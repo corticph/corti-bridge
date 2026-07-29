@@ -2,7 +2,25 @@
 
 Thin reverse proxy that lets Claude Code talk to Corti's Anthropic-compatible API.
 
-Corti now has a native Anthropic Messages endpoint (`/anthropic/v1/messages`). This proxy just swaps the auth header and forwards. No format conversion, no model mapping, no dependencies.
+Corti has a native Anthropic Messages endpoint. This proxy just swaps the auth header and forwards. No format conversion, no model mapping, no dependencies.
+
+## Install
+
+```bash
+git clone <repo-url> ~/projects/cc-proxy
+cd ~/projects/cc-proxy
+./setup.sh
+```
+
+`setup.sh` creates `~/.claude-corti/` with `corti.env` and `settings.json`, and installs the `corti-claude` wrapper to `~/.local/bin/`.
+
+Edit `~/.claude-corti/corti.env` to add your `CORTI_BEARER`, then:
+
+```bash
+corti-claude
+```
+
+That's it. The wrapper starts the proxy if it's not running, then launches `claude` pointed at it.
 
 ## What it does
 
@@ -11,32 +29,26 @@ Corti now has a native Anthropic Messages endpoint (`/anthropic/v1/messages`). T
 - Handles `/v1/messages/count_tokens` locally (Corti doesn't support it)
 - Pipes SSE streaming responses straight through
 
-## Setup
+## Files
 
-```bash
-cp corti.env.example corti.env
-# Edit corti.env — add your CORTI_BEARER and set a CORTI_LOCAL_KEY
+```
+cc-proxy/
+├── gateway.mjs              # The proxy (zero dependencies)
+├── bin/corti-claude         # Wrapper: starts proxy, launches claude
+├── settings.template.json   # Claude Code env config (model aliases, base URL)
+├── corti.env.example        # Env template (bearer, local key, host, port)
+└── setup.sh                 # Installer
 ```
 
-Point Claude Code at the proxy via `settings.json`:
+After install, the runtime layout is:
 
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
-    "ANTHROPIC_AUTH_TOKEN": "sk-corti-local-change-me",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "corti-s1",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "corti-s1-instant",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "corti-s1-mini-instant"
-  }
-}
 ```
+~/.claude-corti/             # Claude Code config dir (CLAUDE_CONFIG_DIR)
+├── corti.env                # Your secrets (not in git)
+├── settings.json            # Claude Code settings
+└── gateway.log              # Proxy log
 
-## Run
-
-```bash
-set -a; source corti.env; set +a
-node gateway.mjs
+~/.local/bin/corti-claude    # The wrapper
 ```
 
 ## Environment
@@ -46,6 +58,8 @@ All vars use `:-` defaults, so shell env takes precedence over `corti.env`. This
 | Var | Required | Default |
 |---|---|---|
 | `CORTI_BEARER` | yes | — |
-| `CORTI_LOCAL_KEY` | no | — |
+| `CORTI_LOCAL_KEY` | no | `sk-corti-local-change-me` |
 | `HOST` | no | `127.0.0.1` |
 | `PORT` | no | `4000` |
+
+`CC_PROXY_DIR` (defaults to `~/projects/cc-proxy`) tells the wrapper where `gateway.mjs` lives. `CC_PROXY_BIN_DIR` (defaults to `~/.local/bin`) controls where the wrapper is installed.

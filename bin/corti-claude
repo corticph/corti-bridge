@@ -1,0 +1,24 @@
+#!/bin/zsh
+# Claude Code on Corti models. Starts the proxy if needed, then launches claude.
+# Installed by cc-proxy setup. Safe to replace — your config lives in ~/.claude-corti/.
+set -euo pipefail
+
+CORTI_DIR="$HOME/.claude-corti"
+PROXY_DIR="${CC_PROXY_DIR:-$HOME/projects/cc-proxy}"
+GATEWAY="http://127.0.0.1:4000"
+
+if ! curl -sf -o /dev/null --max-time 1 "$GATEWAY/health"; then
+    echo "corti-claude: starting gateway..." >&2
+    ( set -a; source "$CORTI_DIR/corti.env"; set +a
+      nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 & )
+    for _ in {1..40}; do
+        curl -sf -o /dev/null --max-time 1 "$GATEWAY/health" && break
+        sleep 0.5
+    done
+    if ! curl -sf -o /dev/null --max-time 1 "$GATEWAY/health"; then
+        echo "corti-claude: gateway failed to start — see $CORTI_DIR/gateway.log" >&2
+        exit 1
+    fi
+fi
+
+CLAUDE_CONFIG_DIR="$CORTI_DIR" exec claude "$@"

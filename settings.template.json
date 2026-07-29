@@ -1,0 +1,9 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
+    "ANTHROPIC_AUTH_TOKEN": "__CORTI_LOCAL_KEY__",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "corti-s1",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "corti-s1-instant",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "corti-s1-mini-instant"
+  }
+}
