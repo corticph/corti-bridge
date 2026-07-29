@@ -3,8 +3,8 @@
 import http from "node:http";
 import https from "node:https";
 
-const HOST = process.env.HOST ?? "127.0.0.1";
-const PORT = Number(process.env.PORT ?? 4000);
+const HOST = process.env.CORTI_HOST ?? "127.0.0.1";
+const PORT = Number(process.env.CORTI_PORT ?? 4000);
 const BEARER = process.env.CORTI_BEARER;
 const UPSTREAM = "https://ai.eu.corti.app/anthropic";
 

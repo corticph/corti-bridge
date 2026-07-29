@@ -58,7 +58,7 @@ All vars use `:-` defaults, so shell env takes precedence over `corti.env`. This
 | Var | Required | Default |
 |---|---|---|
 | `CORTI_BEARER` | yes | — |
-| `HOST` | no | `127.0.0.1` |
-| `PORT` | no | `4000` |
+| `CORTI_HOST` | no | `127.0.0.1` |
+| `CORTI_PORT` | no | `4000` |
 
 `CC_PROXY_DIR` (defaults to `~/projects/cc-proxy`) tells the wrapper where `gateway.mjs` lives. `CC_PROXY_BIN_DIR` (defaults to `~/.local/bin`) controls where the wrapper is installed.
