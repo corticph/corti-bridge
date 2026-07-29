@@ -23,8 +23,8 @@ fi
 
 # 3. settings.json (don't overwrite if exists)
 if [[ ! -f "$CORTI_DIR/settings.json" ]]; then
-    LOCAL_KEY=$(grep CORTI_LOCAL_KEY "$CORTI_DIR/corti.env" | sed 's/.*:-\([^"]*\)".*/\1/')
-    sed "s/__CORTI_LOCAL_KEY__/$LOCAL_KEY/" "$REPO_DIR/settings.template.json" > "$CORTI_DIR/settings.json"
+    BEARER=$(grep '^CORTI_BEARER=' "$CORTI_DIR/corti.env" | sed 's/.*:-\([^"]*\)".*/\1/')
+    sed "s/__CORTI_BEARER__/$BEARER/" "$REPO_DIR/settings.template.json" > "$CORTI_DIR/settings.json"
     echo "Created $CORTI_DIR/settings.json"
 else
     echo "Found $CORTI_DIR/settings.json (kept)"

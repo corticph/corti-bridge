@@ -36,7 +36,7 @@ cc-proxy/
 ├── gateway.mjs              # The proxy (zero dependencies)
 ├── bin/corti-claude         # Wrapper: starts proxy, launches claude
 ├── settings.template.json   # Claude Code env config (model aliases, base URL)
-├── corti.env.example        # Env template (bearer, local key, host, port)
+├── corti.env.example        # Env template (bearer, host, port)
 └── setup.sh                 # Installer
 ```
 
@@ -58,7 +58,6 @@ All vars use `:-` defaults, so shell env takes precedence over `corti.env`. This
 | Var | Required | Default |
 |---|---|---|
 | `CORTI_BEARER` | yes | — |
-| `CORTI_LOCAL_KEY` | no | `sk-corti-local-change-me` |
 | `HOST` | no | `127.0.0.1` |
 | `PORT` | no | `4000` |
 
