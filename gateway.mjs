@@ -24,15 +24,6 @@ http
       return send(res, 200, { input_tokens: estimateTokens(body) });
     }
 
-    if (BEARER) {
-      const key = bearerOf(req.headers) ?? req.headers["x-api-key"];
-      if (key !== BEARER)
-        return send(res, 401, {
-          type: "error",
-          error: { type: "authentication_error", message: "invalid API key" },
-        });
-    }
-
     const body = await rawBody(req);
     const path = (req.url ?? "").split("?")[0];
     const target = new URL(`${UPSTREAM}${path}`);
@@ -99,11 +90,6 @@ function cors(res) {
     "access-control-allow-methods": "POST, GET, OPTIONS",
   });
   res.end();
-}
-
-function bearerOf(h) {
-  const a = h.authorization;
-  return a?.startsWith("Bearer ") ? a.slice(7) : undefined;
 }
 
 function estimateTokens({ system, messages }) {
