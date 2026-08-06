@@ -61,7 +61,7 @@ Read directly from the shell — no local secrets file.
 | `CORTI_HOST` | no | Proxy bind address, default `127.0.0.1` |
 | `CORTI_PORT` | no | Proxy bind port, default `4000` |
 
-`CC_PROXY_DIR` (defaults to `~/projects/cc-proxy`) tells the wrapper where `gateway.mjs` lives. `CC_PROXY_BIN_DIR` (defaults to `~/.local/bin`) controls where the wrapper is installed.
+`CC_PROXY_DIR` (defaults to `~/projects/cc-proxy`) tells the wrapper where `gateway.mjs` lives. `CC_PROXY_BIN_DIR` (defaults to `~/.local/bin`) controls where the wrapper is installed. `CC_PROXY_CONFIG_DIR` overrides the `CLAUDE_CONFIG_DIR` the wrapper uses — it defaults to `~/.corti-claude` so existing installs keep working without setting anything.
 
 `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` are exported by the `corti-claude` wrapper itself, pointed at the local proxy — that's plumbing this tool owns, not something you configure.
 
