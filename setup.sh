@@ -1,5 +1,5 @@
 #!/bin/sh
-# cc-proxy setup — installs the corti-claude wrapper.
+# corti-claude-proxy setup — installs the corti-claude wrapper.
 # Run from the repo root: ./setup.sh
 # Run with --detect-models to fetch Corti's model catalog (via `npx @corti/cli`)
 # and write ~/.corti-claude/settings.json from it.
@@ -92,12 +92,12 @@ case "${1:-}" in
         ;;
     "") ;;
     *)
-        echo "cc-proxy setup: unknown argument: $1" >&2
+        echo "corti-claude-proxy setup: unknown argument: $1" >&2
         exit 1
         ;;
 esac
 
-echo "cc-proxy setup"
+echo "corti-claude-proxy setup"
 echo ""
 
 # 1. Wrapper

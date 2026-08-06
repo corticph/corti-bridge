@@ -1,10 +1,10 @@
 #!/bin/sh
 # Claude Code on Corti models. Starts the proxy if needed, then launches claude.
-# Installed by cc-proxy setup. Safe to replace — your config lives in ~/.corti-claude/.
+# Installed by corti-claude-proxy setup. Safe to replace — your config lives in ~/.corti-claude/.
 set -eu
 
 CORTI_DIR="${CC_PROXY_CONFIG_DIR:-$HOME/.corti-claude}"
-PROXY_DIR="${CC_PROXY_DIR:-$HOME/projects/cc-proxy}"
+PROXY_DIR="${CC_PROXY_DIR:-$HOME/projects/corti-claude-proxy}"
 GATEWAY="http://127.0.0.1:4000"
 
 if [ -z "${CORTI_BEARER:-}" ] || [ -z "${CORTI_BASE_URL:-}" ]; then

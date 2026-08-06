@@ -1,4 +1,4 @@
-# cc-proxy
+# corti-claude-proxy
 
 Thin reverse proxy that lets Claude Code talk to Corti's Anthropic-compatible API.
 
@@ -13,8 +13,8 @@ Both `setup.sh` and `bin/corti-claude` are POSIX `sh` — they run the same unde
 ## Install
 
 ```bash
-git clone <repo-url> ~/projects/cc-proxy
-cd ~/projects/cc-proxy
+git clone https://github.com/corticph/corti-claude-proxy ~/projects/corti-claude-proxy
+cd ~/projects/corti-claude-proxy
 ./setup.sh
 ```
 
@@ -36,7 +36,7 @@ That's it. The wrapper starts the proxy if it's not running, points Claude Code 
 ## Files
 
 ```
-cc-proxy/
+corti-claude-proxy/
 ├── gateway.mjs         # The proxy (zero dependencies)
 ├── bin/corti-claude    # Wrapper: starts proxy, launches claude
 └── setup.sh            # Installer
@@ -63,7 +63,7 @@ Read directly from the shell — no local secrets file.
 | `CORTI_HOST` | no | Proxy bind address, default `127.0.0.1` |
 | `CORTI_PORT` | no | Proxy bind port, default `4000` |
 
-`CC_PROXY_DIR` (defaults to `~/projects/cc-proxy`) tells the wrapper where `gateway.mjs` lives. `CC_PROXY_BIN_DIR` (defaults to `~/.local/bin`) controls where the wrapper is installed. `CC_PROXY_CONFIG_DIR` overrides the `CLAUDE_CONFIG_DIR` the wrapper uses — it defaults to `~/.corti-claude` so existing installs keep working without setting anything.
+`CC_PROXY_DIR` (defaults to `~/projects/corti-claude-proxy`) tells the wrapper where `gateway.mjs` lives. `CC_PROXY_BIN_DIR` (defaults to `~/.local/bin`) controls where the wrapper is installed. `CC_PROXY_CONFIG_DIR` overrides the `CLAUDE_CONFIG_DIR` the wrapper uses — it defaults to `~/.corti-claude` so existing installs keep working without setting anything.
 
 `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` are exported by the `corti-claude` wrapper itself, pointed at the local proxy — that's plumbing this tool owns, not something you configure.
 
