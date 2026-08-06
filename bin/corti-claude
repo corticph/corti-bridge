@@ -7,10 +7,14 @@ CORTI_DIR="$HOME/.corti-claude"
 PROXY_DIR="${CC_PROXY_DIR:-$HOME/projects/cc-proxy}"
 GATEWAY="http://127.0.0.1:4000"
 
+if [[ -z "${CORTI_BEARER:-}" || -z "${CORTI_BASE_URL:-}" ]]; then
+    echo "corti-claude: CORTI_BEARER and CORTI_BASE_URL must be set in your environment" >&2
+    exit 1
+fi
+
 if ! curl -sf -o /dev/null --max-time 1 "$GATEWAY/health"; then
     echo "corti-claude: starting gateway..." >&2
-    ( set -a; source "$CORTI_DIR/corti.env"; set +a
-      nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 & )
+    nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 &
     for _ in {1..40}; do
         curl -sf -o /dev/null --max-time 1 "$GATEWAY/health" && break
         sleep 0.5
@@ -20,5 +24,10 @@ if ! curl -sf -o /dev/null --max-time 1 "$GATEWAY/health"; then
         exit 1
     fi
 fi
+
+mkdir -p "$CORTI_DIR"
+
+export ANTHROPIC_BASE_URL="$GATEWAY"
+export ANTHROPIC_AUTH_TOKEN="local-gateway"
 
 CLAUDE_CONFIG_DIR="$CORTI_DIR" exec claude "$@"

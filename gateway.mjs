@@ -6,12 +6,27 @@ import https from "node:https";
 const HOST = process.env.CORTI_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.CORTI_PORT ?? 4000);
 const BEARER = process.env.CORTI_BEARER;
-const UPSTREAM = "https://ai.eu.corti.app/anthropic";
+const BASE_URL = process.env.CORTI_BASE_URL;
 
 if (!BEARER) {
   console.error("CORTI_BEARER is required");
   process.exit(1);
 }
+
+if (!BASE_URL) {
+  console.error("CORTI_BASE_URL is required");
+  process.exit(1);
+}
+
+const BASE_URL_PATTERN = /^https:\/\/ai\.[a-z0-9-]+\.corti\.app\/v1$/;
+if (!BASE_URL_PATTERN.test(BASE_URL)) {
+  console.error(
+    `CORTI_BASE_URL "${BASE_URL}" doesn't look like a Corti API URL (expected https://ai.<env>.corti.app/v1)`,
+  );
+  process.exit(1);
+}
+
+const UPSTREAM = BASE_URL.replace(/\/v1$/, "/anthropic");
 
 http
   .createServer(async (req, res) => {
