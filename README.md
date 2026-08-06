@@ -12,9 +12,9 @@ cd ~/projects/cc-proxy
 ./setup.sh
 ```
 
-`setup.sh` creates `~/.claude-corti/` with `corti.env` and `settings.json`, and installs the `corti-claude` wrapper to `~/.local/bin/`.
+`setup.sh` creates `~/.corti-claude/` with `corti.env` and `settings.json`, and installs the `corti-claude` wrapper to `~/.local/bin/`.
 
-Edit `~/.claude-corti/corti.env` to add your `CORTI_BEARER`, then:
+Edit `~/.corti-claude/corti.env` to add your `CORTI_BEARER`, then:
 
 ```bash
 corti-claude
@@ -43,7 +43,7 @@ cc-proxy/
 After install, the runtime layout is:
 
 ```
-~/.claude-corti/             # Claude Code config dir (CLAUDE_CONFIG_DIR)
+~/.corti-claude/             # Claude Code config dir (CLAUDE_CONFIG_DIR)
 ├── corti.env                # Your secrets (not in git)
 ├── settings.json            # Claude Code settings
 └── gateway.log              # Proxy log

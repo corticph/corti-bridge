@@ -4,7 +4,7 @@
 set -euo pipefail
 
 REPO_DIR="${0:A:h}"
-CORTI_DIR="$HOME/.claude-corti"
+CORTI_DIR="$HOME/.corti-claude"
 BIN_DIR="${CC_PROXY_BIN_DIR:-$HOME/.local/bin}"
 
 echo "cc-proxy setup"

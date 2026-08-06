@@ -1,9 +1,9 @@
 #!/bin/zsh
 # Claude Code on Corti models. Starts the proxy if needed, then launches claude.
-# Installed by cc-proxy setup. Safe to replace — your config lives in ~/.claude-corti/.
+# Installed by cc-proxy setup. Safe to replace — your config lives in ~/.corti-claude/.
 set -euo pipefail
 
-CORTI_DIR="$HOME/.claude-corti"
+CORTI_DIR="$HOME/.corti-claude"
 PROXY_DIR="${CC_PROXY_DIR:-$HOME/projects/cc-proxy}"
 GATEWAY="http://127.0.0.1:4000"
 
