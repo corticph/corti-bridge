@@ -6,7 +6,9 @@ Corti has a native Anthropic Messages endpoint. This proxy just swaps the auth h
 
 ## Prerequisites
 
-`CORTI_BEARER` and `CORTI_BASE_URL` must already be set in your shell environment (e.g. via `~/.env` sourced from `.zshrc`, or a project `.env` you've loaded). This proxy doesn't manage secrets — it just reads them.
+`CORTI_BEARER` and `CORTI_BASE_URL` must already be set in your shell environment (e.g. via `~/.env` sourced from your shell's rc file, or a project `.env` you've loaded). This proxy doesn't manage secrets — it just reads them.
+
+Both `setup.sh` and `bin/corti-claude` are POSIX `sh` — they run the same under bash, zsh, or dash regardless of what your login shell is (fish included, since it execs scripts via their shebang rather than parsing them).
 
 ## Install
 
@@ -67,7 +69,7 @@ Read directly from the shell — no local secrets file.
 
 ## Model config
 
-Which Corti model backs each Claude Code tier is *not* managed by this repo — it changes independently of the proxy, so it belongs in config you own, the same way you'd declare a provider block in `~/.config/opencode/opencode.json`.
+Which Corti model backs each Claude Code tier is *not* managed by this repo — it changes independently of the proxy, so it belongs in config you own, not something baked into this repo's source.
 
 To set it, create `~/.corti-claude/settings.json` yourself (the wrapper points `CLAUDE_CONFIG_DIR` there):
 
@@ -84,4 +86,14 @@ To set it, create `~/.corti-claude/settings.json` yourself (the wrapper points `
 }
 ```
 
-Adjust the model names to whatever Corti currently offers — check `~/.config/opencode/opencode.json` for the current catalog if you're unsure. This file is entirely yours; `setup.sh` never creates, touches, or overwrites it.
+Adjust the model names to whatever Corti currently offers — run `./setup.sh --detect-models` (below) if you're unsure what's available. This file is entirely yours; `setup.sh` never creates, touches, or overwrites it (unless you explicitly ask it to — see below).
+
+### `setup.sh --detect-models`
+
+Optional shortcut: fetches Corti's live model catalog via `npx @corti/cli list models --json` and writes `~/.corti-claude/settings.json` from the first four models, in order: Opus, Sonnet, Haiku, then Custom.
+
+```bash
+./setup.sh --detect-models
+```
+
+It prints out what it picked and won't overwrite an existing `settings.json` without asking first. This assumes the catalog stays ordered the way it is today — if Corti reorders or inserts a model, re-run it and check the printed mapping, or just edit `settings.json` by hand.

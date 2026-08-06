@@ -1,13 +1,13 @@
-#!/bin/zsh
+#!/bin/sh
 # Claude Code on Corti models. Starts the proxy if needed, then launches claude.
 # Installed by cc-proxy setup. Safe to replace — your config lives in ~/.corti-claude/.
-set -euo pipefail
+set -eu
 
 CORTI_DIR="${CC_PROXY_CONFIG_DIR:-$HOME/.corti-claude}"
 PROXY_DIR="${CC_PROXY_DIR:-$HOME/projects/cc-proxy}"
 GATEWAY="http://127.0.0.1:4000"
 
-if [[ -z "${CORTI_BEARER:-}" || -z "${CORTI_BASE_URL:-}" ]]; then
+if [ -z "${CORTI_BEARER:-}" ] || [ -z "${CORTI_BASE_URL:-}" ]; then
     echo "corti-claude: CORTI_BEARER and CORTI_BASE_URL must be set in your environment" >&2
     exit 1
 fi
@@ -17,9 +17,11 @@ mkdir -p "$CORTI_DIR"
 if ! curl -sf -o /dev/null --max-time 1 "$GATEWAY/health"; then
     echo "corti-claude: starting gateway..." >&2
     nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 &
-    for _ in {1..40}; do
+    i=1
+    while [ "$i" -le 40 ]; do
         curl -sf -o /dev/null --max-time 1 "$GATEWAY/health" && break
         sleep 0.5
+        i=$((i + 1))
     done
     if ! curl -sf -o /dev/null --max-time 1 "$GATEWAY/health"; then
         echo "corti-claude: gateway failed to start — see $CORTI_DIR/gateway.log" >&2
