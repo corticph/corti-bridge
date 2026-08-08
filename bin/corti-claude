@@ -14,6 +14,25 @@ fi
 
 mkdir -p "$CORTI_DIR"
 
+case "${CORTI_DEBUG:-}" in
+    '' | 0 | false | no | off) want_debug=0 ;;
+    *) want_debug=1 ;;
+esac
+
+# The gateway outlives any single invocation, so a debug-state mismatch needs a restart.
+health="$(curl -sf --max-time 1 "$GATEWAY/health" 2>/dev/null || true)"
+if [ -n "$health" ]; then
+    case "$health" in
+        *'"debug":"'*) has_debug=1 ;;
+        *) has_debug=0 ;;
+    esac
+    if [ "$want_debug" != "$has_debug" ]; then
+        echo "corti-claude: debug mode changed — restarting gateway..." >&2
+        pkill -f "$PROXY_DIR/gateway.mjs" 2>/dev/null || true
+        sleep 1
+    fi
+fi
+
 if ! curl -sf -o /dev/null --max-time 1 "$GATEWAY/health"; then
     echo "corti-claude: starting gateway..." >&2
     nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 &
@@ -26,6 +45,16 @@ if ! curl -sf -o /dev/null --max-time 1 "$GATEWAY/health"; then
     if ! curl -sf -o /dev/null --max-time 1 "$GATEWAY/health"; then
         echo "corti-claude: gateway failed to start — see $CORTI_DIR/gateway.log" >&2
         exit 1
+    fi
+fi
+
+if [ "$want_debug" = 1 ]; then
+    log_path="$(curl -sf --max-time 1 "$GATEWAY/health" 2>/dev/null |
+        sed -n 's/.*"debug":"\([^"]*\)".*/\1/p')"
+    if [ -n "$log_path" ]; then
+        echo "corti-claude: debug log -> $log_path" >&2
+    else
+        echo "corti-claude: warning — gateway isn't debug-logging; stop it manually and retry" >&2
     fi
 fi
 

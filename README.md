@@ -32,6 +32,7 @@ That's it. The wrapper starts the proxy if it's not running, points Claude Code 
 - Derives the Anthropic-compatible upstream from `CORTI_BASE_URL` (e.g. `https://ai.eu.corti.app/v1` becomes `https://ai.eu.corti.app/anthropic`), so it follows whatever region/environment you're pointed at (`eu`, `dev-weu`, etc.)
 - Handles `/v1/messages/count_tokens` locally (Corti doesn't support it — it 404s with a plain-text body Claude Code can't parse)
 - Pipes SSE streaming responses straight through
+- Optionally logs every request and response to a timestamped file (see [Debug logging](#debug-logging))
 
 ## Files
 
@@ -50,6 +51,8 @@ After install, the runtime layout is:
 └── gateway.log               # Proxy log
 
 ~/.local/bin/corti-claude    # The wrapper
+
+~/Library/Logs/corti-claude-proxy/   # Debug logs, one per gateway start (only when CORTI_DEBUG is set)
 ```
 
 ## Environment
@@ -62,10 +65,62 @@ Read directly from the shell — no local secrets file.
 | `CORTI_BASE_URL` | yes | Must match `https://ai.<env>.corti.app/v1`; `/v1` is swapped for `/anthropic` |
 | `CORTI_HOST` | no | Proxy bind address, default `127.0.0.1` |
 | `CORTI_PORT` | no | Proxy bind port, default `4000` |
+| `CORTI_DEBUG` | no | Any value except `0`/`false`/`no`/`off` turns on request/response logging |
+| `CORTI_DEBUG_DIR` | no | Where debug logs go; defaults per platform (see below) |
+| `CORTI_DEBUG_MAX_BODY` | no | Per-body byte cap, default `65536`; `0` means unlimited |
 
 `CC_PROXY_DIR` (defaults to `~/projects/corti-claude-proxy`) tells the wrapper where `gateway.mjs` lives. `CC_PROXY_BIN_DIR` (defaults to `~/.local/bin`) controls where the wrapper is installed. `CC_PROXY_CONFIG_DIR` overrides the `CLAUDE_CONFIG_DIR` the wrapper uses — it defaults to `~/.corti-claude` so existing installs keep working without setting anything.
 
 `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` are exported by the `corti-claude` wrapper itself, pointed at the local proxy — that's plumbing this tool owns, not something you configure.
+
+## Debug logging
+
+Set `CORTI_DEBUG` and the gateway writes every request and response to a timestamped file, one per gateway start:
+
+```bash
+CORTI_DEBUG=1 corti-claude
+```
+
+The wrapper prints the log path on startup, and `/health` reports it too:
+
+```bash
+curl -s http://127.0.0.1:4000/health
+# {"status":"healthy","debug":"/Users/you/Library/Logs/corti-claude-proxy/gateway-2026-08-08T14-19-35-470Z.log"}
+```
+
+Each entry carries a request id pairing the request with its response, plus status and duration:
+
+```
+=== #7 REQUEST 2026-08-08T14:19:35.801Z ===
+POST /v1/messages -> https://ai.eu.corti.app/anthropic/v1/messages
+headers: {"host":"127.0.0.1:4000","authorization":"<redacted>", ...}
+body:
+{ "model": "corti-s1", ... }
+
+=== #7 RESPONSE 2026-08-08T14:19:37.012Z (1211ms) ===
+status: 200
+headers: {"content-type":"text/event-stream", ...}
+body:
+event: content_block_delta
+data: {"index":0,"delta":{"text":"..."}}
+```
+
+Streaming responses are teed as they pass through, so the client still receives SSE chunks incrementally — the full stream just also lands in the log. Upstream failures, aborted streams, and locally-handled `count_tokens` calls are all recorded.
+
+**The log contains complete prompt bodies** — your source code, file contents, whatever Claude Code sent. `CORTI_BEARER` is never written, and `authorization`/`x-api-key`/`cookie` headers are redacted, but treat the files as sensitive. The directory is created `0700` and files `0600`. Nothing rotates or prunes them; delete them yourself when done.
+
+Where they go, in order of precedence:
+
+| | |
+|---|---|
+| `CORTI_DEBUG_DIR` | If set, used as-is |
+| macOS | `~/Library/Logs/corti-claude-proxy/` |
+| Linux/other | `$XDG_STATE_HOME/corti-claude-proxy/` (or `~/.local/state/...`) |
+| Fallback | `$TMPDIR/corti-claude-proxy/` if the above isn't writable |
+
+Bodies are capped at 64 KB each by default so a long streaming response doesn't produce a giant file; raise it with `CORTI_DEBUG_MAX_BODY`, or set `0` for no cap. Truncated bodies are marked as such.
+
+The gateway is a background process that outlives any single `corti-claude` run, so toggling `CORTI_DEBUG` has to restart it — the wrapper handles that automatically, in both directions. If you started the gateway some other way, stop it yourself first.
 
 ## Model config
 
