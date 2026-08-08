@@ -28,7 +28,7 @@ detect_models() {
     fi
 
     echo "Fetching model catalog via npx @corti/cli..." >&2
-    if ! cli_json=$(npx --yes @corti/cli@alpha list models --json); then
+    if ! cli_json=$(npx --yes @corti/cli@alpha models list --json); then
         echo "detect-models: failed to run @corti/cli" >&2
         exit 1
     fi
