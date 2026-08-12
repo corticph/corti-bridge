@@ -19,15 +19,31 @@ case "${CORTI_DEBUG:-}" in
     *) want_debug=1 ;;
 esac
 
-# The gateway outlives any single invocation, so a debug-state mismatch needs a restart.
+case "${CORTI_UPSTREAM_MODE:-openai}" in
+    anthropic) want_mode=anthropic ;;
+    *) want_mode=openai ;;
+esac
+
+# The gateway outlives any single invocation, so a state mismatch needs a restart.
 health="$(curl -sf --max-time 1 "$GATEWAY/health" 2>/dev/null || true)"
 if [ -n "$health" ]; then
+    restart_reason=""
     case "$health" in
         *'"debug":"'*) has_debug=1 ;;
         *) has_debug=0 ;;
     esac
     if [ "$want_debug" != "$has_debug" ]; then
-        echo "corti-claude: debug mode changed — restarting gateway..." >&2
+        restart_reason="debug mode changed"
+    fi
+    case "$health" in
+        *"\"mode\":\"$want_mode\""*) ;;
+        *'"mode":'*)
+            if [ -z "$restart_reason" ]; then restart_reason="upstream mode changed"; fi ;;
+        *)
+            if [ -z "$restart_reason" ]; then restart_reason="gateway predates modes (restarting to upgrade)"; fi ;;
+    esac
+    if [ -n "$restart_reason" ]; then
+        echo "corti-claude: $restart_reason — restarting gateway..." >&2
         pkill -f "$PROXY_DIR/gateway.mjs" 2>/dev/null || true
         sleep 1
     fi
@@ -58,7 +74,13 @@ if [ "$want_debug" = 1 ]; then
     fi
 fi
 
+if grep -q '"CLAUDE_CODE_MAX_CONTEXT_TOKENS": *"1000000"' "$CORTI_DIR/settings.json" 2>/dev/null; then
+    echo "corti-claude: settings.json has CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000; the real window is 262144 — re-run ./setup.sh --detect-models or edit the file" >&2
+fi
+
 export ANTHROPIC_BASE_URL="$GATEWAY"
 export ANTHROPIC_AUTH_TOKEN="local-gateway"
+# Per-request attribution text in the system prompt defeats upstream prefix caching.
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 
 CLAUDE_CONFIG_DIR="$CORTI_DIR" exec claude "$@"

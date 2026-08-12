@@ -1,7 +1,7 @@
 #!/bin/sh
 # corti-claude-proxy setup — installs the corti-claude wrapper.
 # Run from the repo root: ./setup.sh
-# Run with --detect-models to fetch Corti's model catalog (via `npx @corti/cli`)
+# Run with --detect-models to fetch Corti's live model catalog (via CORTI_BASE_URL)
 # and write ~/.corti-claude/settings.json from it.
 set -eu
 
@@ -10,8 +10,8 @@ BIN_DIR="${CC_PROXY_BIN_DIR:-$HOME/.local/bin}"
 CORTI_DIR="${CC_PROXY_CONFIG_DIR:-$HOME/.corti-claude}"
 
 detect_models() {
-    if ! command -v npx >/dev/null 2>&1; then
-        echo "detect-models: npx not found — install Node.js first" >&2
+    if [ -z "${CORTI_BEARER:-}" ] || [ -z "${CORTI_BASE_URL:-}" ]; then
+        echo "detect-models: CORTI_BEARER and CORTI_BASE_URL must be set in your environment" >&2
         exit 1
     fi
 
@@ -27,62 +27,73 @@ detect_models() {
         esac
     fi
 
-    echo "Fetching model catalog via npx @corti/cli..." >&2
-    if ! cli_json=$(npx --yes @corti/cli models list --json); then
-        echo "detect-models: failed to run @corti/cli" >&2
+    echo "Fetching model catalog from $CORTI_BASE_URL/models..." >&2
+    if ! catalog=$(curl -sf --max-time 10 -H "Authorization: Bearer $CORTI_BEARER" "$CORTI_BASE_URL/models"); then
+        echo "detect-models: failed to fetch model catalog" >&2
         exit 1
     fi
 
-    if ! models=$(node -e '
+    # Preference lists, first match wins. opus = strongest stable tier (ultra-beta is an RC
+    # build — it's offered as the custom option instead); embedding models never qualify.
+    if ! mapping=$(node -e '
         const data = JSON.parse(process.argv[1]);
-        if (!data.ok || data.error) {
-            console.error("corti-cli probe failed: " + (data.error || "unknown error"));
+        const ids = (Array.isArray(data.data) ? data.data : [])
+            .map((m) => m && m.id)
+            .filter((id) => typeof id === "string" && !/embedding/i.test(id));
+        if (ids.length < 3) {
+            console.error("catalog has fewer than 3 chat models");
             process.exit(1);
         }
-        if (!Array.isArray(data.models) || data.models.length < 3) {
-            console.error("corti-cli returned fewer than 3 models");
-            process.exit(1);
+        const prefs = {
+            opus: ["corti-s1", "corti-s1-ultra-beta", "corti-s1-beta"],
+            sonnet: ["corti-s1-instant", "corti-s1"],
+            haiku: ["corti-s1-mini-instant", "corti-s1-tiny-instant", "corti-s1-mini"],
+            custom: ["corti-s1-ultra-beta", "corti-s1-mini"],
+        };
+        const pick = (list) => list.find((id) => ids.includes(id)) || null;
+        const out = { opus: pick(prefs.opus), sonnet: pick(prefs.sonnet), haiku: pick(prefs.haiku), custom: pick(prefs.custom) };
+        // any slot that missed its preference list falls back to the first unused catalog model
+        const used = new Set(Object.values(out).filter(Boolean));
+        for (const slot of Object.keys(out)) {
+            if (!out[slot]) {
+                out[slot] = ids.find((id) => !used.has(id)) || ids[0];
+                console.error(`warning: no preference match for ${slot}; using ${out[slot]}`);
+                used.add(out[slot]);
+            }
         }
-        process.stdout.write(data.models.join("\n"));
-    ' "$cli_json"); then
+        process.stdout.write(JSON.stringify(out));
+    ' "$catalog"); then
         exit 1
     fi
-
-    set -f
-    set -- $models
-    set +f
-
-    opus="$1"
-    sonnet="$2"
-    haiku="$3"
-    custom="${4:-}"
 
     mkdir -p "$CORTI_DIR"
     node -e '
         const fs = require("fs");
-        const [path, opus, sonnet, haiku, custom, maxTokens] = process.argv.slice(1);
+        const [path, mappingJson] = process.argv.slice(1);
+        const m = JSON.parse(mappingJson);
         const env = {
-            ANTHROPIC_DEFAULT_OPUS_MODEL: opus,
-            ANTHROPIC_DEFAULT_SONNET_MODEL: sonnet,
-            ANTHROPIC_DEFAULT_HAIKU_MODEL: haiku,
+            ANTHROPIC_DEFAULT_OPUS_MODEL: m.opus,
+            ANTHROPIC_DEFAULT_SONNET_MODEL: m.sonnet,
+            ANTHROPIC_DEFAULT_HAIKU_MODEL: m.haiku,
         };
-        if (custom) {
-            env.ANTHROPIC_CUSTOM_MODEL_OPTION = custom;
-            env.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME = custom;
+        if (m.custom) {
+            env.ANTHROPIC_CUSTOM_MODEL_OPTION = m.custom;
+            env.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME = m.custom;
         }
-        env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = maxTokens;
+        env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "262144";
         fs.writeFileSync(path, JSON.stringify({ env: env }, null, 2) + "\n");
-    ' "$CORTI_DIR/settings.json" "$opus" "$sonnet" "$haiku" "$custom" "1000000"
+    ' "$CORTI_DIR/settings.json" "$mapping"
 
     echo "" >&2
-    echo "Opus: $opus" >&2
-    echo "Sonnet: $sonnet" >&2
-    echo "Haiku: $haiku" >&2
-    if [ -n "$custom" ]; then
-        echo "Custom: $custom" >&2
-    fi
+    node -e 'const m = JSON.parse(process.argv[1]);
+        console.log("Opus: " + m.opus);
+        console.log("Sonnet: " + m.sonnet);
+        console.log("Haiku: " + m.haiku);
+        if (m.custom) console.log("Custom: " + m.custom);
+    ' "$mapping" >&2
     echo "" >&2
     echo "Wrote $CORTI_DIR/settings.json — edit it anytime to change these." >&2
+    echo "Context window is set to 262144 (probed on all current tiers); edit if Corti ships smaller-context models." >&2
 }
 
 case "${1:-}" in

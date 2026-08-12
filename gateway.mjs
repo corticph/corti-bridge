@@ -5,11 +5,27 @@ import http from "node:http";
 import https from "node:https";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
+import zlib from "node:zlib";
+import {
+  TranslateRejection,
+  createStreamTranslator,
+  estimateTokens,
+  translateCompletion,
+  translateError,
+  translateModels,
+  translateNetworkError,
+  translateRequest,
+} from "./translate.mjs";
 
 const HOST = process.env.CORTI_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.CORTI_PORT ?? 4000);
 const BEARER = process.env.CORTI_BEARER;
 const BASE_URL = process.env.CORTI_BASE_URL;
+const MODE = process.env.CORTI_UPSTREAM_MODE === "anthropic" ? "anthropic" : "openai";
+const REASONING_MODE = ["thinking", "text", "drop"].includes(process.env.CORTI_REASONING_MODE)
+  ? process.env.CORTI_REASONING_MODE
+  : "thinking";
 
 if (!BEARER) {
   console.error("CORTI_BEARER is required");
@@ -29,90 +45,703 @@ if (!BASE_URL_PATTERN.test(BASE_URL)) {
   process.exit(1);
 }
 
-const UPSTREAM = BASE_URL.replace(/\/v1$/, "/anthropic");
+const UPSTREAM = MODE === "anthropic" ? BASE_URL.replace(/\/v1$/, "/anthropic") : BASE_URL;
+
+// Probe-locked constants (.context/projects/switch-to-openai-endpoints/probes-round2.md)
+const PING_INTERVAL_MS = 15_000;
+const STREAM_IDLE_MS = 120_000;
+const NONSTREAM_TIMEOUT_MS = 600_000;
+const CONTEXT_WINDOW = 262_144;
+const OVERFLOW_TOKEN_ESTIMATE = 250_000;
+const BYTE_CAP_BYTES = 900_000;
+const BYTE_CAP_MIN_TOKENS = 200_000;
+const MEMORY_BREAKER_BYTES = 64_000_000;
 
 const DEBUG = isTruthy(process.env.CORTI_DEBUG);
 const DEBUG_MAX_BODY = Number(process.env.CORTI_DEBUG_MAX_BODY ?? 65536);
 const LOG_FILE = DEBUG ? openDebugLog() : null;
 
+const agent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 32 });
+
 let requestId = 0;
 
-http
-  .createServer(async (req, res) => {
-    if (req.method === "OPTIONS") return cors(res);
+const server = http.createServer((req, res) => {
+  if (req.method === "OPTIONS") return cors(res);
 
-    if (req.url === "/health")
-      return send(res, 200, { status: "healthy", debug: LOG_FILE ?? false });
+  if (req.url === "/health")
+    return send(res, 200, {
+      status: "healthy",
+      mode: MODE,
+      upstream: UPSTREAM,
+      debug: LOG_FILE ?? false,
+    });
 
-    const id = ++requestId;
-    const reqPath = (req.url ?? "").split("?")[0];
-    const isCountTokens = reqPath.startsWith("/v1/messages/count_tokens");
-    const target = isCountTokens ? null : new URL(`${UPSTREAM}${reqPath}`);
+  if (MODE === "anthropic") return handlePassthrough(req, res);
+  return handleOpenAI(req, res);
+});
 
-    // Single read: the stream is consumed, so a second rawBody() would never settle.
-    const body = await rawBody(req);
-    const started = Date.now();
-    logRequest(id, req, reqPath, target, body);
+// CC streams can be long-lived; don't let Node's request timeout kill them.
+server.requestTimeout = 0;
+server.listen(PORT, HOST, () => {
+  console.log(`corti-proxy on http://${HOST}:${PORT} (mode: ${MODE}, reasoning: ${REASONING_MODE})`);
+  if (LOG_FILE) console.log(`corti-proxy debug log: ${LOG_FILE}`);
+});
 
-    if (isCountTokens) {
+/* ================================================================== */
+/* anthropic mode: thin pass-through (legacy)                          */
+/* ================================================================== */
+
+async function handlePassthrough(req, res) {
+  const id = ++requestId;
+  const reqPath = (req.url ?? "").split("?")[0];
+  const isCountTokens = reqPath.startsWith("/v1/messages/count_tokens");
+  const target = isCountTokens ? null : new URL(`${UPSTREAM}${reqPath}`);
+
+  const body = await rawBody(req);
+  const started = Date.now();
+  logRequest(id, req, target, body);
+
+  if (isCountTokens) {
+    try {
       const result = { input_tokens: estimateTokens(JSON.parse(body.toString())) };
-      logResponse(id, started, 200, null, JSON.stringify(result));
+      logResponse({ id, started, status: 200, body: JSON.stringify(result), note: "handled locally" });
       return send(res, 200, result);
+    } catch {
+      const envelope = {
+        type: "error",
+        error: { type: "invalid_request_error", message: "request body is not valid JSON" },
+      };
+      logResponse({ id, started, status: 400, body: JSON.stringify(envelope), note: "handled locally" });
+      return send(res, 400, envelope);
     }
+  }
 
-    const proxyReq = https.request(
-      target,
-      {
-        method: req.method,
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${BEARER}`,
-          "anthropic-version": req.headers["anthropic-version"] ?? "2023-06-01",
-          "content-length": body.length,
-          ...(req.headers["anthropic-beta"] && {
-            "anthropic-beta": req.headers["anthropic-beta"],
-          }),
-        },
+  const proxyReq = https.request(
+    target,
+    {
+      agent,
+      method: req.method,
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${BEARER}`,
+        "anthropic-version": req.headers["anthropic-version"] ?? "2023-06-01",
+        "content-length": body.length,
+        ...(req.headers["anthropic-beta"] && { "anthropic-beta": req.headers["anthropic-beta"] }),
       },
-      (upstream) => {
-        console.log(`${req.method} ${reqPath} ${upstream.statusCode}`);
-        res.writeHead(upstream.statusCode ?? 502, upstream.headers);
-        if (LOG_FILE) teeResponse(id, started, upstream, res);
-        upstream.pipe(res);
-      },
-    );
+    },
+    (upstream) => {
+      console.log(`${req.method} ${reqPath} ${upstream.statusCode}`);
+      res.writeHead(upstream.statusCode ?? 502, upstream.headers);
+      if (LOG_FILE) teeResponse(id, started, upstream, res);
+      upstream.pipe(res);
+    },
+  );
 
-    proxyReq.on("error", (err) => {
-      console.error(err.message);
-      logResponse(id, started, null, null, "", `upstream request error: ${err.message}`);
-      if (!res.headersSent)
-        send(res, 502, {
-          type: "error",
-          error: { type: "api_error", message: err.message },
-        });
-    });
-
-    req.on("close", () => {
-      if (!res.writableEnded) proxyReq.destroy();
-    });
-
-    proxyReq.end(body);
-  })
-  .listen(PORT, HOST, () => {
-    console.log(`corti-proxy on http://${HOST}:${PORT}`);
-    if (LOG_FILE) console.log(`corti-proxy debug log: ${LOG_FILE}`);
+  proxyReq.on("error", (err) => {
+    console.error(err.message);
+    logResponse({ id, started, status: null, body: "", note: `upstream request error: ${err.message}` });
+    if (!res.headersSent)
+      send(res, 502, { type: "error", error: { type: "api_error", message: err.message } });
   });
 
+  req.on("close", () => {
+    if (!res.writableEnded) proxyReq.destroy();
+  });
+
+  proxyReq.end(body);
+}
+
+/* ================================================================== */
+/* openai mode: translating gateway                                    */
+/* ================================================================== */
+
+function handleOpenAI(req, res) {
+  const reqPath = (req.url ?? "").split("?")[0];
+  return rawBody(req)
+    .then((body) => {
+      if (req.method === "POST" && reqPath === "/v1/messages") return handleMessages(req, res, body);
+      if (req.method === "POST" && reqPath === "/v1/messages/count_tokens") return handleCountTokens(res, body);
+      if (req.method === "GET" && reqPath === "/v1/models") return handleModels(res);
+      if (req.method === "POST" && reqPath === "/api/event_logging/batch") return send(res, 200, {});
+      return send(res, 404, {
+        type: "error",
+        error: { type: "not_found_error", message: `unknown route: ${req.method} ${reqPath}` },
+      });
+    })
+    .catch((err) => {
+      console.error(err);
+      if (!res.headersSent)
+        send(res, 500, { type: "error", error: { type: "api_error", message: "proxy failure" } });
+    });
+}
+
+function handleCountTokens(res, body) {
+  try {
+    return send(res, 200, { input_tokens: estimateTokens(JSON.parse(body.toString())) });
+  } catch {
+    return send(res, 400, {
+      type: "error",
+      error: { type: "invalid_request_error", message: "request body is not valid JSON" },
+    });
+  }
+}
+
+function handleModels(res) {
+  const proxyReq = https.request(
+    new URL(`${UPSTREAM}/models`),
+    { agent, method: "GET", headers: { authorization: `Bearer ${BEARER}` } },
+    (upstream) => {
+      const chunks = [];
+      upstream.on("data", (c) => chunks.push(c));
+      upstream.on("end", () => {
+        const text = Buffer.concat(chunks).toString();
+        if (upstream.statusCode !== 200) {
+          const mapped = translateError({
+            status: upstream.statusCode,
+            headers: upstream.headers,
+            bodyText: text,
+          });
+          return send(res, mapped.status, mapped.envelope, mapped.headers);
+        }
+        try {
+          return send(res, 200, translateModels(JSON.parse(text)));
+        } catch {
+          return send(res, 502, {
+            type: "error",
+            error: { type: "api_error", message: "upstream /models returned unparseable body" },
+          });
+        }
+      });
+    },
+  );
+  proxyReq.on("error", (err) => {
+    const mapped = translateNetworkError(err);
+    if (!res.headersSent) send(res, mapped.status, mapped.envelope);
+  });
+  proxyReq.end();
+}
+
+function handleMessages(req, res, body) {
+  const id = ++requestId;
+  const started = Date.now();
+  const url = `${UPSTREAM}/chat/completions`;
+  const diagnostics = [];
+
+  // all mutable request state up front: fail()/finalize() may run at any point after this
+  let clientGone = false;
+  let finalized = false;
+  let proxyReq = null;
+  let upstreamRes = null;
+  let headersSentToClient = false;
+  let lastActivity = Date.now();
+  let translator = null;
+  let interval = null;
+  let absolute = null;
+  let loggedResponse = false;
+  let upstreamStatus = null;
+  let emittedTruncated = false;
+  let emittedSize = 0;
+  let upstreamSize = 0;
+  const emittedFrames = [];
+  const upstreamChunks = [];
+
+  logRequest(id, req, url, body);
+
+  const finalize = (note) => {
+    if (finalized) return;
+    finalized = true;
+    if (interval) clearInterval(interval);
+    if (absolute) clearTimeout(absolute);
+    if (proxyReq && !proxyReq.destroyed) proxyReq.destroy();
+    if (LOG_FILE && note) {
+      if (translator && !loggedResponse)
+        logUpstreamResponse(id, upstreamStatus ?? null, cap(Buffer.concat(upstreamChunks))[0]);
+      if (!loggedResponse)
+        logResponse({
+          id,
+          started,
+          status: res.statusCode ?? null,
+          body: emittedFrames.length ? Buffer.concat(emittedFrames) : "",
+          note,
+          diagnostics,
+          truncated: emittedTruncated,
+        });
+    }
+  };
+
+  const fail = (mapped, note) => {
+    // PRE_STREAM envelope; only valid while the client response is still unwritten
+    if (res.headersSent || clientGone) return finalize(note);
+    loggedResponse = true;
+    logResponse({ id, started, status: mapped.status, body: JSON.stringify(mapped.envelope), note, diagnostics });
+    send(res, mapped.status, mapped.envelope, mapped.headers);
+    finalize(note);
+  };
+
+  req.on("close", () => {
+    if (!res.writableEnded) {
+      clientGone = true;
+      finalize("client-abort");
+    }
+  });
+
+  /* ---- local body checks (before any upstream contact) ---- */
+
+  let anthropicBody;
+  try {
+    anthropicBody = JSON.parse(body.toString());
+  } catch {
+    return fail(
+      {
+        status: 400,
+        envelope: {
+          type: "error",
+          error: { type: "invalid_request_error", message: "request body is not valid JSON" },
+        },
+      },
+      "bad-json",
+    );
+  }
+
+  if (body.length > MEMORY_BREAKER_BYTES)
+    return fail(
+      {
+        status: 413,
+        envelope: {
+          type: "error",
+          error: { type: "request_too_large", message: "request body exceeds local proxy cap (64 MB)" },
+        },
+      },
+      "body-cap",
+    );
+
+  const est = estimateTokens(anthropicBody);
+  if (est > OVERFLOW_TOKEN_ESTIMATE || (body.length > BYTE_CAP_BYTES && est > BYTE_CAP_MIN_TOKENS))
+    return fail(
+      {
+        status: 400,
+        envelope: {
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message: `prompt is too long (proxy estimate: ~${est} tokens > ~${CONTEXT_WINDOW} window)`,
+          },
+        },
+      },
+      "local-overflow",
+    );
+
+  if (body.length > BYTE_CAP_BYTES)
+    return fail(
+      {
+        status: 413,
+        envelope: {
+          type: "error",
+          error: {
+            type: "request_too_large",
+            message: "request body exceeds upstream ~1MB size cap; remove or shrink large images",
+          },
+        },
+      },
+      "byte-cap",
+    );
+
+  /* ---- request translation ---- */
+
+  let translated;
+  try {
+    const out = translateRequest(anthropicBody);
+    translated = out.request;
+    diagnostics.push(...out.dropped.map((d) => `dropped: ${d}`));
+  } catch (err) {
+    if (err instanceof TranslateRejection)
+      return fail({ status: err.status, envelope: err.envelope }, "translation-rejected");
+    throw err;
+  }
+
+  const ctx = {
+    msgId: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+    requestedModel: anthropicBody.model,
+    stopSequencesSent: translated.stop ?? [],
+    reasoningMode: REASONING_MODE,
+    estimatedInput: est,
+    onDiagnostic: (m) => diagnostics.push(m),
+  };
+
+  const upstreamBody = Buffer.from(JSON.stringify(translated));
+  logUpstreamRequest(id, url, upstreamBody);
+
+  /* ---- response plumbing ---- */
+
+  const collectEmitted = (buf) => {
+    if (!LOG_FILE) return;
+    if (DEBUG_MAX_BODY > 0 && emittedSize + buf.length > DEBUG_MAX_BODY) {
+      const room = DEBUG_MAX_BODY - emittedSize;
+      if (room > 0) emittedFrames.push(buf.subarray(0, room));
+      emittedSize = DEBUG_MAX_BODY;
+      emittedTruncated = true;
+      return;
+    }
+    emittedFrames.push(buf);
+    emittedSize += buf.length;
+  };
+
+  const writeEvent = (event, data) => {
+    if (clientGone || res.writableEnded) return false;
+    const buf = Buffer.from(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    collectEmitted(buf);
+    const ok = res.write(buf);
+    if (!ok && upstreamRes) {
+      upstreamRes.pause();
+      res.once("drain", () => upstreamRes && upstreamRes.resume());
+    }
+    return ok;
+  };
+
+  const writePing = () => {
+    if (clientGone || res.writableEnded) return;
+    const buf = Buffer.from(`event: ping\ndata: {"type":"ping"}\n\n`);
+    collectEmitted(buf);
+    res.write(buf);
+  };
+
+  const deadlineCheck = () => {
+    const silence = Date.now() - lastActivity;
+    if (silence >= STREAM_IDLE_MS) {
+      if (headersSentToClient) {
+        if (!finalized) {
+          writeEvent("error", {
+            type: "error",
+            error: { type: "timeout_error", message: "upstream stalled" },
+          });
+          res.end();
+          finalize("watchdog-timeout");
+        }
+      } else if (!finalized) {
+        fail(
+          {
+            status: 504,
+            envelope: {
+              type: "error",
+              error: { type: "timeout_error", message: "upstream timed out waiting for response headers" },
+            },
+          },
+          "watchdog-timeout",
+        );
+      }
+      return;
+    }
+    if (silence >= PING_INTERVAL_MS && headersSentToClient) writePing();
+  };
+
+  proxyReq = https.request(
+    url,
+    {
+      agent,
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${BEARER}`,
+        "content-length": upstreamBody.length,
+      },
+    },
+    (upstreamRaw) => {
+      lastActivity = Date.now();
+      upstreamStatus = upstreamRaw.statusCode;
+
+      if (upstreamRaw.statusCode >= 400) {
+        // PRE_STREAM error path: drain body first, then envelope; bytes stay capped at 8KB
+        const chunks = [];
+        let size = 0;
+        upstreamRaw.on("data", (c) => {
+          if (size < 8192) {
+            const slice = c.subarray(0, Math.min(c.length, 8192 - size));
+            chunks.push(slice);
+            size += slice.length;
+          }
+        });
+        upstreamRaw.on("end", () => {
+          const text = Buffer.concat(chunks).toString();
+          console.log(`POST /v1/messages ${upstreamRaw.statusCode}`);
+          fail(
+            translateError({
+              status: upstreamRaw.statusCode,
+              headers: upstreamRaw.headers,
+              bodyText: text,
+              requestedModel: anthropicBody.model,
+            }),
+            "upstream-error",
+          );
+        });
+        return;
+      }
+
+      const wantsStream = translated.stream === true;
+      const contentType = String(upstreamRaw.headers["content-type"] ?? "");
+      const isSse = contentType.includes("text/event-stream");
+
+      upstreamRes = upstreamRaw;
+      if (upstreamRaw.headers["content-encoding"] === "gzip") {
+        const gunzip = zlib.createGunzip();
+        upstreamRaw.pipe(gunzip);
+        upstreamRes = gunzip;
+        upstreamRaw.on("error", () => gunzip.destroy());
+      }
+
+      if (!wantsStream) {
+        const chunks = [];
+        upstreamRes.on("data", (c) => {
+          chunks.push(c);
+          lastActivity = Date.now();
+        });
+        upstreamRes.on("end", () => {
+          const raw = Buffer.concat(chunks);
+          logUpstreamResponse(id, upstreamStatus, cap(raw)[0]);
+          try {
+            const msg = translateCompletion(JSON.parse(raw.toString()), ctx);
+            loggedResponse = true;
+            logResponse({
+              id,
+              started,
+              status: 200,
+              body: JSON.stringify(msg),
+              note: "completed",
+              diagnostics,
+            });
+            send(res, 200, msg);
+          } catch {
+            loggedResponse = false;
+            fail(
+              {
+                status: 502,
+                envelope: {
+                  type: "error",
+                  error: { type: "api_error", message: "upstream returned unparseable completion" },
+                },
+              },
+              "parse-fail",
+            );
+            return;
+          }
+          finalize(null);
+        });
+        upstreamRes.on("error", (err) => fail(translateNetworkError(err), "upstream-error"));
+        return;
+      }
+
+      if (!isSse) {
+        // stream requested but upstream answered JSON: synthesize a one-shot SSE turn
+        const chunks = [];
+        upstreamRes.on("data", (c) => {
+          chunks.push(c);
+          lastActivity = Date.now();
+        });
+        upstreamRes.on("end", () => {
+          const raw = Buffer.concat(chunks);
+          let msg;
+          try {
+            msg = translateCompletion(JSON.parse(raw.toString()), ctx);
+          } catch {
+            fail(
+              {
+                status: 502,
+                envelope: {
+                  type: "error",
+                  error: {
+                    type: "api_error",
+                    message: "upstream returned unparseable non-SSE body to streaming request",
+                  },
+                },
+              },
+              "parse-fail",
+            );
+            return;
+          }
+          headersSentToClient = true;
+          res.writeHead(200, {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache",
+            connection: "keep-alive",
+            "x-accel-buffering": "no",
+          });
+          res.flushHeaders();
+          logUpstreamResponse(id, upstreamStatus, cap(raw)[0]);
+          writeEvent("message_start", {
+            type: "message_start",
+            message: {
+              ...msg,
+              content: [],
+              stop_reason: null,
+              stop_sequence: null,
+              usage: {
+                input_tokens: est,
+                output_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+              },
+            },
+          });
+          msg.content.forEach((block, i) => {
+            const skeleton =
+              block.type === "tool_use"
+                ? { ...block, input: {} }
+                : block.type === "thinking"
+                  ? { type: "thinking", thinking: "", signature: "" }
+                  : { type: "text", text: "" };
+            writeEvent("content_block_start", { type: "content_block_start", index: i, content_block: skeleton });
+            if (block.type === "text")
+              writeEvent("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "text_delta", text: block.text } });
+            else if (block.type === "thinking") {
+              writeEvent("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "thinking_delta", thinking: block.thinking } });
+              writeEvent("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "signature_delta", signature: block.signature } });
+            } else if (block.type === "tool_use")
+              writeEvent("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } });
+            writeEvent("content_block_stop", { type: "content_block_stop", index: i });
+          });
+          writeEvent("message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: msg.stop_reason, stop_sequence: msg.stop_sequence ?? null },
+            usage: msg.usage,
+          });
+          writeEvent("message_stop", { type: "message_stop" });
+          res.end();
+          finalize("completed");
+        });
+        upstreamRes.on("error", (err) => fail(translateNetworkError(err), "upstream-error"));
+        return;
+      }
+
+      // streaming SSE path
+      headersSentToClient = true;
+      res.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+        "x-accel-buffering": "no",
+      });
+      res.flushHeaders();
+
+      translator = createStreamTranslator(ctx, writeEvent);
+      let buffer = "";
+      let sawDone = false;
+
+      const terminalNote = () =>
+        emittedFrames.some((f) => f.includes("event: error")) ? "upstream-error" : "completed";
+
+      const processEventBlock = (block) => {
+        const dataLines = block
+          .split(/\r?\n/)
+          .filter((l) => l.startsWith("data:"))
+          .map((l) => l.slice(5).trimStart());
+        if (!dataLines.length) return;
+        const payload = dataLines.join("\n");
+        if (payload.trim() === "[DONE]") {
+          sawDone = true;
+          translator.done();
+          res.end();
+          finalize("completed");
+          return;
+        }
+        try {
+          translator.feed(JSON.parse(payload));
+        } catch {
+          diagnostics.push(`unparseable upstream data line skipped (${payload.slice(0, 120)})`);
+        }
+        if (!finalized && translator.terminated && !sawDone) {
+          res.end();
+          finalize(terminalNote());
+        }
+      };
+
+      const streamError = () => {
+        if (finalized) return;
+        // mid-stream socket failure (possibly over gunzip): never close open
+        // blocks — truncated tool args must not look complete
+        if (!translator.terminated)
+          writeEvent("error", {
+            type: "error",
+            error: { type: "api_error", message: "upstream connection closed mid-stream" },
+          });
+        res.end();
+        finalize("upstream-error");
+      };
+
+      upstreamRes.on("data", (chunk) => {
+        lastActivity = Date.now();
+        if (LOG_FILE && (DEBUG_MAX_BODY <= 0 || upstreamSize < DEBUG_MAX_BODY)) {
+          upstreamChunks.push(chunk);
+          upstreamSize += chunk.length;
+        }
+        buffer += chunk.toString();
+        const parts = buffer.split(/\r?\n\r?\n/);
+        buffer = parts.pop();
+        for (const part of parts) {
+          if (finalized) break;
+          processEventBlock(part);
+        }
+      });
+
+      upstreamRes.on("end", () => {
+        if (finalized) return;
+        if (buffer.trim()) processEventBlock(buffer);
+        if (finalized) return;
+        if (!sawDone) {
+          translator.done();
+          diagnostics.push("upstream ended without [DONE]");
+          res.end();
+          finalize(terminalNote());
+        }
+      });
+
+      upstreamRes.on("error", streamError);
+      upstreamRaw.on("error", streamError);
+    },
+  );
+
+  proxyReq.on("error", (err) => {
+    if (finalized || clientGone) return;
+    if (!headersSentToClient) return fail(translateNetworkError(err), "upstream-error");
+    writeEvent("error", {
+      type: "error",
+      error: { type: "api_error", message: "upstream connection error" },
+    });
+    res.end();
+    finalize("upstream-error");
+  });
+
+  if (translated.stream === true) {
+    interval = setInterval(deadlineCheck, 1_000);
+  } else {
+    absolute = setTimeout(() => {
+      if (finalized) return;
+      fail(
+        {
+          status: 504,
+          envelope: { type: "error", error: { type: "timeout_error", message: "upstream timed out" } },
+        },
+        "watchdog-timeout",
+      );
+    }, NONSTREAM_TIMEOUT_MS);
+  }
+
+  proxyReq.end(upstreamBody);
+}
+
+/* ================================================================== */
+/* shared helpers                                                      */
+/* ================================================================== */
+
 function rawBody(req) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
   });
 }
 
-function send(res, status, data) {
-  res.writeHead(status, { "content-type": "application/json" });
+function send(res, status, data, extraHeaders) {
+  res.writeHead(status, { "content-type": "application/json", ...(extraHeaders ?? {}) });
   res.end(JSON.stringify(data));
 }
 
@@ -123,20 +752,6 @@ function cors(res) {
     "access-control-allow-methods": "POST, GET, OPTIONS",
   });
   res.end();
-}
-
-function estimateTokens({ system, messages }) {
-  let chars = 0;
-  const add = (s) => { if (typeof s === "string") chars += s.length; };
-  if (system) {
-    if (typeof system === "string") add(system);
-    else if (Array.isArray(system)) system.forEach((b) => add(b.text));
-  }
-  for (const msg of messages ?? []) {
-    if (typeof msg.content === "string") add(msg.content);
-    else if (Array.isArray(msg.content)) msg.content.forEach((b) => add(b.text));
-  }
-  return Math.max(1, Math.floor(chars / 4));
 }
 
 /* ---------- debug logging ---------- */
@@ -157,6 +772,7 @@ function openDebugLog() {
           `=== corti-claude-proxy debug log ===`,
           `started:  ${new Date().toISOString()}`,
           `pid:      ${process.pid}`,
+          `mode:     ${MODE}`,
           `upstream: ${UPSTREAM}`,
           `body cap: ${DEBUG_MAX_BODY > 0 ? `${DEBUG_MAX_BODY} bytes` : "unlimited"}`,
           "",
@@ -190,7 +806,7 @@ function writeEntry(lines) {
   }
 }
 
-function logRequest(id, req, reqPath, target, body) {
+function logRequest(id, req, target, body) {
   if (!LOG_FILE) return;
   writeEntry([
     `=== #${id} REQUEST ${new Date().toISOString()} ===`,
@@ -200,13 +816,32 @@ function logRequest(id, req, reqPath, target, body) {
   ]);
 }
 
-function logResponse(id, started, status, headers, body, note, truncated) {
+function logUpstreamRequest(id, url, body) {
+  if (!LOG_FILE) return;
+  writeEntry([
+    `=== #${id} UPSTREAM-REQUEST ${new Date().toISOString()} ===`,
+    `POST ${url}`,
+    ...formatBody(...cap(body)),
+  ]);
+}
+
+function logUpstreamResponse(id, status, body) {
+  if (!LOG_FILE) return;
+  writeEntry([
+    `=== #${id} UPSTREAM-RESPONSE ${new Date().toISOString()} ===`,
+    `status: ${status ?? "none"}`,
+    ...formatBody(...cap(body)),
+  ]);
+}
+
+function logResponse({ id, started, status, headers, body, note, diagnostics, truncated }) {
   if (!LOG_FILE) return;
   writeEntry([
     `=== #${id} RESPONSE ${new Date().toISOString()} (${Date.now() - started}ms) ===`,
     `status: ${status ?? "none"}${note ? ` — ${note}` : ""}`,
     ...(headers ? [`headers: ${JSON.stringify(redact(headers))}`] : []),
     ...formatBody(body, truncated),
+    ...(diagnostics?.length ? [`diagnostics:`, ...diagnostics.map((d) => `  - ${d}`)] : []),
   ]);
 }
 
@@ -234,8 +869,15 @@ function teeResponse(id, started, upstream, res) {
   const finish = (note) => {
     if (logged) return;
     logged = true;
-    const body = Buffer.concat(chunks);
-    logResponse(id, started, upstream.statusCode, upstream.headers, body, note, truncated);
+    logResponse({
+      id,
+      started,
+      status: upstream.statusCode,
+      headers: upstream.headers,
+      body: Buffer.concat(chunks),
+      note,
+      truncated,
+    });
   };
 
   upstream.on("end", () => finish());
