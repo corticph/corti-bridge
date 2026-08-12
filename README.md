@@ -152,6 +152,7 @@ Compared to first-party Anthropic, this setup cannot support:
 
 - **WebSearch and other server-side tools** — they're stripped from requests; the model has no live web access.
 - **PDF input** — base64 PDF document blocks are replaced with a visible `[PDF document omitted...]` placeholder.
+- **Misleading `[1M]` context badge** — newer Claude Code versions badge proxied models with a `[1M]` suffix via the server-side `context-1m` beta gate, even though the real window is 256k. `setup.sh` neutralizes it with `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`; if the badge still shows, delete that env value only if you actually want 1M behavior.
 - **Image support depends on the resolved model** — e.g. upstream rejects images for `corti-s1` (DS V4F) with a clean 400, while `corti-s1-ultra-beta` and `corti-s1-mini-instant` accept them. Pick a multimodal tier in `settings.json` if you use image workflows.
 - **Prompt-caching economics** — caching is upstream's automatic prefix cache; usage reports zeros for cache fields when caching isn't active.
 - **Reasoning signatures are synthetic** — thinking blocks emitted by the proxy carry a constant signature (`corti-proxy`, base64). Claude Code accepts and re-sends them; the proxy strips them from history on re-entry. If you ever take a session from `~/.corti-claude` and resume it against real Anthropic, those blocks will fail server-side signature validation — filter them out first.

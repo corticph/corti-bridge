@@ -81,6 +81,7 @@ detect_models() {
             env.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME = m.custom;
         }
         env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "262144";
+        env.CLAUDE_CODE_DISABLE_1M_CONTEXT = "1";
         fs.writeFileSync(path, JSON.stringify({ env: env }, null, 2) + "\n");
     ' "$CORTI_DIR/settings.json" "$mapping"
 
@@ -94,6 +95,7 @@ detect_models() {
     echo "" >&2
     echo "Wrote $CORTI_DIR/settings.json — edit it anytime to change these." >&2
     echo "Context window is set to 262144 (probed on all current tiers); edit if Corti ships smaller-context models." >&2
+    echo "CLAUDE_CODE_DISABLE_1M_CONTEXT=1 hides the misleading [1M] context badge in the app." >&2
 }
 
 case "${1:-}" in
