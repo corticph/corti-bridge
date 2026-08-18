@@ -103,7 +103,7 @@ const server = http.createServer((req, res) => {
       debug: LOG_FILE ?? false,
     });
 
-  if (MODE === "anthropic") return handlePassthrough(req, res);
+  if (MODE === "anthropic") return void handlePassthrough(req, res).catch(proxyFailure(res));
   return handleOpenAI(req, res);
 });
 
@@ -246,11 +246,7 @@ function handleOpenAI(req, res) {
         error: { type: "not_found_error", message: `unknown route: ${req.method} ${reqPath}` },
       });
     })
-    .catch((err) => {
-      console.error(err);
-      if (!res.headersSent)
-        send(res, 500, { type: "error", error: { type: "api_error", message: "proxy failure" } });
-    });
+    .catch(proxyFailure(res));
 }
 
 function handleCountTokens(res, body) {
@@ -913,6 +909,16 @@ function rawBody(req) {
 function send(res, status, data, extraHeaders) {
   res.writeHead(status, { "content-type": "application/json", ...(extraHeaders ?? {}) });
   res.end(JSON.stringify(data));
+}
+
+// Both handlers are async. An unhandled rejection terminates the process on Node 22, so an
+// error in one mode would take down every in-flight session in the other.
+function proxyFailure(res) {
+  return (err) => {
+    console.error(err);
+    if (!res.headersSent)
+      send(res, 500, { type: "error", error: { type: "api_error", message: "proxy failure" } });
+  };
 }
 
 function cors(res) {
