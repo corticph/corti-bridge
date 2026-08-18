@@ -57,6 +57,47 @@ const wsTools = (await translateRequest({
 })).request.tools;
 check("websearch: converted to function tool", wsTools?.length === 1 && wsTools[0]?.function?.name === "WebSearch", true);
 
+// consult_advisor: tool def injected when CORTI_ADVISOR_TOOL is set, in both gateway modes.
+process.env.CORTI_ADVISOR_TOOL = "1";
+const advBody = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }] };
+await applyIntercepts(advBody);
+check("advisor: tool def injected", advBody.tools?.some((t) => t.name === "consult_advisor"), true);
+check("advisor: schema has focus", advBody.tools?.find((t) => t.name === "consult_advisor")?.input_schema?.properties?.focus?.type, "string");
+// The openai translate path filters tools to input_schema + string name; ours has both, so it survives.
+const advTools = (await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }],
+})).request.tools;
+check("advisor: survives openai filter", advTools?.some((t) => t.function?.name === "consult_advisor"), true);
+
+// Guard: not injected when the env var is unset.
+delete process.env.CORTI_ADVISOR_TOOL;
+const advBody2 = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [] };
+await applyIntercepts(advBody2);
+check("advisor: not injected when unset", advBody2.tools.length, 0);
+
+// Result rewrite with a stubbed runAdvisor — hermetic, no child_process spawn. Mirrors the
+// shape Claude Code produces: an error tool_result ("Unknown tool: ...", is_error:true) that
+// it round-trips in the next request; the intercept overwrites both content AND is_error.
+process.env.CORTI_ADVISOR_TOOL = "1";
+const stub = async (focus) => `stub advice for: ${focus}`;
+const advBody3 = {
+  model: "corti-s1", max_tokens: 16,
+  messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "tu_adv1", name: "consult_advisor", input: { focus: "the plan" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_adv1", content: "Unknown tool: consult_advisor", is_error: true }] },
+  ],
+};
+await applyIntercepts(advBody3, { runAdvisor: stub });
+const advResult = advBody3.messages[1].content[0];
+check("advisor: result rewritten", advResult.content, "Advisor feedback:\n\nstub advice for: the plan");
+check("advisor: is_error cleared", advResult.is_error, false);
+
+// Idempotency: don\x27t inject twice if the tool is already present.
+const advBody4 = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [{ name: "consult_advisor", input_schema: { type: "object" } }] };
+await applyIntercepts(advBody4);
+check("advisor: no duplicate injection", advBody4.tools.filter((t) => t.name === "consult_advisor").length, 1);
+delete process.env.CORTI_ADVISOR_TOOL;
+
 // Claude Code parses the digit pair out of our message to size compaction; when the match
 // fails it tells the user the conversation cannot be compacted at all.
 const CC_OVERFLOW_RE = /prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)/i;

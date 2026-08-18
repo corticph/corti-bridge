@@ -206,6 +206,9 @@ Read directly from the shell — no local secrets file.
 | `CORTI_DEBUG` | no | Any value except `0`/`false`/`no`/`off` turns on request/response logging |
 | `CORTI_DEBUG_DIR` | no | Where debug logs go; defaults per platform (see [Debug logging](#debug-logging)) |
 | `CORTI_DEBUG_MAX_BODY` | no | Per-body byte cap, default `2097152` (2 MB); `0` means unlimited |
+| `CORTI_ADVISOR_TOOL` | no | Opt in the `consult_advisor` client-side tool intercept — injects an advisor tool the model can call, and synthesizes its `tool_result` by spawning a headless `corti-claude -p --model <CORTI_ADVISOR_MODEL>`. Off by default; the advisor child is spawned without this var so it can't recurse. |
+| `CORTI_ADVISOR_MODEL` | no | Model alias for the advisor backing (default `opus`); resolved by the wrapper, so use a tier alias (`opus`, `sonnet`, `haiku`, `fable`), not a `claude-` name |
+| `CORTI_ADVISOR_TIMEOUT_MS` | no | Bound on the advisor spawn, default `60000`; on timeout the `tool_result` becomes `(no response)` rather than hanging the turn |
 
 `CC_PROXY_BIN_DIR` (defaults to `~/.local/bin`) controls where the wrapper is installed. `CC_PROXY_CONFIG_DIR` (defaults to `~/.corti-claude`) is the proxy's own state directory — model mapping, profile choice, gateway log. `CC_PROXY_DIR` tells the wrapper where `gateway.mjs` lives; `setup.sh` bakes your clone's real path into the installed wrapper, so you only need this if you move the clone afterwards.
 

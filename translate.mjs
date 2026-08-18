@@ -1,6 +1,9 @@
 // translate.mjs — Anthropic Messages ⇄ OpenAI Chat Completions wire translation.
 
 import https from "node:https";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 export const REASONING_SIGNATURE = "Y29ydGktcHJveHk="; // base64 "corti-proxy"
 
@@ -212,6 +215,86 @@ function formatSearchResults(query, results) {
 }
 
 /* ------------------------------------------------------------------ */
+/* advisor: headless corti-claude backing (consult_advisor intercept)  */
+/* ------------------------------------------------------------------ */
+
+// The advisor runs as a headless `corti-claude -p` session through this same gateway, so it
+// inherits the Corti model mapping. The recursion guard has two layers: the env var below
+// gates injection on the gateway, and the advisor child is spawned WITHOUT it (so its own
+// requests don't re-inject) and with `--tools ""` (so it can't emit a tool_use at all).
+const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
+const ADVISOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-prompt.txt");
+const ADVISOR_TIMEOUT_MS = Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 60_000;
+const ADVISOR_MODEL = process.env.CORTI_ADVISOR_MODEL || "opus";
+
+const ADVISOR_TOOL_NAME = "consult_advisor";
+const ADVISOR_TOOL_NAMES = new Set([ADVISOR_TOOL_NAME]);
+const ADVISOR_TOOL_DEF = {
+  name: ADVISOR_TOOL_NAME,
+  description:
+    "Consult a senior advisor for a second opinion or review. Use 'focus' to say what you " +
+    "want advice on. Call this when you want an advisor review before proceeding.",
+  input_schema: {
+    type: "object",
+    properties: {
+      focus: {
+        type: "string",
+        description:
+          "What you want the advisor to focus on — the question, decision, or part of the " +
+          "conversation you'd like a second opinion on. Include whatever context the advisor needs.",
+      },
+    },
+    required: ["focus"],
+  },
+};
+
+// Runs the advisor as a headless corti-claude session. Resolves to the advisor's text, or null
+// on timeout / spawn failure / unparseable output. The child env has CORTI_ADVISOR_TOOL stripped
+// so the child's own requests through the proxy don't re-inject the tool (recursion guard).
+export function runAdvisor(focus) {
+  return new Promise((resolve) => {
+    const args = [
+      "-p",
+      "--model", ADVISOR_MODEL,
+      "--output-format", "json",
+      "--system-prompt-file", ADVISOR_PROMPT_FILE,
+      "--tools", "",
+      "--input-format", "text",
+    ];
+    const env = { ...process.env };
+    delete env.CORTI_ADVISOR_TOOL;
+    const child = execFile("corti-claude", args, {
+      env,
+      timeout: ADVISOR_TIMEOUT_MS,
+      maxBuffer: 4 * 1024 * 1024,
+    }, (err, stdout) => {
+      if (err) return resolve(null);
+      try {
+        // --output-format json emits a JSON array of event objects; the result text is on the
+        // element with type === "result". Fall back to result.text, then raw stdout.
+        const out = stdout.toString().trim();
+        const arr = JSON.parse(out);
+        const items = Array.isArray(arr) ? arr : [arr];
+        const result = items.find((o) => o && o.type === "result");
+        const text =
+          (typeof result?.result === "string" && result.result) ||
+          (typeof result?.text === "string" && result.text) ||
+          out;
+        return resolve(text || null);
+      } catch {
+        return resolve(null);
+      }
+    });
+    child.stdin.on("error", () => {}); // child closed stdin before we wrote
+    child.stdin.end(String(focus ?? ""));
+  });
+}
+
+// Default backing used when no runAdvisor is injected via ctx (production). Aliased rather than
+// re-declared to avoid a TDZ reference before runAdvisor is initialised.
+const defaultRunAdvisor = runAdvisor;
+
+/* ------------------------------------------------------------------ */
 /* intercept registry — shared by both gateway modes                   */
 /* ------------------------------------------------------------------ */
 
@@ -256,13 +339,54 @@ async function interceptWebSearch(body, { toolUseMap }) {
   return diagnostics;
 }
 
+// Local truthiness check so translate.mjs stays zero-dependency (the gateway's isTruthy lives
+// in gateway.mjs). Mirrors its semantics.
+function isTruthyEnv(v) {
+  return v != null && !["", "0", "false", "no", "off"].includes(String(v).toLowerCase());
+}
+
+// Injects the consult_advisor tool def and rewrites its tool_result blocks with the advisor's
+// output. Gated by CORTI_ADVISOR_TOOL; the runAdvisor dependency is injectable via ctx so tests
+// stay hermetic (no child_process spawn).
+async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor } = {}) {
+  if (!isTruthyEnv(process.env.CORTI_ADVISOR_TOOL)) return [];
+  const diagnostics = [];
+
+  // (a) inject the tool def so the model sees it (idempotent — don't push if present)
+  if (Array.isArray(body.tools)) {
+    if (!body.tools.some((t) => t && t.name === ADVISOR_TOOL_NAME)) body.tools.push(ADVISOR_TOOL_DEF);
+  } else {
+    body.tools = [ADVISOR_TOOL_DEF];
+  }
+
+  // (b) rewrite tool_result blocks for consult_advisor calls. Claude Code synthesizes an error
+  // tool_result ("Unknown tool: consult_advisor", is_error:true) for the unknown tool and
+  // round-trips it in the next request; we overwrite both content AND is_error here.
+  const call = runAdvisor || defaultRunAdvisor;
+  for (const msg of body.messages ?? []) {
+    if (msg?.role !== "user" || !Array.isArray(msg.content)) continue;
+    for (const b of msg.content) {
+      if (b?.type !== "tool_result") continue;
+      const toolUse = toolUseMap.get(b.tool_use_id);
+      if (!toolUse || !ADVISOR_TOOL_NAMES.has(toolUse.name)) continue;
+      const focus = toolUse.input?.focus ?? "";
+      const out = await call(focus);
+      b.content = out ? `Advisor feedback:\n\n${out}` : "Advisor feedback: (no response)";
+      b.is_error = false;
+      diagnostics.push(`advisor intercepted: focus="${focus.slice(0, 60)}"`);
+    }
+  }
+  return diagnostics;
+}
+
 const intercepts = [
   interceptModelMapping,
   interceptWebSearch,
+  interceptConsultAdvisor,
 ];
 
-export async function applyIntercepts(body) {
-  const ctx = { toolUseMap: buildToolUseMap(body) };
+export async function applyIntercepts(body, opts) {
+  const ctx = { toolUseMap: buildToolUseMap(body), ...(opts || {}) };
   const diagnostics = [];
   for (const fn of intercepts) {
     const diags = await fn(body, ctx);
