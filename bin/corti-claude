@@ -4,32 +4,232 @@
 set -eu
 
 CORTI_DIR="${CC_PROXY_CONFIG_DIR:-$HOME/.corti-claude}"
-PROXY_DIR="${CC_PROXY_DIR:-$HOME/projects/corti-claude-proxy}"
-GATEWAY="http://127.0.0.1:4000"
+PROXY_DIR="${CC_PROXY_DIR:-/path/to/corti-claude-proxy}"  # setup.sh rewrites this to the real clone path at install time
+GATEWAY="http://${CORTI_HOST:-127.0.0.1}:${CORTI_PORT:-4192}"
+
+# Gateway lifecycle. Defined up here so --stop / --restart (parsed next) can use them
+# before the credential and claude-installed guards run; the launch flow calls them too.
+gateway_health() {
+    curl -sf --max-time 1 "$GATEWAY/health" 2>/dev/null || true
+}
+
+# Match the payload, not just a 200: any process on this port could answer the status code.
+gateway_is_ours() {
+    case "${1:-}" in *'"status":"healthy"'*) return 0 ;; *) return 1 ;; esac
+}
+
+# Stop the gateway if it is ours; idempotent; returns 1 if it will not die.
+gateway_stop() {
+    [ -n "$(gateway_health)" ] || return 0
+    pkill -f "$PROXY_DIR/gateway.mjs" 2>/dev/null || true
+    sleep 1
+    # pkill may be absent or may not match; re-check so a stale gateway isn't used silently.
+    if [ -n "$(gateway_health)" ]; then
+        return 1
+    fi
+    return 0
+}
+
+# Start the gateway and wait for it to answer health. Caller has already confirmed creds.
+gateway_start() {
+    # An uninstalled wrapper still holds the placeholder path; say so instead of polling for 20s.
+    if [ ! -f "$PROXY_DIR/gateway.mjs" ]; then
+        echo "corti-claude: no gateway.mjs at $PROXY_DIR" >&2
+        echo "corti-claude: run ./setup.sh from your clone to install the wrapper, or set CC_PROXY_DIR to the clone path" >&2
+        exit 1
+    fi
+    nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 &
+    i=1
+    while [ "$i" -le 40 ]; do
+        gateway_is_ours "$(gateway_health)" && return 0
+        sleep 0.5
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# --stop / --restart bypass the credential and claude-installed guards: --stop needs
+# neither; --restart needs creds but not claude.
+case "${1:-}" in
+    --stop)
+        mkdir -p "$CORTI_DIR"
+        if gateway_stop; then
+            echo "corti-claude: gateway stopped" >&2
+            exit 0
+        fi
+        echo "corti-claude: the gateway on $GATEWAY didn't stop — stop it manually (pkill -f gateway.mjs)" >&2
+        exit 1
+        ;;
+    --restart)
+        mkdir -p "$CORTI_DIR"
+        # Creds before kill: don't drop a working gateway for a missing token.
+        if [ -z "${CORTI_BEARER:-}" ] || [ -z "${CORTI_BASE_URL:-}" ]; then
+            echo "corti-claude: CORTI_BEARER and CORTI_BASE_URL must be set to restart the gateway" >&2
+            exit 1
+        fi
+        if ! gateway_stop; then
+            echo "corti-claude: the gateway on $GATEWAY didn't stop — stop it manually (pkill -f gateway.mjs)" >&2
+            exit 1
+        fi
+        if ! gateway_start; then
+            echo "corti-claude: gateway failed to start — see $CORTI_DIR/gateway.log" >&2
+            exit 1
+        fi
+        echo "corti-claude: gateway restarted" >&2
+        exit 0
+        ;;
+    --help|-h)
+        cat >&2 <<EOF
+corti-claude — Claude Code on Corti models.
+
+Usage: corti-claude [--anthropic] [args passed to claude]
+       corti-claude --stop
+       corti-claude --restart
+
+  (default)    Start the gateway if needed, then launch claude
+  --anthropic  Use Corti's /anthropic pass-through mode (default: openai translator)
+  --stop       Stop the gateway and exit
+  --restart    Stop then start the gateway and exit (needs CORTI_BEARER/CORTI_BASE_URL)
+  --help       Show this
+EOF
+        exit 0
+        ;;
+esac
 
 if [ -z "${CORTI_BEARER:-}" ] || [ -z "${CORTI_BASE_URL:-}" ]; then
     echo "corti-claude: CORTI_BEARER and CORTI_BASE_URL must be set in your environment" >&2
+    echo "corti-claude: run 'npx @corti/cli models init', then open a new terminal" >&2
+    exit 1
+fi
+
+# Looser than the gateway's own regex (glob can't express [a-z0-9-]+); this only turns a
+# silent startup timeout into an immediate message — the gateway enforces the real check.
+case "$CORTI_BASE_URL" in
+    https://ai.*.corti.app/v1) ;;
+    *)
+        echo "corti-claude: CORTI_BASE_URL must look like https://ai.<env>.corti.app/v1 (got: $CORTI_BASE_URL)" >&2
+        exit 1
+        ;;
+esac
+
+if ! command -v claude >/dev/null 2>&1; then
+    echo "corti-claude: the 'claude' command isn't on your PATH - install Claude Code first" >&2
     exit 1
 fi
 
 mkdir -p "$CORTI_DIR"
 
-if ! curl -sf -o /dev/null --max-time 1 "$GATEWAY/health"; then
+# --anthropic selects anthropic pass-through mode; default is openai (translating gateway).
+# The flag is consumed here; remaining args pass through to claude.
+want_mode=openai
+new_args=""
+for _arg in "$@"; do
+    if [ "$_arg" = "--anthropic" ]; then
+        want_mode=anthropic
+    else
+        _esc=$(printf '%s' "$_arg" | sed "s/'/'\\\\''/g")
+        new_args="${new_args:+$new_args }'$_esc'"
+    fi
+done
+unset _arg _esc
+export CORTI_UPSTREAM_MODE="$want_mode"
+
+case "${CORTI_DEBUG:-}" in
+    '' | 0 | false | no | off) want_debug=0 ;;
+    *) want_debug=1 ;;
+esac
+
+if [ "$want_mode" = anthropic ]; then
+    want_upstream="${CORTI_BASE_URL%/v1}/anthropic"
+else
+    want_upstream="$CORTI_BASE_URL"
+fi
+
+health="$(gateway_health)"
+if [ -n "$health" ] && ! gateway_is_ours "$health"; then
+    echo "corti-claude: something else is listening on $GATEWAY - set CORTI_PORT to a free port" >&2
+    exit 1
+fi
+
+# The gateway outlives any single invocation, so a state mismatch needs a restart.
+if [ -n "$health" ]; then
+    restart_reason=""
+    case "$health" in
+        *'"debug":"'*) has_debug=1 ;;
+        *) has_debug=0 ;;
+    esac
+    if [ "$want_debug" != "$has_debug" ]; then
+        restart_reason="debug mode changed"
+    fi
+    case "$health" in
+        *"\"mode\":\"$want_mode\""*) ;;
+        *'"mode":'*)
+            if [ -z "$restart_reason" ]; then restart_reason="upstream mode changed"; fi ;;
+        *)
+            if [ -z "$restart_reason" ]; then restart_reason="gateway is an older build (restarting to upgrade)"; fi ;;
+    esac
+    # A changed CORTI_BASE_URL means the running gateway is ours but stale — restart, not fail.
+    case "$health" in
+        *"\"upstream\":\"$want_upstream\""*) ;;
+        *'"upstream":'*)
+            if [ -z "$restart_reason" ]; then restart_reason="CORTI_BASE_URL changed"; fi ;;
+    esac
+    if [ -n "$restart_reason" ]; then
+        echo "corti-claude: $restart_reason — restarting gateway..." >&2
+        if ! gateway_stop; then
+            echo "corti-claude: warning — the old gateway on $GATEWAY didn't stop; stop it manually and retry" >&2
+        fi
+    fi
+fi
+
+if ! gateway_is_ours "$(gateway_health)"; then
     echo "corti-claude: starting gateway..." >&2
-    nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 &
-    i=1
-    while [ "$i" -le 40 ]; do
-        curl -sf -o /dev/null --max-time 1 "$GATEWAY/health" && break
-        sleep 0.5
-        i=$((i + 1))
-    done
-    if ! curl -sf -o /dev/null --max-time 1 "$GATEWAY/health"; then
+    if ! gateway_start; then
         echo "corti-claude: gateway failed to start — see $CORTI_DIR/gateway.log" >&2
         exit 1
     fi
 fi
 
+if [ "$want_debug" = 1 ]; then
+    log_path="$(curl -sf --max-time 1 "$GATEWAY/health" 2>/dev/null |
+        sed -n 's/.*"debug":"\([^"]*\)".*/\1/p')"
+    if [ -n "$log_path" ]; then
+        echo "corti-claude: debug log -> $log_path" >&2
+    else
+        echo "corti-claude: warning — gateway isn't debug-logging; stop it manually and retry" >&2
+    fi
+fi
+
+# Model aliases live here rather than in settings.json so they never leak into a plain `claude`.
+# Both files absent leaves this inert.
+if [ -f "$CORTI_DIR/models.env" ]; then
+    . "$CORTI_DIR/models.env"
+    export ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
+    export CLAUDE_CODE_MAX_CONTEXT_TOKENS
+    # Capabilities are optional; Claude Code infers by name when they're absent.
+    for _cap in OPUS SONNET HAIKU; do
+        eval "[ -n \"\${ANTHROPIC_DEFAULT_${_cap}_MODEL_SUPPORTED_CAPABILITIES:-}\" ]" &&
+            export "ANTHROPIC_DEFAULT_${_cap}_MODEL_SUPPORTED_CAPABILITIES"
+    done
+    unset _cap
+    if [ -n "${ANTHROPIC_DEFAULT_FABLE_MODEL:-}" ]; then
+        export ANTHROPIC_DEFAULT_FABLE_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL_NAME
+        [ -n "${ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES:-}" ] &&
+            export ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES
+    fi
+fi
+
+profile_dir="$CORTI_DIR"
+if [ -f "$CORTI_DIR/profile.env" ]; then
+    . "$CORTI_DIR/profile.env"
+    profile_dir="${CLAUDE_CONFIG_DIR:-$CORTI_DIR}"
+fi
+
 export ANTHROPIC_BASE_URL="$GATEWAY"
 export ANTHROPIC_AUTH_TOKEN="local-gateway"
+# Per-request attribution text in the system prompt defeats upstream prefix caching.
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0
+# The [1M] badge newer Claude Code versions show for proxied models is misleading here.
+export CLAUDE_CODE_DISABLE_1M_CONTEXT=1
 
-CLAUDE_CONFIG_DIR="$CORTI_DIR" exec claude "$@"
+CLAUDE_CONFIG_DIR="$profile_dir" eval exec claude $new_args
