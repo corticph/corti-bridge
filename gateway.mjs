@@ -501,7 +501,7 @@ async function handleMessages(req, res, body) {
         const gunzip = zlib.createGunzip();
         upstreamRaw.pipe(gunzip);
         upstreamRes = gunzip;
-        upstreamRaw.on("error", () => gunzip.destroy());
+        upstreamRaw.on("error", (err) => gunzip.destroy(err));
       }
 
       if (!wantsStream) {

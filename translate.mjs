@@ -185,8 +185,14 @@ function decodeHtml(s) {
     .replace(/&nbsp;/g, " ")
     .replace(/&#0183;/g, "·")
     .replace(/&#035;/g, "#")
-    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&#(\d+);/g, (_, n) => {
+      const cp = Number(n);
+      return cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : "";
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => {
+      const cp = parseInt(n, 16);
+      return cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : "";
+    })
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -765,14 +771,11 @@ export function translateNetworkError(err) {
 /* non-streaming response                                              */
 /* ------------------------------------------------------------------ */
 
-function anthropicStop(choice, stopSequencesSent) {
+function anthropicStop(choice) {
   const fr = choice?.finish_reason;
-  const sr = choice?.stop_reason;
   if (fr === "length") return { stop_reason: "max_tokens", stop_sequence: null };
   if (fr === "tool_calls") return { stop_reason: "tool_use", stop_sequence: null };
-  if (fr === "stop" && typeof sr === "string" && stopSequencesSent.includes(sr))
-    return { stop_reason: "stop_sequence", stop_sequence: sr };
-  if (fr === "stop") return { stop_reason: "end_turn", stop_sequence: null };
+  // OpenAI's finish_reason "stop" doesn't identify a matched stop sequence, so map to end_turn.
   return { stop_reason: "end_turn", stop_sequence: null };
 }
 
@@ -823,7 +826,7 @@ export function translateCompletion(completion, ctx) {
     role: "assistant",
     content,
     model: ctx.requestedModel,
-    ...anthropicStop(choice, ctx.stopSequencesSent),
+    ...anthropicStop(choice),
     usage: anthropicUsage(completion.usage),
   };
 }
@@ -958,7 +961,7 @@ export function createStreamTranslator(ctx, emit) {
 
   const finish = (choice) => {
     finishSeen = true;
-    pendingStop = anthropicStop(choice, ctx.stopSequencesSent);
+    pendingStop = anthropicStop(choice);
     closeOpen();
   };
 

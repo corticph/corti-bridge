@@ -124,9 +124,14 @@ mkdir -p "$CORTI_DIR"
 want_mode=openai
 new_args=""
 for _arg in "$@"; do
-    [ "$_arg" = "--anthropic" ] && want_mode=anthropic || new_args="${new_args:+$new_args }'$_arg'"
+    if [ "$_arg" = "--anthropic" ]; then
+        want_mode=anthropic
+    else
+        _esc=$(printf '%s' "$_arg" | sed "s/'/'\\\\''/g")
+        new_args="${new_args:+$new_args }'$_esc'"
+    fi
 done
-unset _arg
+unset _arg _esc
 export CORTI_UPSTREAM_MODE="$want_mode"
 
 case "${CORTI_DEBUG:-}" in
