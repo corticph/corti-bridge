@@ -842,7 +842,6 @@ export function createStreamTranslator(ctx, emit) {
   let nextBlockIndex = 0;
   const toolBlocks = new Map(); // upstream tool_calls index -> { blockIndex, closed }
   let pendingStop = null;
-  let finishSeen = false;
   let doneEmitted = false;
   let terminated = false;
   let latestUsage = null;
@@ -960,7 +959,6 @@ export function createStreamTranslator(ctx, emit) {
   };
 
   const finish = (choice) => {
-    finishSeen = true;
     pendingStop = anthropicStop(choice);
     closeOpen();
   };
@@ -1032,15 +1030,8 @@ export function createStreamTranslator(ctx, emit) {
       emit("message_stop", { type: "message_stop" });
     },
 
-    abort() {
-      terminated = true;
-    },
-
     get terminated() {
       return terminated;
-    },
-    get finishSeen() {
-      return finishSeen;
     },
   };
 }

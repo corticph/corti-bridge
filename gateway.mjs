@@ -30,10 +30,10 @@ const HOST = process.env.CORTI_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.CORTI_PORT ?? 4192);
 const BEARER = process.env.CORTI_BEARER;
 const BASE_URL = process.env.CORTI_BASE_URL;
-// Mode is per request, not per process — see ANTHROPIC_PREFIX below. This is read once at
-// boot solely so a pre-dispatch wrapper, which sets it and never adds a path prefix, still
-// gets pass-through on bare paths. Nothing else may consult it.
-const LEGACY_COMPAT = process.env.CORTI_UPSTREAM_MODE === "anthropic";
+// What a request carrying no mode prefix resolves to. Normally openai; a wrapper predating
+// path dispatch sets CORTI_UPSTREAM_MODE and cannot add a prefix, so its bare requests have
+// to keep meaning pass-through. Read once at boot — mode is otherwise per request.
+const BARE_PATH_IS_ANTHROPIC = process.env.CORTI_UPSTREAM_MODE === "anthropic";
 const REASONING_MODE = ["thinking", "text", "drop"].includes(process.env.CORTI_REASONING_MODE)
   ? process.env.CORTI_REASONING_MODE
   : "thinking";
@@ -105,8 +105,7 @@ function splitPath(url) {
   const reqPath = (url ?? "").split("?")[0];
   if (reqPath === ANTHROPIC_PREFIX || reqPath.startsWith(`${ANTHROPIC_PREFIX}/`))
     return { anthropic: true, path: reqPath.slice(ANTHROPIC_PREFIX.length) || "/" };
-  // A bare path means openai, except for a legacy wrapper that cannot add the prefix at all.
-  return { anthropic: LEGACY_COMPAT, path: reqPath };
+  return { anthropic: BARE_PATH_IS_ANTHROPIC, path: reqPath };
 }
 
 const server = http.createServer((req, res) => {
@@ -129,9 +128,9 @@ function healthPayload() {
   return {
     status: "healthy",
     gatewayVersion: 2,
-    // Truthfully: what a request with no prefix resolves to. A pre-dispatch wrapper compares
-    // this against the mode it wants, so the value has to describe bare-path behaviour.
-    mode: LEGACY_COMPAT ? "anthropic" : "openai",
+    // A pre-dispatch wrapper compares this against the mode it wants, so it has to describe
+    // bare-path behaviour rather than naming a process-wide mode that no longer exists.
+    mode: BARE_PATH_IS_ANTHROPIC ? "anthropic" : "openai",
     upstream: BASE_URL,
     debug: LOG_FILE ?? false,
   };
@@ -203,18 +202,15 @@ async function handlePassthrough(req, res, reqPath) {
   logRequest(id, req, target, body);
 
   if (isCountTokens) {
-    try {
-      const result = { input_tokens: estimateTokens(JSON.parse(body.toString())) };
-      logResponse({ id, started, status: 200, body: JSON.stringify(result), note: "handled locally" });
-      return send(res, 200, result);
-    } catch {
-      const envelope = {
-        type: "error",
-        error: { type: "invalid_request_error", message: "request body is not valid JSON" },
-      };
-      logResponse({ id, started, status: 400, body: JSON.stringify(envelope), note: "handled locally" });
-      return send(res, 400, envelope);
-    }
+    const counted = countTokens(body);
+    logResponse({
+      id,
+      started,
+      status: counted.status,
+      body: JSON.stringify(counted.payload),
+      note: "handled locally",
+    });
+    return send(res, counted.status, counted.payload);
   }
 
   const proxyReq = https.request(
@@ -268,7 +264,10 @@ function handleOpenAI(req, res, reqPath) {
   return rawBody(req)
     .then((body) => {
       if (req.method === "POST" && reqPath === "/v1/messages") return handleMessages(req, res, body);
-      if (req.method === "POST" && reqPath === "/v1/messages/count_tokens") return handleCountTokens(res, body);
+      if (req.method === "POST" && reqPath === "/v1/messages/count_tokens") {
+        const counted = countTokens(body);
+        return send(res, counted.status, counted.payload);
+      }
       if (req.method === "GET" && reqPath === "/v1/models") return handleModels(res);
       if (req.method === "POST" && reqPath === "/api/event_logging/batch") return send(res, 200, {});
       return send(res, 404, {
@@ -279,14 +278,19 @@ function handleOpenAI(req, res, reqPath) {
     .catch(proxyFailure(res));
 }
 
-function handleCountTokens(res, body) {
+// Neither upstream offers token counting — the OpenAI API has no such endpoint and Corti's
+// /anthropic 404s on it — so both routes answer locally from the same estimate.
+function countTokens(body) {
   try {
-    return send(res, 200, { input_tokens: estimateTokens(JSON.parse(body.toString())) });
+    return { status: 200, payload: { input_tokens: estimateTokens(JSON.parse(body.toString())) } };
   } catch {
-    return send(res, 400, {
-      type: "error",
-      error: { type: "invalid_request_error", message: "request body is not valid JSON" },
-    });
+    return {
+      status: 400,
+      payload: {
+        type: "error",
+        error: { type: "invalid_request_error", message: "request body is not valid JSON" },
+      },
+    };
   }
 }
 
@@ -495,7 +499,6 @@ async function handleMessages(req, res, body) {
   const ctx = {
     msgId: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
     requestedModel: anthropicBody.model,
-    stopSequencesSent: translated.stop ?? [],
     reasoningMode: REASONING_MODE,
     estimatedInput: est,
     onDiagnostic: (m) => diagnostics.push(m),
