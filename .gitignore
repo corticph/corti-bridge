@@ -1,2 +1,6 @@
 gateway.log
 node_modules/
+
+# Local-only: captured API fixtures and the model-mapping test that reads them.
+test/fixtures/
+test/models.sh
