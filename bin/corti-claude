@@ -5,7 +5,10 @@ set -eu
 
 CORTI_DIR="${CC_PROXY_CONFIG_DIR:-$HOME/.corti-claude}"
 PROXY_DIR="${CC_PROXY_DIR:-/path/to/corti-claude-proxy}"  # setup.sh rewrites this to the real clone path at install time
-GATEWAY="http://${CORTI_HOST:-127.0.0.1}:${CORTI_PORT:-4192}"
+PORT="${CORTI_PORT:-4192}"
+GATEWAY="http://${CORTI_HOST:-127.0.0.1}:$PORT"
+# Per-port, so stopping one gateway cannot take down another started from the same clone.
+PID_FILE="$CORTI_DIR/gateway-$PORT.pid"
 
 # Gateway lifecycle. Defined up here so --stop / --restart (parsed next) can use them
 # before the credential and claude-installed guards run; the launch flow calls them too.
@@ -18,10 +21,29 @@ gateway_is_ours() {
     case "${1:-}" in *'"status":"healthy"'*) return 0 ;; *) return 1 ;; esac
 }
 
+# Echo the pid of this port's gateway, or return 1. Liveness alone is not enough: pids are
+# recycled, so the command line has to confirm it is still our process.
+gateway_pid() {
+    [ -f "$PID_FILE" ] || return 1
+    _pid=$(cat "$PID_FILE" 2>/dev/null) || return 1
+    [ -n "$_pid" ] || return 1
+    kill -0 "$_pid" 2>/dev/null || return 1
+    ps -o command= -p "$_pid" 2>/dev/null | grep -q 'gateway\.mjs' || return 1
+    printf '%s' "$_pid"
+}
+
 # Stop the gateway if it is ours; idempotent; returns 1 if it will not die.
 gateway_stop() {
     [ -n "$(gateway_health)" ] || return 0
-    pkill -f "$PROXY_DIR/gateway.mjs" 2>/dev/null || true
+    if _pid=$(gateway_pid); then
+        kill -TERM "$_pid" 2>/dev/null || true
+    else
+        # No usable pid file — a gateway predating this wrapper, or started by hand. This
+        # pattern matches the clone path, so it cannot tell two ports apart; it is the
+        # fallback precisely because there is nothing better to go on.
+        pkill -f "$PROXY_DIR/gateway.mjs" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
     sleep 1
     # pkill may be absent or may not match; re-check so a stale gateway isn't used silently.
     if [ -n "$(gateway_health)" ]; then
@@ -39,6 +61,8 @@ gateway_start() {
         exit 1
     fi
     nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 &
+    # Temp-then-move so a concurrent reader never sees a half-written pid.
+    printf '%s' "$!" > "$PID_FILE.tmp" && mv "$PID_FILE.tmp" "$PID_FILE"
     i=1
     while [ "$i" -le 40 ]; do
         gateway_is_ours "$(gateway_health)" && return 0
