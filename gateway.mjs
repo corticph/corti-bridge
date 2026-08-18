@@ -69,6 +69,7 @@ const HEADERS_TIMEOUT_MS = !Number.isFinite(_headersTimeout)
     ? _headersTimeout
     : STREAM_IDLE_MS;
 const NONSTREAM_TIMEOUT_MS = 600_000;
+const SHUTDOWN_GRACE_MS = 5_000;
 // Upstream's own 400 is authoritative for whichever model is called; this just bounds the backstop.
 const CONTEXT_WINDOW = 524_288;
 // estimateTokens undercounts real usage, so this trips only on absurd bodies.
@@ -85,6 +86,11 @@ const LOG_FILE = DEBUG ? openDebugLog() : null;
 const agent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 32 });
 
 let requestId = 0;
+
+// Closers for responses still streaming. Shutdown ends each one with a terminal frame
+// instead of letting the socket reset, so the client sees a decodable error.
+const inFlight = new Set();
+let shuttingDown = false;
 
 const server = http.createServer((req, res) => {
   if (req.method === "OPTIONS") return cors(res);
@@ -107,6 +113,38 @@ server.listen(PORT, HOST, () => {
   console.log(`corti-proxy on http://${HOST}:${PORT} (mode: ${MODE}, reasoning: ${REASONING_MODE})`);
   if (LOG_FILE) console.log(`corti-proxy debug log: ${LOG_FILE}`);
 });
+
+// Without this, SIGTERM is the OS default: the process dies instantly and every open stream
+// resets mid-frame, which the client surfaces as ECONNRESET rather than an API error.
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`corti-proxy: ${signal} — shutting down`);
+
+  // server.close() only stops the listener; it resolves once every socket is gone, and an
+  // idle keep-alive client would hold it open indefinitely.
+  server.close(() => process.exit(0));
+  server.closeIdleConnections();
+
+  for (const closer of inFlight) {
+    try {
+      closer();
+    } catch {
+      // a closer racing its own socket teardown must not block the rest
+    }
+  }
+
+  // Backstop: a wedged socket, or the outbound pool's ref'd sockets, would otherwise
+  // keep the process alive past the point of usefulness.
+  setTimeout(() => {
+    server.closeAllConnections();
+    agent.destroy();
+    process.exit(0);
+  }, SHUTDOWN_GRACE_MS).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 /* ================================================================== */
 /* anthropic mode: thin pass-through                                     */
@@ -175,6 +213,14 @@ async function handlePassthrough(req, res) {
     if (!res.headersSent)
       send(res, 502, { type: "error", error: { type: "api_error", message: err.message } });
   });
+
+  // Passthrough carries Corti's raw wire bytes, so there is no Anthropic frame we could
+  // honestly synthesise here — ending the response is the truthful signal.
+  const closer = () => {
+    if (!res.writableEnded) res.end();
+  };
+  inFlight.add(closer);
+  res.on("close", () => inFlight.delete(closer));
 
   req.on("close", () => {
     if (!res.writableEnded) proxyReq.destroy();
@@ -273,6 +319,7 @@ async function handleMessages(req, res, body) {
   let attempt = 0;
   let retryTimer = null;
   let drainPending = false;
+  let shutdownCloser = null;
   let upstreamStatus = null;
   let emittedTruncated = false;
   let emittedSize = 0;
@@ -288,6 +335,7 @@ async function handleMessages(req, res, body) {
     if (interval) clearInterval(interval);
     if (absolute) clearTimeout(absolute);
     if (retryTimer) clearTimeout(retryTimer);
+    if (shutdownCloser) inFlight.delete(shutdownCloser);
     if (proxyReq && !proxyReq.destroyed) proxyReq.destroy();
     if (LOG_FILE && note) {
       if (translator && !loggedResponse)
@@ -471,6 +519,28 @@ async function handleMessages(req, res, body) {
     collectEmitted(buf);
     res.write(buf);
   };
+
+  // Registered here, not with the other state: it closes over writeEvent, which is
+  // initialised just above — registering earlier would leave a TDZ window where a
+  // signal arriving mid-setup throws instead of shutting down cleanly.
+  shutdownCloser = () => {
+    if (finalized) return;
+    if (!headersSentToClient)
+      return fail(
+        {
+          status: 529,
+          envelope: { type: "error", error: { type: "overloaded_error", message: "gateway shutting down" } },
+        },
+        "shutdown",
+      );
+    writeEvent("error", {
+      type: "error",
+      error: { type: "api_error", message: "gateway shutting down" },
+    });
+    res.end();
+    finalize("shutdown");
+  };
+  inFlight.add(shutdownCloser);
 
   const deadlineCheck = () => {
     const silence = Date.now() - lastActivity;
