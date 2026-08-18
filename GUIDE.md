@@ -134,7 +134,7 @@ corti-claude --restart    # stop then start it (needs CORTI_BEARER/CORTI_BASE_UR
 
 `--stop` needs nothing — not even credentials — so it works when something's wrong. `--restart` checks credentials *before* stopping, so a typo'd `CORTI_BEARER` won't take down a working gateway. Stopping a gateway that's already stopped is not an error.
 
-Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require restarting the gateway: the gateway doesn't read `models.env` (the wrapper does, at launch), so a new mapping takes effect the next time you run `corti-claude`. You only need `--restart` if you've changed `CORTI_BASE_URL` or switched `--anthropic` mode — and even then, a normal `corti-claude` run detects the staleness and restarts it for you.
+Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require restarting the gateway: the gateway doesn't read `models.env` (the wrapper does, at launch), so a new mapping takes effect the next time you run `corti-claude`. You only need `--restart` if you've changed `CORTI_BASE_URL` — and even then, a normal `corti-claude` run detects the staleness and restarts it for you. Switching `--anthropic` never needs one: both modes are always being served.
 
 ## Upstream failures and retries
 
@@ -166,7 +166,10 @@ The wrapper prints the log path on startup, and `/health` reports it too:
 
 ```bash
 curl -s http://127.0.0.1:4192/health
-# {"status":"healthy","mode":"openai","upstream":"https://ai.eu.corti.app/v1","debug":"/Users/you/Library/Logs/corti-claude-proxy/gateway-2026-01-01T00-00-00-000Z.log"}
+# {"status":"healthy","gatewayVersion":2,"mode":"openai","upstream":"https://ai.eu.corti.app/v1","debug":"/Users/you/Library/Logs/corti-claude-proxy/gateway-2026-01-01T00-00-00-000Z.log"}
+#
+# `mode` is not a process-wide setting — it reports what a request carrying no path prefix
+# resolves to, which is what the wrapper compares when deciding whether to restart.
 ```
 
 In `openai` mode each request id gets up to four entries — REQUEST (what the client sent), UPSTREAM-REQUEST (translated OpenAI body), UPSTREAM-RESPONSE (raw upstream bytes, plus upstream headers when the status was an error — that's the only place `server`, `retry-after` and `x-request-id` survive), RESPONSE (translated bytes sent to the client, with a `note` of `completed`/`upstream-error`/`client-abort`/`watchdog-timeout`/`parse-fail` and per-request diagnostics). Mistranslation debugging is a diff problem: compare REQUEST→UPSTREAM-REQUEST and UPSTREAM-RESPONSE→RESPONSE.
@@ -184,7 +187,7 @@ Where they go, in order of precedence:
 
 Bodies are capped at 2 MB each by default so a long streaming response doesn't produce a giant file; raise it with `CORTI_DEBUG_MAX_BODY`, or set `0` for no cap. Truncated bodies are marked as such.
 
-The gateway is a background process that outlives any single `corti-claude` run, so toggling `CORTI_DEBUG` (or switching to `--anthropic`) has to restart it — the wrapper handles that automatically, in both directions. If you started the gateway some other way, stop it yourself first.
+The gateway is a background process that outlives any single `corti-claude` run, so toggling `CORTI_DEBUG` has to restart it — the wrapper handles that automatically, in both directions. If you started the gateway some other way, stop it yourself first.
 
 ## Environment reference
 
@@ -196,7 +199,6 @@ Read directly from the shell — no local secrets file.
 | `CORTI_BASE_URL` | yes | Must match `https://ai.<env>.corti.app/v1`; used as-is (OpenAI-compatible endpoints) |
 | `CORTI_HOST` | no | Proxy bind address, default `127.0.0.1` |
 | `CORTI_PORT` | no | Proxy bind port, default `4192` |
-| `CORTI_UPSTREAM_MODE` | no | Set internally by `--anthropic`; don't set directly |
 | `CORTI_REASONING_MODE` | no | `thinking` (default: reasoning becomes Anthropic thinking blocks), `text` (fold into reply text), `drop` |
 | `TAVILY_API_KEY` | no | Enables Tavily as the primary WebSearch backend; when unset (or when Tavily fails/rate-limits) the keyless DuckDuckGo scrape is used instead |
 | `CORTI_SEARCH_DEPTH` | no | Tavily search depth: `basic` (default, 1 credit) or `advanced` (2 credits, richer snippets); ignored without `TAVILY_API_KEY` |
@@ -228,11 +230,13 @@ Compared to first-party Anthropic or `anthropic` mode, this setup cannot support
 corti-claude --anthropic
 ```
 
-Runs the gateway as a thin pass-through to Corti's `/anthropic` endpoint — no translation, every path forwarded, auth swap only. Two intentional deltas: `/health` reports the mode field, and `count_tokens` uses the current estimator.
+Points **this session** at the gateway's pass-through route instead of the translating one — no translation, every path forwarded, auth swap only. It changes nothing about the gateway: one process serves both routes at all times, so the flag costs no restart and does not disturb sessions running in the other mode. `count_tokens` is still answered locally by the estimator on both routes.
 
-`openai` mode is the default because pass-through currently loses something Claude Code relies on (see below), which the translation layer supplies. Use `openai` mode unless you have a reason not to.
+Mechanically, the wrapper exports `ANTHROPIC_BASE_URL=http://127.0.0.1:4192/anthropic` rather than the bare origin, and the gateway dispatches on that prefix. You only need to know this if you are curling the gateway by hand or reading raw debug-log paths.
 
-Use `anthropic` mode today to escape hatch a translation bug, or as a comparison harness: run a session in each mode and diff the debug logs.
+`openai` mode is the default because pass-through loses something Claude Code relies on (see below), which the translation layer supplies. Use `openai` mode unless you have a reason not to.
+
+Use `anthropic` mode to escape-hatch a translation bug, or as a comparison harness: run `corti-claude` and `corti-claude --anthropic` **at the same time**. Both write to the same debug log, so the two modes interleave by timestamp in one file — compare by request id rather than diffing two logs from two gateway lifetimes.
 
 The cost is specific and worth knowing before you reach for it: Corti's `/anthropic` endpoint drops input-token accounting on streaming responses. `message_start` reports `usage: {"input_tokens": 0, "output_tokens": 0}` and `message_delta` carries only `output_tokens` — no input count, no cache fields. Claude Code always streams, so in this mode every transcript records zero input tokens and context/cost readouts stop working. Non-streaming requests to the same endpoint return full usage, so no request parameter fixes it. Tool use is unaffected.
 

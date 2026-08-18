@@ -10,12 +10,12 @@ Local gateway that lets Claude Code talk to Corti's OpenAI-compatible API while 
 
 - **Bidirectional translation** — Anthropic Messages ⇄ OpenAI Chat Completions both ways: system prompts, tools, model names, tool_use/tool_result pairing, thinking config, and images
 - **Streaming** — SSE; parallel tool calls round-trip by index
-- **Pass-through mode** — `--anthropic` skips translation and forwards to Corti's `/anthropic` endpoint (auth swap only); `openai` translation is the default
+- **Pass-through mode** — `--anthropic` skips translation and forwards to Corti's `/anthropic` endpoint (auth swap only); `openai` translation is the default. One gateway serves both routes at once, so switching costs no restart and leaves other sessions alone
 - **Auth swap** — discards the client's token, sends `CORTI_BEARER` upstream; writes nothing to any `settings.json`, so a plain `claude` session stays on Anthropic models
 - **Model tiers** — maps fable/opus/sonnet/haiku to Corti models by model-ID shape, so a new generation needs no code change
 - **WebSearch** — converted to a function tool, results intercepted via Tavily with a keyless DuckDuckGo fallback
 - **Upstream retries** — bounded, pre-stream retry with back-off absorbs the empty-bodied `5xx` bursts Corti's edge emits, which are otherwise too fast for Claude Code's own retry ladder to outlast
-- **Persistent gateway** — keeps running between sessions and auto-restarts when stale (wrong mode, moved base URL, old build)
+- **Persistent gateway** — keeps running between sessions and auto-restarts when stale (moved base URL, old build)
 
 &nbsp;
 
