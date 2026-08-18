@@ -71,7 +71,7 @@ export async function webSearch(query) {
   return results;
 }
 
-// Tavily search; depth via CORTI_SEARCH_DEPTH, key read at call time.
+// Tavily search; depth is fixed at load, the API key is read at call time.
 const SEARCH_DEPTH = ["basic", "advanced"].includes(process.env.CORTI_SEARCH_DEPTH)
   ? process.env.CORTI_SEARCH_DEPTH
   : "basic";
@@ -500,7 +500,7 @@ export async function translateRequest(body) {
   };
 
   if (body.max_tokens !== undefined) {
-    if (typeof body.max_tokens !== "number" || !Number.isInteger(body.max_tokens) || body.max_tokens < 0)
+    if (typeof body.max_tokens !== "number" || !Number.isInteger(body.max_tokens) || body.max_tokens < 1)
       reject(400, "invalid_request_error", "max_tokens must be a positive integer");
     req.max_tokens = body.max_tokens;
   }

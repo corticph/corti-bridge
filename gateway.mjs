@@ -61,7 +61,9 @@ const BYTE_CAP_BYTES = 8_000_000;
 const MEMORY_BREAKER_BYTES = 64_000_000;
 
 const DEBUG = isTruthy(process.env.CORTI_DEBUG);
-const DEBUG_MAX_BODY = Number(process.env.CORTI_DEBUG_MAX_BODY ?? 2097152);
+const _debugMaxBody = Number(process.env.CORTI_DEBUG_MAX_BODY);
+// 0 stays 0 (the "unlimited" sentinel); NaN (a non-numeric env value) falls back to the default.
+const DEBUG_MAX_BODY = Number.isFinite(_debugMaxBody) ? _debugMaxBody : 2097152;
 const LOG_FILE = DEBUG ? openDebugLog() : null;
 
 const agent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 32 });
