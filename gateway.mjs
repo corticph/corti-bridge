@@ -19,6 +19,12 @@ import {
   translateNetworkError,
   translateRequest,
 } from "./translate.mjs";
+import {
+  RETRY_MAX_ATTEMPTS,
+  isRetryableNetworkError,
+  isRetryableStatus,
+  retryDelayMs,
+} from "./lib/retry.mjs";
 
 const HOST = process.env.CORTI_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.CORTI_PORT ?? 4192);
@@ -52,6 +58,16 @@ const UPSTREAM = MODE === "anthropic" ? BASE_URL.replace(/\/v1$/, "/anthropic") 
 // Probe-locked constants
 const PING_INTERVAL_MS = 15_000;
 const STREAM_IDLE_MS = 120_000;
+// Silence before response headers means upstream never answered at all — a far stronger
+// death signal than a mid-generation pause, so it gets its own, shorter fuse. Set
+// CORTI_HEADERS_TIMEOUT_MS=0 to fall back to STREAM_IDLE_MS; raise it if upstream
+// buffers whole non-SSE replies to streaming requests and generation runs long.
+const _headersTimeout = Number(process.env.CORTI_HEADERS_TIMEOUT_MS);
+const HEADERS_TIMEOUT_MS = !Number.isFinite(_headersTimeout)
+  ? 60_000
+  : _headersTimeout > 0
+    ? _headersTimeout
+    : STREAM_IDLE_MS;
 const NONSTREAM_TIMEOUT_MS = 600_000;
 // Upstream's own 400 is authoritative for whichever model is called; this just bounds the backstop.
 const CONTEXT_WINDOW = 524_288;
@@ -254,6 +270,9 @@ async function handleMessages(req, res, body) {
   let interval = null;
   let absolute = null;
   let loggedResponse = false;
+  let attempt = 0;
+  let retryTimer = null;
+  let drainPending = false;
   let upstreamStatus = null;
   let emittedTruncated = false;
   let emittedSize = 0;
@@ -268,6 +287,7 @@ async function handleMessages(req, res, body) {
     finalized = true;
     if (interval) clearInterval(interval);
     if (absolute) clearTimeout(absolute);
+    if (retryTimer) clearTimeout(retryTimer);
     if (proxyReq && !proxyReq.destroyed) proxyReq.destroy();
     if (LOG_FILE && note) {
       if (translator && !loggedResponse)
@@ -292,6 +312,29 @@ async function handleMessages(req, res, body) {
     logResponse({ id, started, status: mapped.status, body: JSON.stringify(mapped.envelope), note, diagnostics });
     send(res, mapped.status, mapped.envelope, mapped.headers);
     finalize(note);
+  };
+
+  // A retry is only safe while the client response is still unwritten: once SSE frames
+  // are out, a second attempt would replay a partial turn.
+  const canRetry = () =>
+    !finalized && !clientGone && !headersSentToClient && !res.headersSent && attempt < RETRY_MAX_ATTEMPTS;
+
+  const scheduleRetry = (n, reason, delay) => {
+    diagnostics.push(`attempt ${n} failed (${reason}); retried after ${delay}ms`);
+    // Drop the abandoned attempt's socket rather than returning it to the pool, and
+    // deafen it first: a late 'error' from the destroy would otherwise reach fail()
+    // and surface as a client error while the retry is still pending.
+    const dead = proxyReq;
+    if (dead && !dead.destroyed) {
+      dead.removeAllListeners("error");
+      dead.on("error", () => {});
+      dead.destroy();
+    }
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      if (finalized || clientGone) return;
+      sendUpstream();
+    }, delay);
   };
 
   req.on("close", () => {
@@ -409,7 +452,15 @@ async function handleMessages(req, res, body) {
     const ok = res.write(buf);
     if (!ok && upstreamRes) {
       upstreamRes.pause();
-      res.once("drain", () => upstreamRes && upstreamRes.resume());
+      // One listener per backpressure episode, not per failed write: repeated writes
+      // before a drain otherwise stack listeners for the life of the stream.
+      if (!drainPending) {
+        drainPending = true;
+        res.once("drain", () => {
+          drainPending = false;
+          if (upstreamRes) upstreamRes.resume();
+        });
+      }
     }
     return ok;
   };
@@ -423,7 +474,8 @@ async function handleMessages(req, res, body) {
 
   const deadlineCheck = () => {
     const silence = Date.now() - lastActivity;
-    if (silence >= STREAM_IDLE_MS) {
+    const limit = headersSentToClient ? STREAM_IDLE_MS : HEADERS_TIMEOUT_MS;
+    if (silence >= limit) {
       if (headersSentToClient) {
         if (!finalized) {
           writeEvent("error", {
@@ -450,280 +502,312 @@ async function handleMessages(req, res, body) {
     if (silence >= PING_INTERVAL_MS && headersSentToClient) writePing();
   };
 
-  proxyReq = https.request(
-    url,
-    {
-      agent,
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${BEARER}`,
-        "content-length": upstreamBody.length,
+  // One attempt. Re-invoked by scheduleRetry() while the client response is still
+  // unwritten, so a retried request looks to Claude Code like one slow request.
+  const sendUpstream = () => {
+    const myAttempt = ++attempt;
+    upstreamStatus = null;
+    lastActivity = Date.now();
+
+    proxyReq = https.request(
+      url,
+      {
+        // Retries bypass the pool: a keep-alive socket pinned to an unhealthy backend
+        // would just hand back the same instant 5xx.
+        agent: myAttempt === 1 ? agent : false,
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${BEARER}`,
+          "content-length": upstreamBody.length,
+        },
       },
-    },
-    (upstreamRaw) => {
-      lastActivity = Date.now();
-      upstreamStatus = upstreamRaw.statusCode;
+      (upstreamRaw) => {
+        if (myAttempt !== attempt || finalized || clientGone) return void upstreamRaw.resume();
+        lastActivity = Date.now();
+        upstreamStatus = upstreamRaw.statusCode;
 
-      if (upstreamRaw.statusCode >= 400) {
-        // PRE_STREAM error path: drain body first, then envelope; bytes stay capped at 8KB
-        const chunks = [];
-        let size = 0;
-        upstreamRaw.on("data", (c) => {
-          if (size < 8192) {
-            const slice = c.subarray(0, Math.min(c.length, 8192 - size));
-            chunks.push(slice);
-            size += slice.length;
-          }
-        });
-        upstreamRaw.on("end", () => {
-          const text = Buffer.concat(chunks).toString();
-          console.log(`POST /v1/messages ${upstreamRaw.statusCode}`);
-          fail(
-            translateError({
-              status: upstreamRaw.statusCode,
-              headers: upstreamRaw.headers,
-              bodyText: text,
-              requestedModel: anthropicBody.model,
-            }),
-            "upstream-error",
-          );
-        });
-        return;
-      }
-
-      const wantsStream = translated.stream === true;
-      const contentType = String(upstreamRaw.headers["content-type"] ?? "");
-      const isSse = contentType.includes("text/event-stream");
-
-      upstreamRes = upstreamRaw;
-      if (upstreamRaw.headers["content-encoding"] === "gzip") {
-        const gunzip = zlib.createGunzip();
-        upstreamRaw.pipe(gunzip);
-        upstreamRes = gunzip;
-        upstreamRaw.on("error", (err) => gunzip.destroy(err));
-      }
-
-      if (!wantsStream) {
-        const chunks = [];
-        upstreamRes.on("data", (c) => {
-          chunks.push(c);
-          lastActivity = Date.now();
-        });
-        upstreamRes.on("end", () => {
-          const raw = Buffer.concat(chunks);
-          logUpstreamResponse(id, upstreamStatus, cap(raw)[0]);
-          try {
-            const msg = translateCompletion(JSON.parse(raw.toString()), ctx);
-            loggedResponse = true;
-            logResponse({
-              id,
-              started,
-              status: 200,
-              body: JSON.stringify(msg),
-              note: "completed",
-              diagnostics,
-            });
-            send(res, 200, msg);
-          } catch {
-            loggedResponse = false;
+        if (upstreamRaw.statusCode >= 400) {
+          // PRE_STREAM error path: drain body first, then envelope; bytes stay capped at 8KB
+          const chunks = [];
+          let size = 0;
+          upstreamRaw.on("data", (c) => {
+            if (size < 8192) {
+              const slice = c.subarray(0, Math.min(c.length, 8192 - size));
+              chunks.push(slice);
+              size += slice.length;
+            }
+          });
+          upstreamRaw.on("end", () => {
+            if (myAttempt !== attempt || finalized || clientGone) return;
+            const text = Buffer.concat(chunks).toString();
+            const status = upstreamRaw.statusCode;
+            console.log(`POST /v1/messages ${status}${myAttempt > 1 ? ` (attempt ${myAttempt})` : ""}`);
+            // The only place upstream headers reach the log: what fail() records is the
+            // envelope sent to the client, which drops server/retry-after/x-request-id.
+            logUpstreamResponse(id, status, Buffer.from(text), upstreamRaw.headers);
+            if (isRetryableStatus(status) && canRetry())
+              return scheduleRetry(
+                myAttempt,
+                `HTTP ${status}`,
+                retryDelayMs(myAttempt, upstreamRaw.headers["retry-after"]),
+              );
             fail(
-              {
-                status: 502,
-                envelope: {
-                  type: "error",
-                  error: { type: "api_error", message: "upstream returned unparseable completion" },
-                },
-              },
-              "parse-fail",
+              translateError({
+                status,
+                headers: upstreamRaw.headers,
+                bodyText: text,
+                requestedModel: anthropicBody.model,
+              }),
+              "upstream-error",
             );
-            return;
-          }
-          finalize(null);
-        });
-        upstreamRes.on("error", (err) => fail(translateNetworkError(err), "upstream-error"));
-        return;
-      }
-
-      if (!isSse) {
-        // stream requested but upstream answered JSON: synthesize a one-shot SSE turn
-        const chunks = [];
-        upstreamRes.on("data", (c) => {
-          chunks.push(c);
-          lastActivity = Date.now();
-        });
-        upstreamRes.on("end", () => {
-          const raw = Buffer.concat(chunks);
-          let msg;
-          try {
-            msg = translateCompletion(JSON.parse(raw.toString()), ctx);
-          } catch {
-            fail(
-              {
-                status: 502,
-                envelope: {
-                  type: "error",
-                  error: {
-                    type: "api_error",
-                    message: "upstream returned unparseable non-SSE body to streaming request",
-                  },
-                },
-              },
-              "parse-fail",
-            );
-            return;
-          }
-          headersSentToClient = true;
-          res.writeHead(200, {
-            "content-type": "text/event-stream; charset=utf-8",
-            "cache-control": "no-cache",
-            connection: "keep-alive",
-            "x-accel-buffering": "no",
           });
-          res.flushHeaders();
-          logUpstreamResponse(id, upstreamStatus, cap(raw)[0]);
-          writeEvent("message_start", {
-            type: "message_start",
-            message: {
-              ...msg,
-              content: [],
-              stop_reason: null,
-              stop_sequence: null,
-              usage: {
-                input_tokens: est,
-                output_tokens: 1,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-              },
-            },
-          });
-          msg.content.forEach((block, i) => {
-            const skeleton =
-              block.type === "tool_use"
-                ? { ...block, input: {} }
-                : block.type === "thinking"
-                  ? { type: "thinking", thinking: "", signature: "" }
-                  : { type: "text", text: "" };
-            writeEvent("content_block_start", { type: "content_block_start", index: i, content_block: skeleton });
-            if (block.type === "text")
-              writeEvent("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "text_delta", text: block.text } });
-            else if (block.type === "thinking") {
-              writeEvent("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "thinking_delta", thinking: block.thinking } });
-              writeEvent("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "signature_delta", signature: block.signature } });
-            } else if (block.type === "tool_use")
-              writeEvent("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } });
-            writeEvent("content_block_stop", { type: "content_block_stop", index: i });
-          });
-          writeEvent("message_delta", {
-            type: "message_delta",
-            delta: { stop_reason: msg.stop_reason, stop_sequence: msg.stop_sequence ?? null },
-            usage: msg.usage,
-          });
-          writeEvent("message_stop", { type: "message_stop" });
-          res.end();
-          finalize("completed");
-        });
-        upstreamRes.on("error", (err) => fail(translateNetworkError(err), "upstream-error"));
-        return;
-      }
-
-      // streaming SSE path
-      headersSentToClient = true;
-      res.writeHead(200, {
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-cache",
-        connection: "keep-alive",
-        "x-accel-buffering": "no",
-      });
-      res.flushHeaders();
-
-      translator = createStreamTranslator(ctx, writeEvent);
-      let buffer = "";
-      let sawDone = false;
-
-      const terminalNote = () =>
-        emittedFrames.some((f) => f.includes("event: error")) ? "upstream-error" : "completed";
-
-      const processEventBlock = (block) => {
-        const dataLines = block
-          .split(/\r?\n/)
-          .filter((l) => l.startsWith("data:"))
-          .map((l) => l.slice(5).trimStart());
-        if (!dataLines.length) return;
-        const payload = dataLines.join("\n");
-        if (payload.trim() === "[DONE]") {
-          sawDone = true;
-          translator.done();
-          res.end();
-          finalize("completed");
           return;
         }
-        try {
-          translator.feed(JSON.parse(payload));
-        } catch {
-          diagnostics.push(`unparseable upstream data line skipped (${payload.slice(0, 120)})`);
-        }
-        if (!finalized && translator.terminated && !sawDone) {
-          res.end();
-          finalize(terminalNote());
-        }
-      };
 
-      const streamError = () => {
-        if (finalized) return;
-        // mid-stream socket failure (possibly over gunzip): never close open
-        // blocks — truncated tool args must not look complete
-        if (!translator.terminated)
-          writeEvent("error", {
-            type: "error",
-            error: { type: "api_error", message: "upstream connection closed mid-stream" },
+        const wantsStream = translated.stream === true;
+        const contentType = String(upstreamRaw.headers["content-type"] ?? "");
+        const isSse = contentType.includes("text/event-stream");
+
+        upstreamRes = upstreamRaw;
+        if (upstreamRaw.headers["content-encoding"] === "gzip") {
+          const gunzip = zlib.createGunzip();
+          upstreamRaw.pipe(gunzip);
+          upstreamRes = gunzip;
+          upstreamRaw.on("error", (err) => gunzip.destroy(err));
+        }
+
+        if (!wantsStream) {
+          const chunks = [];
+          upstreamRes.on("data", (c) => {
+            chunks.push(c);
+            lastActivity = Date.now();
           });
-        res.end();
-        finalize("upstream-error");
-      };
-
-      upstreamRes.on("data", (chunk) => {
-        lastActivity = Date.now();
-        if (LOG_FILE && (DEBUG_MAX_BODY <= 0 || upstreamSize < DEBUG_MAX_BODY)) {
-          upstreamChunks.push(chunk);
-          upstreamSize += chunk.length;
+          upstreamRes.on("end", () => {
+            const raw = Buffer.concat(chunks);
+            logUpstreamResponse(id, upstreamStatus, cap(raw)[0]);
+            try {
+              const msg = translateCompletion(JSON.parse(raw.toString()), ctx);
+              loggedResponse = true;
+              logResponse({
+                id,
+                started,
+                status: 200,
+                body: JSON.stringify(msg),
+                note: "completed",
+                diagnostics,
+              });
+              send(res, 200, msg);
+            } catch {
+              loggedResponse = false;
+              fail(
+                {
+                  status: 502,
+                  envelope: {
+                    type: "error",
+                    error: { type: "api_error", message: "upstream returned unparseable completion" },
+                  },
+                },
+                "parse-fail",
+              );
+              return;
+            }
+            finalize(null);
+          });
+          upstreamRes.on("error", (err) => fail(translateNetworkError(err), "upstream-error"));
+          return;
         }
-        buffer += chunk.toString();
-        const parts = buffer.split(/\r?\n\r?\n/);
-        buffer = parts.pop();
-        for (const part of parts) {
-          if (finalized) break;
-          processEventBlock(part);
-        }
-      });
 
-      upstreamRes.on("end", () => {
-        if (finalized) return;
-        if (buffer.trim()) processEventBlock(buffer);
-        if (finalized) return;
-        if (!sawDone) {
-          translator.done();
-          diagnostics.push("upstream ended without [DONE]");
+        if (!isSse) {
+          // stream requested but upstream answered JSON: synthesize a one-shot SSE turn
+          const chunks = [];
+          upstreamRes.on("data", (c) => {
+            chunks.push(c);
+            lastActivity = Date.now();
+          });
+          upstreamRes.on("end", () => {
+            const raw = Buffer.concat(chunks);
+            let msg;
+            try {
+              msg = translateCompletion(JSON.parse(raw.toString()), ctx);
+            } catch {
+              fail(
+                {
+                  status: 502,
+                  envelope: {
+                    type: "error",
+                    error: {
+                      type: "api_error",
+                      message: "upstream returned unparseable non-SSE body to streaming request",
+                    },
+                  },
+                },
+                "parse-fail",
+              );
+              return;
+            }
+            headersSentToClient = true;
+            res.writeHead(200, {
+              "content-type": "text/event-stream; charset=utf-8",
+              "cache-control": "no-cache",
+              connection: "keep-alive",
+              "x-accel-buffering": "no",
+            });
+            res.flushHeaders();
+            logUpstreamResponse(id, upstreamStatus, cap(raw)[0]);
+            writeEvent("message_start", {
+              type: "message_start",
+              message: {
+                ...msg,
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: {
+                  input_tokens: est,
+                  output_tokens: 1,
+                  cache_creation_input_tokens: 0,
+                  cache_read_input_tokens: 0,
+                },
+              },
+            });
+            msg.content.forEach((block, i) => {
+              const skeleton =
+                block.type === "tool_use"
+                  ? { ...block, input: {} }
+                  : block.type === "thinking"
+                    ? { type: "thinking", thinking: "", signature: "" }
+                    : { type: "text", text: "" };
+              writeEvent("content_block_start", { type: "content_block_start", index: i, content_block: skeleton });
+              if (block.type === "text")
+                writeEvent("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "text_delta", text: block.text } });
+              else if (block.type === "thinking") {
+                writeEvent("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "thinking_delta", thinking: block.thinking } });
+                writeEvent("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "signature_delta", signature: block.signature } });
+              } else if (block.type === "tool_use")
+                writeEvent("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } });
+              writeEvent("content_block_stop", { type: "content_block_stop", index: i });
+            });
+            writeEvent("message_delta", {
+              type: "message_delta",
+              delta: { stop_reason: msg.stop_reason, stop_sequence: msg.stop_sequence ?? null },
+              usage: msg.usage,
+            });
+            writeEvent("message_stop", { type: "message_stop" });
+            res.end();
+            finalize("completed");
+          });
+          upstreamRes.on("error", (err) => fail(translateNetworkError(err), "upstream-error"));
+          return;
+        }
+
+        // streaming SSE path
+        headersSentToClient = true;
+        res.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+          "x-accel-buffering": "no",
+        });
+        res.flushHeaders();
+
+        translator = createStreamTranslator(ctx, writeEvent);
+        let buffer = "";
+        let sawDone = false;
+
+        const terminalNote = () =>
+          emittedFrames.some((f) => f.includes("event: error")) ? "upstream-error" : "completed";
+
+        const processEventBlock = (block) => {
+          const dataLines = block
+            .split(/\r?\n/)
+            .filter((l) => l.startsWith("data:"))
+            .map((l) => l.slice(5).trimStart());
+          if (!dataLines.length) return;
+          const payload = dataLines.join("\n");
+          if (payload.trim() === "[DONE]") {
+            sawDone = true;
+            translator.done();
+            res.end();
+            finalize("completed");
+            return;
+          }
+          try {
+            translator.feed(JSON.parse(payload));
+          } catch {
+            diagnostics.push(`unparseable upstream data line skipped (${payload.slice(0, 120)})`);
+          }
+          if (!finalized && translator.terminated && !sawDone) {
+            res.end();
+            finalize(terminalNote());
+          }
+        };
+
+        const streamError = () => {
+          if (finalized) return;
+          // mid-stream socket failure (possibly over gunzip): never close open
+          // blocks — truncated tool args must not look complete
+          if (!translator.terminated)
+            writeEvent("error", {
+              type: "error",
+              error: { type: "api_error", message: "upstream connection closed mid-stream" },
+            });
           res.end();
-          finalize(terminalNote());
-        }
+          finalize("upstream-error");
+        };
+
+        upstreamRes.on("data", (chunk) => {
+          lastActivity = Date.now();
+          if (LOG_FILE && (DEBUG_MAX_BODY <= 0 || upstreamSize < DEBUG_MAX_BODY)) {
+            upstreamChunks.push(chunk);
+            upstreamSize += chunk.length;
+          }
+          buffer += chunk.toString();
+          const parts = buffer.split(/\r?\n\r?\n/);
+          buffer = parts.pop();
+          for (const part of parts) {
+            if (finalized) break;
+            processEventBlock(part);
+          }
+        });
+
+        upstreamRes.on("end", () => {
+          if (finalized) return;
+          if (buffer.trim()) processEventBlock(buffer);
+          if (finalized) return;
+          if (!sawDone) {
+            translator.done();
+            diagnostics.push("upstream ended without [DONE]");
+            res.end();
+            finalize(terminalNote());
+          }
+        });
+
+        upstreamRes.on("error", streamError);
+        upstreamRaw.on("error", streamError);
+      },
+    );
+
+    proxyReq.on("error", (err) => {
+      if (myAttempt !== attempt || finalized || clientGone) return;
+      if (!headersSentToClient) {
+        if (isRetryableNetworkError(err) && canRetry())
+          return scheduleRetry(
+            myAttempt,
+            err?.cause?.code ?? err?.code ?? err.message,
+            retryDelayMs(myAttempt),
+          );
+        return fail(translateNetworkError(err), "upstream-error");
+      }
+      writeEvent("error", {
+        type: "error",
+        error: { type: "api_error", message: "upstream connection error" },
       });
-
-      upstreamRes.on("error", streamError);
-      upstreamRaw.on("error", streamError);
-    },
-  );
-
-  proxyReq.on("error", (err) => {
-    if (finalized || clientGone) return;
-    if (!headersSentToClient) return fail(translateNetworkError(err), "upstream-error");
-    writeEvent("error", {
-      type: "error",
-      error: { type: "api_error", message: "upstream connection error" },
+      res.end();
+      finalize("upstream-error");
     });
-    res.end();
-    finalize("upstream-error");
-  });
+
+    proxyReq.end(upstreamBody);
+  };
 
   if (translated.stream === true) {
     interval = setInterval(deadlineCheck, 1_000);
@@ -740,7 +824,7 @@ async function handleMessages(req, res, body) {
     }, NONSTREAM_TIMEOUT_MS);
   }
 
-  proxyReq.end(upstreamBody);
+  sendUpstream();
 }
 
 /* ================================================================== */
@@ -841,11 +925,12 @@ function logUpstreamRequest(id, url, body) {
   ]);
 }
 
-function logUpstreamResponse(id, status, body) {
+function logUpstreamResponse(id, status, body, headers) {
   if (!LOG_FILE) return;
   writeEntry([
     `=== #${id} UPSTREAM-RESPONSE ${new Date().toISOString()} ===`,
     `status: ${status ?? "none"}`,
+    ...(headers ? [`headers: ${JSON.stringify(redact(headers))}`] : []),
     ...formatBody(...cap(body)),
   ]);
 }

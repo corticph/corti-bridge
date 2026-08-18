@@ -10,6 +10,7 @@ This is a reference, not a tutorial. For install and run, see the [README](READM
 - [Model config](#model-config)
 - [Claude Code profile](#claude-code-profile)
 - [The gateway](#the-gateway)
+- [Upstream failures and retries](#upstream-failures-and-retries)
 - [Debug logging](#debug-logging)
 - [Environment reference](#environment-reference)
 - [Known degradations (openai mode)](#known-degradations-openai-mode)
@@ -135,6 +136,24 @@ corti-claude --restart    # stop then start it (needs CORTI_BEARER/CORTI_BASE_UR
 
 Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require restarting the gateway: the gateway doesn't read `models.env` (the wrapper does, at launch), so a new mapping takes effect the next time you run `corti-claude`. You only need `--restart` if you've changed `CORTI_BASE_URL` or switched `--anthropic` mode — and even then, a normal `corti-claude` run detects the staleness and restarts it for you.
 
+## Upstream failures and retries
+
+Corti's edge fails in bursts. During one on 2026-08-18 it answered most requests with an empty-bodied `503` for roughly a minute at a time, while a minority still succeeded — two requests 154ms apart came back `503` and `200`. Empty-bodied `403`s appeared in the same windows. That shape (no body, no `x-request-id`, sub-second) is the load balancer talking, not a model.
+
+Claude Code retries on its own, but its ladder is about five attempts inside ~8 seconds — too fast to outlast a blip like that, so every message in the window failed. The gateway therefore retries upstream itself before the client ever sees an error:
+
+- **Up to 3 attempts** (the original plus 2 retries), backing off ~0.5s then ~1.5s with jitter. Worst case adds under 3 seconds.
+- **Only while the client response is still unwritten.** Once SSE frames have gone out, a retry would replay a partial turn, so a mid-stream failure is passed through as it always was.
+- **Retryable:** `408`, `429`, `500`, `502`, `503`, `504`, `529`, and connection-level failures (`ECONNRESET`, `ETIMEDOUT`, and friends). A numeric `Retry-After` is honoured, clamped to 4s.
+- **Not retryable:** `400`, `401`, `403`, `404`, `413`. A bad `CORTI_BEARER` has to fail on the first attempt rather than tripling the cost of every request.
+- **Retries skip the connection pool.** A keep-alive socket pinned to an unhealthy backend would just hand back the same instant `5xx`, so attempt 2 opens a fresh connection.
+
+The two ladders multiply — the client's five attempts each become up to three upstream calls — which is why this one stays deliberately short. It is meant to absorb sub-10-second edge blips, not to replace the client's policy or to ride out a real outage. When upstream is genuinely down you still get an `overloaded_error`, just a few seconds later.
+
+Retries are invisible to the client but not to you: each one appends an `attempt N failed (…); retried after Nms` line to the request's `diagnostics` in the debug log, and the gateway's console log tags them (`POST /v1/messages 503 (attempt 2)`).
+
+Separately, silence *before* upstream sends response headers now has its own deadline (`CORTI_HEADERS_TIMEOUT_MS`, default 60s) rather than sharing the 120s mid-stream idle timeout — an upstream that accepts the connection and then says nothing is a much stronger death signal than a pause mid-generation. Raise it if you see spurious timeouts on long generations; `0` restores the old shared 120s behaviour.
+
 ## Debug logging
 
 Set `CORTI_DEBUG` and the gateway writes every request and response to a timestamped file, one per gateway start:
@@ -150,7 +169,7 @@ curl -s http://127.0.0.1:4192/health
 # {"status":"healthy","mode":"openai","upstream":"https://ai.eu.corti.app/v1","debug":"/Users/you/Library/Logs/corti-claude-proxy/gateway-2026-01-01T00-00-00-000Z.log"}
 ```
 
-In `openai` mode each request id gets up to four entries — REQUEST (what the client sent), UPSTREAM-REQUEST (translated OpenAI body), UPSTREAM-RESPONSE (raw upstream bytes), RESPONSE (translated bytes sent to the client, with a `note` of `completed`/`upstream-error`/`client-abort`/`watchdog-timeout`/`parse-fail` and per-request diagnostics). Mistranslation debugging is a diff problem: compare REQUEST→UPSTREAM-REQUEST and UPSTREAM-RESPONSE→RESPONSE.
+In `openai` mode each request id gets up to four entries — REQUEST (what the client sent), UPSTREAM-REQUEST (translated OpenAI body), UPSTREAM-RESPONSE (raw upstream bytes, plus upstream headers when the status was an error — that's the only place `server`, `retry-after` and `x-request-id` survive), RESPONSE (translated bytes sent to the client, with a `note` of `completed`/`upstream-error`/`client-abort`/`watchdog-timeout`/`parse-fail` and per-request diagnostics). Mistranslation debugging is a diff problem: compare REQUEST→UPSTREAM-REQUEST and UPSTREAM-RESPONSE→RESPONSE.
 
 **The log contains complete prompt bodies** — your source code, file contents, whatever Claude Code sent — including their translated forms. `CORTI_BEARER` is never written, and `authorization`/`x-api-key`/`cookie` headers are redacted, but treat the files as sensitive. The directory is created `0700` and files `0600`. Nothing rotates or prunes them; delete them yourself when done.
 
@@ -181,6 +200,7 @@ Read directly from the shell — no local secrets file.
 | `CORTI_REASONING_MODE` | no | `thinking` (default: reasoning becomes Anthropic thinking blocks), `text` (fold into reply text), `drop` |
 | `TAVILY_API_KEY` | no | Enables Tavily as the primary WebSearch backend; when unset (or when Tavily fails/rate-limits) the keyless DuckDuckGo scrape is used instead |
 | `CORTI_SEARCH_DEPTH` | no | Tavily search depth: `basic` (default, 1 credit) or `advanced` (2 credits, richer snippets); ignored without `TAVILY_API_KEY` |
+| `CORTI_HEADERS_TIMEOUT_MS` | no | How long to wait for upstream response headers before giving up, default `60000`; `0` falls back to the 120s mid-stream idle timeout |
 | `CORTI_DEBUG` | no | Any value except `0`/`false`/`no`/`off` turns on request/response logging |
 | `CORTI_DEBUG_DIR` | no | Where debug logs go; defaults per platform (see [Debug logging](#debug-logging)) |
 | `CORTI_DEBUG_MAX_BODY` | no | Per-body byte cap, default `2097152` (2 MB); `0` means unlimited |
