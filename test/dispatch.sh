@@ -118,6 +118,19 @@ check "/health reports a gatewayVersion" \
 check "/health reports bare-path mode as openai" \
   "$(curl -s -m 10 "$G/health" | grep -c '"mode":"openai"')" "1"
 
+# The mode marker on the auth token is the only signal that survives URL resolution, so it is
+# what catches a client silently dropping the path prefix.
+auth() { curl -s -m 10 -o /dev/null -w '%{http_code}' -H 'content-type: application/json' \
+  -H "authorization: Bearer $1" -d "$BODY" "$G$2"; }
+check "anthropic marker on a bare path is rejected loudly" \
+  "$(auth local-gateway-anthropic /v1/messages)" "400"
+check "anthropic marker on the prefixed path is fine" \
+  "$(auth local-gateway-anthropic /anthropic/v1/messages)" "200"
+check "openai marker on a bare path is fine" \
+  "$(auth local-gateway-openai /v1/messages)" "200"
+check "an unmarked token still routes by path" \
+  "$(auth local-gateway /v1/messages)" "200"
+
 # Claude Code probes this against the base URL; both routes answer it locally.
 check "HEAD /api/hello answered locally, bare" \
   "$(curl -s -m 10 -I -o /dev/null -w '%{http_code}' "$G/api/hello")" "200"

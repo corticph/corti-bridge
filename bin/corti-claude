@@ -255,7 +255,9 @@ if [ "$want_mode" = anthropic ]; then
 else
     export ANTHROPIC_BASE_URL="$GATEWAY"
 fi
-export ANTHROPIC_AUTH_TOKEN="local-gateway"
+# The gateway discards this token; the suffix exists only so it can tell that the path prefix
+# above survived the client's URL handling. A header cannot be lost to URL resolution.
+export ANTHROPIC_AUTH_TOKEN="local-gateway-$want_mode"
 # Per-request attribution text in the system prompt defeats upstream prefix caching.
 export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 # The [1M] badge newer Claude Code versions show for proxied models is misleading here.

@@ -108,6 +108,20 @@ function splitPath(url) {
   return { anthropic: BARE_PATH_IS_ANTHROPIC, path: reqPath };
 }
 
+// The wrapper stamps the mode it asked for onto the auth token, which the gateway otherwise
+// discards. Headers are untouched by URL resolution, so a stamp that disagrees with the path
+// means the prefix was lost in transit — the one failure that would otherwise be silent,
+// serving pass-through traffic through the translator.
+function modeMarker(req) {
+  const auth = req.headers.authorization ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : (req.headers["x-api-key"] ?? "");
+  if (token.endsWith("-anthropic")) return "anthropic";
+  if (token.endsWith("-openai")) return "openai";
+  return null;
+}
+
+let warnedUnmarked = false;
+
 const server = http.createServer((req, res) => {
   if (req.method === "OPTIONS") return cors(res);
 
@@ -115,6 +129,24 @@ const server = http.createServer((req, res) => {
   if (req.url === "/health") return send(res, 200, healthPayload());
 
   const { anthropic, path: reqPath } = splitPath(req.url);
+
+  const marker = modeMarker(req);
+  if (marker === "anthropic" && !anthropic)
+    return send(res, 400, {
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message:
+          `pass-through was requested but the "${ANTHROPIC_PREFIX}" path prefix did not arrive — ` +
+          `the client dropped it from ANTHROPIC_BASE_URL. Re-run ./setup.sh; if that does not ` +
+          `help, the client changed how it joins a base URL to a request path.`,
+      },
+    });
+  if (marker === null && !warnedUnmarked) {
+    warnedUnmarked = true;
+    // Hand-curling and pre-dispatch wrappers land here. The path is authoritative for them.
+    console.log("corti-proxy: request without a mode marker — routing by path alone");
+  }
 
   // Claude Code probes this against the base URL before its first request. Answering locally
   // keeps both modes identical; pass-through would otherwise forward it upstream.
