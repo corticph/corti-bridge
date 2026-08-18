@@ -30,7 +30,10 @@ const HOST = process.env.CORTI_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.CORTI_PORT ?? 4192);
 const BEARER = process.env.CORTI_BEARER;
 const BASE_URL = process.env.CORTI_BASE_URL;
-const MODE = process.env.CORTI_UPSTREAM_MODE === "anthropic" ? "anthropic" : "openai";
+// Mode is per request, not per process — see ANTHROPIC_PREFIX below. This is read once at
+// boot solely so a pre-dispatch wrapper, which sets it and never adds a path prefix, still
+// gets pass-through on bare paths. Nothing else may consult it.
+const LEGACY_COMPAT = process.env.CORTI_UPSTREAM_MODE === "anthropic";
 const REASONING_MODE = ["thinking", "text", "drop"].includes(process.env.CORTI_REASONING_MODE)
   ? process.env.CORTI_REASONING_MODE
   : "thinking";
@@ -53,7 +56,11 @@ if (!BASE_URL_PATTERN.test(BASE_URL)) {
   process.exit(1);
 }
 
-const UPSTREAM = MODE === "anthropic" ? BASE_URL.replace(/\/v1$/, "/anthropic") : BASE_URL;
+const UPSTREAM_OPENAI = BASE_URL;
+const UPSTREAM_ANTHROPIC = BASE_URL.replace(/\/v1$/, "/anthropic");
+// Claude Code preserves a path prefix in ANTHROPIC_BASE_URL, so the wrapper selects a mode by
+// pointing a session at "$GATEWAY" or "$GATEWAY/anthropic".
+const ANTHROPIC_PREFIX = "/anthropic";
 
 // Probe-locked constants
 const PING_INTERVAL_MS = 15_000;
@@ -92,25 +99,50 @@ let requestId = 0;
 const inFlight = new Set();
 let shuttingDown = false;
 
+// Splits the mode prefix off a URL. Anchored on purpose: "/v1/anthropic/messages" and
+// "/anthropicabc/x" are openai paths, not pass-through ones.
+function splitPath(url) {
+  const reqPath = (url ?? "").split("?")[0];
+  if (reqPath === ANTHROPIC_PREFIX || reqPath.startsWith(`${ANTHROPIC_PREFIX}/`))
+    return { anthropic: true, path: reqPath.slice(ANTHROPIC_PREFIX.length) || "/" };
+  // A bare path means openai, except for a legacy wrapper that cannot add the prefix at all.
+  return { anthropic: LEGACY_COMPAT, path: reqPath };
+}
+
 const server = http.createServer((req, res) => {
   if (req.method === "OPTIONS") return cors(res);
 
-  if (req.url === "/health")
-    return send(res, 200, {
-      status: "healthy",
-      mode: MODE,
-      upstream: UPSTREAM,
-      debug: LOG_FILE ?? false,
-    });
+  // Unprefixed on purpose: the wrapper curls it before it knows which mode a session wants.
+  if (req.url === "/health") return send(res, 200, healthPayload());
 
-  if (MODE === "anthropic") return void handlePassthrough(req, res).catch(proxyFailure(res));
-  return handleOpenAI(req, res);
+  const { anthropic, path: reqPath } = splitPath(req.url);
+
+  // Claude Code probes this against the base URL before its first request. Answering locally
+  // keeps both modes identical; pass-through would otherwise forward it upstream.
+  if (req.method === "HEAD" && reqPath === "/api/hello") return void res.writeHead(200).end();
+
+  if (anthropic) return void handlePassthrough(req, res, reqPath).catch(proxyFailure(res));
+  return handleOpenAI(req, res, reqPath);
 });
+
+function healthPayload() {
+  return {
+    status: "healthy",
+    gatewayVersion: 2,
+    // Truthfully: what a request with no prefix resolves to. A pre-dispatch wrapper compares
+    // this against the mode it wants, so the value has to describe bare-path behaviour.
+    mode: LEGACY_COMPAT ? "anthropic" : "openai",
+    upstream: BASE_URL,
+    debug: LOG_FILE ?? false,
+  };
+}
 
 // CC streams can be long-lived; don't let Node's request timeout kill them.
 server.requestTimeout = 0;
 server.listen(PORT, HOST, () => {
-  console.log(`corti-proxy on http://${HOST}:${PORT} (mode: ${MODE}, reasoning: ${REASONING_MODE})`);
+  console.log(
+    `corti-proxy on http://${HOST}:${PORT} (openai: /, anthropic: ${ANTHROPIC_PREFIX}, reasoning: ${REASONING_MODE})`,
+  );
   if (LOG_FILE) console.log(`corti-proxy debug log: ${LOG_FILE}`);
 });
 
@@ -150,11 +182,10 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 /* anthropic mode: thin pass-through                                     */
 /* ================================================================== */
 
-async function handlePassthrough(req, res) {
+async function handlePassthrough(req, res, reqPath) {
   const id = ++requestId;
-  const reqPath = (req.url ?? "").split("?")[0];
   const isCountTokens = reqPath.startsWith("/v1/messages/count_tokens");
-  const target = isCountTokens ? null : new URL(`${UPSTREAM}${reqPath}`);
+  const target = isCountTokens ? null : new URL(`${UPSTREAM_ANTHROPIC}${reqPath}`);
 
   let body = await rawBody(req);
   const started = Date.now();
@@ -233,8 +264,7 @@ async function handlePassthrough(req, res) {
 /* openai mode: translating gateway                                    */
 /* ================================================================== */
 
-function handleOpenAI(req, res) {
-  const reqPath = (req.url ?? "").split("?")[0];
+function handleOpenAI(req, res, reqPath) {
   return rawBody(req)
     .then((body) => {
       if (req.method === "POST" && reqPath === "/v1/messages") return handleMessages(req, res, body);
@@ -262,7 +292,7 @@ function handleCountTokens(res, body) {
 
 function handleModels(res) {
   const proxyReq = https.request(
-    new URL(`${UPSTREAM}/models`),
+    new URL(`${UPSTREAM_OPENAI}/models`),
     { agent, method: "GET", headers: { authorization: `Bearer ${BEARER}` } },
     (upstream) => {
       const chunks = [];
@@ -298,7 +328,7 @@ function handleModels(res) {
 async function handleMessages(req, res, body) {
   const id = ++requestId;
   const started = Date.now();
-  const url = `${UPSTREAM}/chat/completions`;
+  const url = `${UPSTREAM_OPENAI}/chat/completions`;
   const diagnostics = [];
 
   // all mutable request state up front: fail()/finalize() may run at any point after this
@@ -948,8 +978,8 @@ function openDebugLog() {
           `=== corti-claude-proxy debug log ===`,
           `started:  ${new Date().toISOString()}`,
           `pid:      ${process.pid}`,
-          `mode:     ${MODE}`,
-          `upstream: ${UPSTREAM}`,
+          `upstream (openai):    ${UPSTREAM_OPENAI}`,
+          `upstream (anthropic): ${UPSTREAM_ANTHROPIC}`,
           `body cap: ${DEBUG_MAX_BODY > 0 ? `${DEBUG_MAX_BODY} bytes` : "unlimited"}`,
           "",
           "",
