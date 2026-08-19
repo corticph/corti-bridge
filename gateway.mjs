@@ -13,6 +13,7 @@ import {
   createStreamTranslator,
   estimateTokens,
   promptTooLong,
+  runAdvisor,
   translateCompletion,
   translateError,
   translateModels,
@@ -120,6 +121,15 @@ function modeMarker(req) {
   return null;
 }
 
+// The advisor child is spawned through this same gateway; without a guard it would re-inject
+// consult_advisor into its own request and recurse. A -noadvisor suffix on the auth token is the
+// per-request opt-out (mirrors -anthropic/-openai). runAdvisor stamps it on the child's token.
+function wantsNoAdvisor(req) {
+  const auth = req.headers.authorization ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : (req.headers["x-api-key"] ?? "");
+  return typeof token === "string" && token.endsWith("-noadvisor");
+}
+
 let warnedUnmarked = false;
 
 const server = http.createServer((req, res) => {
@@ -224,7 +234,7 @@ async function handlePassthrough(req, res, reqPath) {
   if (!isCountTokens && req.method === "POST" && reqPath === "/v1/messages") {
     try {
       const parsed = JSON.parse(body.toString());
-      await applyIntercepts(parsed);
+      await applyIntercepts(parsed, { skipAdvisor: wantsNoAdvisor(req) });
       body = Buffer.from(JSON.stringify(parsed));
     } catch {
       // JSON parse failed — forward original body; upstream will reject
@@ -519,7 +529,7 @@ async function handleMessages(req, res, body) {
 
   let translated;
   try {
-    const out = await translateRequest(anthropicBody);
+    const out = await translateRequest(anthropicBody, { skipAdvisor: wantsNoAdvisor(req) });
     translated = out.request;
     diagnostics.push(...out.dropped.map((d) => `dropped: ${d}`));
   } catch (err) {
@@ -534,6 +544,138 @@ async function handleMessages(req, res, body) {
     reasoningMode: REASONING_MODE,
     estimatedInput: est,
     onDiagnostic: (m) => diagnostics.push(m),
+  };
+
+  // Hold-and-continue advisor: when the turn ends on a consult_advisor tool_use, the translator
+  // fires this hook instead of terminating. We emit a synthetic server_tool_use + advisor_tool_result
+  // inline (the shape the harness renders as "Advising…"), run the advisor, then make a second
+  // upstream call with the consult_advisor tool_use + a real client tool_result appended so the
+  // model reads the advice and actually answers the user. The gateway owns the terminal events.
+  let advisorHandled = false;
+  ctx.onAdvisorToolUse = async ({ id, focus }) => {
+    if (advisorHandled || finalized || clientGone) return;
+    advisorHandled = true;
+    diagnostics.push(`advisor hold-and-continue: id=${id} focus="${String(focus).slice(0, 60)}"`);
+
+    // 1. Emit the synthetic server-tool advisor blocks inline (rendered by the harness, not
+    //    round-tripped to Corti — the continuation call below carries the client-tool shape).
+    const srvIdx = translator ? translator.nextBlockIndex : 0;
+    const resIdx = srvIdx + 1;
+    writeEvent("content_block_start", {
+      type: "content_block_start", index: srvIdx,
+      content_block: { type: "server_tool_use", id, name: "advisor", input: {} },
+    });
+    writeEvent("content_block_stop", { type: "content_block_stop", index: srvIdx });
+
+    // 2. Run the advisor. Non-blocking UI: "Advising" shows while this runs.
+    let advisorText = "Advisor feedback: (no response)";
+    try {
+      const out = await runAdvisor(focus);
+      if (out) advisorText = `Advisor feedback:\n\n${out}`;
+    } catch (err) {
+      diagnostics.push(`advisor spawn failed: ${err?.message ?? err}`);
+    }
+
+    if (finalized || clientGone) return;
+    writeEvent("content_block_start", {
+      type: "content_block_start", index: resIdx,
+      content_block: {
+        type: "advisor_tool_result", tool_use_id: id,
+        content: { type: "advisor_result", text: advisorText, stop_reason: "end_turn" },
+      },
+    });
+    writeEvent("content_block_stop", { type: "content_block_stop", index: resIdx });
+
+    // 3. Continuation: a second, non-streaming upstream call. The history gains the model's
+    //    consult_advisor tool_use + a client tool_result holding the advice, so the model reads
+    //    the result and answers. We translate that response and stream it back as content blocks
+    //    under the SAME message (the harness sees one continuous turn).
+    try {
+      await continueAfterAdvisor(id, focus, advisorText);
+    } catch (err) {
+      diagnostics.push(`advisor continuation failed: ${err?.message ?? err}`);
+      if (!finalized && !res.writableEnded) {
+        writeEvent("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage: { input_tokens: est, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        });
+        writeEvent("message_stop", { type: "message_stop" });
+        res.end();
+        finalize("advisor-continuation-failed");
+      }
+    }
+  };
+
+  // The second upstream call: appends the consult_advisor tool_use + tool_result to the original
+  // request and asks the model to continue. Non-streaming for simplicity (the first turn already
+  // streamed; this is the advisor-aware continuation).
+  const continueAfterAdvisor = (toolUseId, focus, advisorText) => {
+    return new Promise((resolve, reject) => {
+      // Build the continuation body: original messages + a new user turn carrying the tool_result.
+      const contMessages = [...(anthropicBody.messages || [])];
+      contMessages.push({
+        role: "assistant",
+        content: [{ type: "tool_use", id: toolUseId, name: "consult_advisor", input: { focus } }],
+      });
+      contMessages.push({
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: toolUseId, content: advisorText, is_error: false }],
+      });
+      const contAnthropic = { ...anthropicBody, messages: contMessages, stream: false };
+      translateRequest(contAnthropic)
+        .then((out) => {
+          const contTranslated = out.request;
+          diagnostics.push(...out.dropped.map((d) => `continuation dropped: ${d}`));
+          const body = Buffer.from(JSON.stringify(contTranslated));
+          const req = https.request(url, {
+            agent, method: "POST",
+            headers: { "content-type": "application/json", authorization: `Bearer ${BEARER}`, "content-length": body.length },
+          }, (up) => {
+            const chunks = [];
+            up.on("data", (c) => chunks.push(c));
+            up.on("end", () => {
+              if (finalized || clientGone) return resolve();
+              try {
+                const msg = translateCompletion(JSON.parse(Buffer.concat(chunks).toString()), ctx);
+                // Stream the continuation content as more content_block events under this message.
+                let idx = translator ? translator.nextBlockIndex : resIdx + 1;
+                for (const block of msg.content) {
+                  const skeleton =
+                    block.type === "tool_use" ? { ...block, input: {} } :
+                    block.type === "thinking" ? { type: "thinking", thinking: "", signature: "" } :
+                    { type: "text", text: "" };
+                  writeEvent("content_block_start", { type: "content_block_start", index: idx, content_block: skeleton });
+                  if (block.type === "text")
+                    writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: block.text } });
+                  else if (block.type === "thinking") {
+                    writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "thinking_delta", thinking: block.thinking } });
+                    writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "signature_delta", signature: block.signature } });
+                  } else if (block.type === "tool_use")
+                    writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } });
+                  writeEvent("content_block_stop", { type: "content_block_stop", index: idx });
+                  idx++;
+                }
+                writeEvent("message_delta", {
+                  type: "message_delta",
+                  delta: { stop_reason: msg.stop_reason ?? "end_turn", stop_sequence: msg.stop_sequence ?? null },
+                  usage: msg.usage,
+                });
+                writeEvent("message_stop", { type: "message_stop" });
+                res.end();
+                finalize("advisor-continuation");
+                resolve();
+              } catch (e) {
+                reject(e);
+              }
+            });
+            up.on("error", reject);
+          });
+          req.on("error", reject);
+          req.end(body);
+        })
+        .catch(reject);
+    });
   };
 
   const upstreamBody = Buffer.from(JSON.stringify(translated));
@@ -858,6 +1000,9 @@ async function handleMessages(req, res, body) {
           if (payload.trim() === "[DONE]") {
             sawDone = true;
             translator.done();
+            // When the translator handed the turn to the advisor hook, the hook owns the rest
+            // of the stream (async: it runs the advisor + continuation). Do not finalize here.
+            if (translator.advisorHandoff) return;
             res.end();
             finalize("completed");
             return;
@@ -908,6 +1053,7 @@ async function handleMessages(req, res, body) {
           if (!sawDone) {
             translator.done();
             diagnostics.push("upstream ended without [DONE]");
+            if (translator.advisorHandoff) return; // hook owns the rest (async)
             res.end();
             finalize(terminalNote());
           }

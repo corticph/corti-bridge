@@ -263,6 +263,11 @@ export function runAdvisor(focus) {
     ];
     const env = { ...process.env };
     delete env.CORTI_ADVISOR_TOOL;
+    // Recursion guard: stamp a -noadvisor suffix on the auth token so the gateway's
+    // wantsNoAdvisor() check skips consult_advisor injection for the advisor child's own
+    // requests. The wrapper sets ANTHROPIC_AUTH_TOKEN="local-gateway-<mode>"; append the suffix.
+    if (typeof env.ANTHROPIC_AUTH_TOKEN === "string" && !env.ANTHROPIC_AUTH_TOKEN.endsWith("-noadvisor"))
+      env.ANTHROPIC_AUTH_TOKEN = env.ANTHROPIC_AUTH_TOKEN + "-noadvisor";
     const child = execFile("corti-claude", args, {
       env,
       timeout: ADVISOR_TIMEOUT_MS,
@@ -348,8 +353,8 @@ function isTruthyEnv(v) {
 // Injects the consult_advisor tool def and rewrites its tool_result blocks with the advisor's
 // output. Gated by CORTI_ADVISOR_TOOL; the runAdvisor dependency is injectable via ctx so tests
 // stay hermetic (no child_process spawn).
-async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor } = {}) {
-  if (!isTruthyEnv(process.env.CORTI_ADVISOR_TOOL)) return [];
+async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor } = {}) {
+  if (skipAdvisor || !isTruthyEnv(process.env.CORTI_ADVISOR_TOOL)) return [];
   const diagnostics = [];
 
   // (a) inject the tool def so the model sees it (idempotent — don't push if present)
@@ -463,7 +468,7 @@ function documentText(block) {
 }
 
 
-export async function translateRequest(body) {
+export async function translateRequest(body, opts) {
   if (!body || typeof body !== "object")
     reject(400, "invalid_request_error", "request body is not valid JSON");
   if (typeof body.model !== "string" || !body.model)
@@ -471,7 +476,7 @@ export async function translateRequest(body) {
   if (!Array.isArray(body.messages))
     reject(400, "invalid_request_error", "Field required: messages");
 
-  const interceptDiags = await applyIntercepts(body);
+  const interceptDiags = await applyIntercepts(body, opts);
 
   const dropped = [...interceptDiags];
   const sysParts = [];
@@ -964,12 +969,13 @@ export function createStreamTranslator(ctx, emit) {
   let messageStarted = false;
   let open = null; // { kind: "thinking"|"text"|"tool", index }
   let nextBlockIndex = 0;
-  const toolBlocks = new Map(); // upstream tool_calls index -> { blockIndex, closed }
+  const toolBlocks = new Map(); // upstream tool_calls index -> { blockIndex, closed, name, id, args }
   let pendingStop = null;
   let doneEmitted = false;
   let terminated = false;
   let latestUsage = null;
   let outputChars = 0;
+  let advisorToolUse = null; // { id, name, args } when the turn ends on a consult_advisor tool_use
 
   const closeOpen = () => {
     if (!open) return;
@@ -1055,15 +1061,30 @@ export function createStreamTranslator(ctx, emit) {
         const name = entry.function?.name ?? "";
         if (!entry.id || !name)
           ctx.onDiagnostic?.(`tool head missing ${!entry.id ? "id" : "name"} at index ${idx}`);
-        openBlock("tool", { type: "tool_use", id, name, input: {} });
-        toolBlocks.set(idx, { blockIndex: open.index, closed: false });
+        // Suppress the client consult_advisor tool_use from the harness: we replace it with a
+        // synthetic server_tool_use + advisor_tool_result inline (see finish()/onAdvisorToolUse),
+        // so the harness never dispatches a tool it has no implementation for (no error flash).
+        // We still record the block so the hook can read id + focus; marked closed + blockIndex -1
+        // so it is never emitted and occupies no block index.
+        if (name === ADVISOR_TOOL_NAME && typeof ctx.onAdvisorToolUse === "function") {
+          toolBlocks.set(idx, { blockIndex: -1, closed: true, name, id, args: "" });
+        } else {
+          openBlock("tool", { type: "tool_use", id, name, input: {} });
+          toolBlocks.set(idx, { blockIndex: open.index, closed: false, name, id, args: "" });
+        }
       }
     }
 
     const rec = toolBlocks.get(idx);
     if (!rec || rec.closed) {
-      if (entry.function?.arguments)
+      // The suppressed advisor block is closed but we still need to accumulate its args
+      // (the focus) for the hook — just don't emit them to the harness.
+      if (rec && rec.name === ADVISOR_TOOL_NAME && typeof ctx.onAdvisorToolUse === "function") {
+        const f = entry.function?.arguments;
+        if (typeof f === "string") rec.args += f;
+      } else if (entry.function?.arguments) {
         ctx.onDiagnostic?.(`tool args for unknown/closed index ${idx}: skipped`);
+      }
       return;
     }
     const frag = entry.function?.arguments;
@@ -1073,6 +1094,7 @@ export function createStreamTranslator(ctx, emit) {
         ctx.onDiagnostic?.(`tool args for non-open block ${rec.blockIndex}: skipped`);
         return;
       }
+      rec.args += frag;
       outputChars += frag.length;
       emit("content_block_delta", {
         type: "content_block_delta",
@@ -1085,6 +1107,17 @@ export function createStreamTranslator(ctx, emit) {
   const finish = (choice) => {
     pendingStop = anthropicStop(choice);
     closeOpen();
+    // Detect a turn ending on a consult_advisor tool_use. The harness would otherwise end the
+    // turn and synthesize a "No such tool" error; the gateway uses this to hold the turn open
+    // and emit an inline advisor_tool_result instead. Only fires when a hook is registered.
+    if (pendingStop?.stop_reason === "tool_use" && typeof ctx.onAdvisorToolUse === "function") {
+      const adv = [...toolBlocks.values()].reverse().find((t) => t.name === "consult_advisor");
+      if (adv) {
+        let focus = "";
+        try { focus = (JSON.parse(adv.args || "{}")).focus ?? ""; } catch { focus = adv.args; }
+        advisorToolUse = { id: adv.id, focus };
+      }
+    }
   };
 
   const usageEvent = (usage) => {
@@ -1094,6 +1127,12 @@ export function createStreamTranslator(ctx, emit) {
   const emitDeltaEvent = () => {
     if (doneEmitted) return;
     doneEmitted = true;
+    // Hand the turn to the gateway instead of terminating, so it can emit an inline
+    // advisor_tool_result and a continuation. The gateway owns the terminal events then.
+    if (advisorToolUse && typeof ctx.onAdvisorToolUse === "function") {
+      ctx.onAdvisorToolUse(advisorToolUse);
+      return;
+    }
     const usage = latestUsage
       ? anthropicUsage(latestUsage)
       : {
@@ -1147,15 +1186,27 @@ export function createStreamTranslator(ctx, emit) {
     // [DONE] or upstream end/close: single terminal entry point
     done() {
       if (terminated) return;
-      terminated = true;
       startMessage();
       closeOpen();
       emitDeltaEvent();
-      emit("message_stop", { type: "message_stop" });
+      // When the turn is handed off for an inline advisor result, the gateway owns the rest
+      // of the stream — do not emit message_stop or mark terminated.
+      if (!advisorToolUse) {
+        terminated = true;
+        emit("message_stop", { type: "message_stop" });
+      }
     },
 
     get terminated() {
       return terminated;
+    },
+    get nextBlockIndex() {
+      return nextBlockIndex;
+    },
+    // True when the translator handed the turn to the gateway for an inline advisor result
+    // (done() suppressed message_stop). The stream handlers use this to know not to finalize.
+    get advisorHandoff() {
+      return !!advisorToolUse && !terminated;
     },
   };
 }
