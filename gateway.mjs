@@ -20,6 +20,7 @@ import {
   translateNetworkError,
   translateRequest,
 } from "./translate.mjs";
+import { serializeAdvisorInput } from "./lib/advisor-transcript.mjs";
 import {
   RETRY_MAX_ATTEMPTS,
   isRetryableNetworkError,
@@ -554,10 +555,17 @@ async function handleMessages(req, res, body) {
   // upstream call with the consult_advisor tool_use + a real client tool_result appended so the
   // model reads the advice and actually answers the user. The gateway owns the terminal events.
   let advisorHandled = false;
-  ctx.onAdvisorToolUse = async ({ id, focus }) => {
+  ctx.onAdvisorToolUse = async ({ id }) => {
     if (advisorHandled || finalized || clientGone) return;
     advisorHandled = true;
-    diagnostics.push(`advisor hold-and-continue: id=${id} focus="${String(focus).slice(0, 60)}"`);
+    // Serialize the executor's full request (system + tools + transcript + budget line) for the
+    // advisor. The tool input is empty — the executor signals timing only; the harness forwards
+    // context automatically, per the official advisor tool design.
+    const { text: advisorInput, elidedCount } = serializeAdvisorInput(anthropicBody, {
+      maxTokens: Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2048,
+    });
+    const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
+    diagnostics.push(`advisor hold-and-continue: id=${id} transcript=${advisorInput.length} chars${elidedStr}`);
 
     // 1. Emit the synthetic server-tool advisor blocks inline (rendered by the harness, not
     //    round-tripped to Corti — the continuation call below carries the client-tool shape).
@@ -569,10 +577,10 @@ async function handleMessages(req, res, body) {
     });
     writeEvent("content_block_stop", { type: "content_block_stop", index: srvIdx });
 
-    // 2. Run the advisor. Non-blocking UI: "Advising" shows while this runs.
+    // 2. Run the advisor on the serialized transcript. Non-blocking UI: "Advising" shows while this runs.
     let advisorText = "Advisor feedback: (no response)";
     try {
-      const out = await runAdvisor(focus);
+      const out = await runAdvisor(advisorInput);
       if (out) advisorText = `Advisor feedback:\n\n${out}`;
     } catch (err) {
       diagnostics.push(`advisor spawn failed: ${err?.message ?? err}`);
@@ -593,7 +601,7 @@ async function handleMessages(req, res, body) {
     //    the result and answers. We translate that response and stream it back as content blocks
     //    under the SAME message (the harness sees one continuous turn).
     try {
-      await continueAfterAdvisor(id, focus, advisorText);
+      await continueAfterAdvisor(id, advisorText);
     } catch (err) {
       diagnostics.push(`advisor continuation failed: ${err?.message ?? err}`);
       if (!finalized && !res.writableEnded) {
@@ -612,13 +620,13 @@ async function handleMessages(req, res, body) {
   // The second upstream call: appends the consult_advisor tool_use + tool_result to the original
   // request and asks the model to continue. Non-streaming for simplicity (the first turn already
   // streamed; this is the advisor-aware continuation).
-  const continueAfterAdvisor = (toolUseId, focus, advisorText) => {
+  const continueAfterAdvisor = (toolUseId, advisorText) => {
     return new Promise((resolve, reject) => {
       // Build the continuation body: original messages + a new user turn carrying the tool_result.
       const contMessages = [...(anthropicBody.messages || [])];
       contMessages.push({
         role: "assistant",
-        content: [{ type: "tool_use", id: toolUseId, name: "consult_advisor", input: { focus } }],
+        content: [{ type: "tool_use", id: toolUseId, name: "consult_advisor", input: {} }],
       });
       contMessages.push({
         role: "user",

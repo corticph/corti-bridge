@@ -2,8 +2,10 @@
 
 import https from "node:https";
 import path from "node:path";
+import fs from "node:fs";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { serializeAdvisorInput } from "./lib/advisor-transcript.mjs";
 
 export const REASONING_SIGNATURE = "Y29ydGktcHJveHk="; // base64 "corti-proxy"
 
@@ -224,34 +226,38 @@ function formatSearchResults(query, results) {
 // requests don't re-inject) and with `--tools ""` (so it can't emit a tool_use at all).
 const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const ADVISOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-prompt.txt");
+const ADVISOR_EXECUTOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-executor-prompt.txt");
 const ADVISOR_TIMEOUT_MS = Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 60_000;
 const ADVISOR_MODEL = process.env.CORTI_ADVISOR_MODEL || "opus";
+// Soft per-call output cap, surfaced to the advisor via the serialized transcript's budget
+// line. The official advisor tool sets a hard `max_tokens` on the tool def; corti-claude -p
+// exposes no such flag, so this is a soft steer (the advisor shapes to fit) plus the hard
+// ADVISOR_TIMEOUT_MS / maxBuffer ceilings. 2048 is the official "recommended starting point."
+// Read at call time (not module load) so per-test env changes take effect.
+const advisorMaxTokens = () => Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2048;
 
 const ADVISOR_TOOL_NAME = "consult_advisor";
 const ADVISOR_TOOL_NAMES = new Set([ADVISOR_TOOL_NAME]);
+// Empty input_schema: the executor signals *timing only*. Letting it write a query loses
+// exactly the detail the advisor is there to catch — the harness forwards the full transcript
+// automatically (see serializeAdvisorInput). `additionalProperties: false` matters: models
+// want to fill in a "question" field.
 const ADVISOR_TOOL_DEF = {
   name: ADVISOR_TOOL_NAME,
   description:
-    "Consult a senior advisor for a second opinion or review. Use 'focus' to say what you " +
-    "want advice on. Call this when you want an advisor review before proceeding.",
-  input_schema: {
-    type: "object",
-    properties: {
-      focus: {
-        type: "string",
-        description:
-          "What you want the advisor to focus on — the question, decision, or part of the " +
-          "conversation you'd like a second opinion on. Include whatever context the advisor needs.",
-      },
-    },
-    required: ["focus"],
-  },
+    "Consult a stronger reviewer model. Takes no parameters — your entire conversation " +
+    "history is forwarded automatically. Call before committing to an approach, when stuck, " +
+    "and before declaring a task complete.",
+  input_schema: { type: "object", properties: {}, additionalProperties: false },
 };
 
 // Runs the advisor as a headless corti-claude session. Resolves to the advisor's text, or null
 // on timeout / spawn failure / unparseable output. The child env has CORTI_ADVISOR_TOOL stripped
 // so the child's own requests through the proxy don't re-inject the tool (recursion guard).
-export function runAdvisor(focus) {
+// `text` is the serialized executor transcript (system + tools + messages + budget line), not a
+// short focus string — the advisor sees the full context the executor has, per the official
+// advisor tool's "server supplies context" behaviour.
+export function runAdvisor(text) {
   return new Promise((resolve) => {
     const args = [
       "-p",
@@ -291,13 +297,48 @@ export function runAdvisor(focus) {
       }
     });
     child.stdin.on("error", () => {}); // child closed stdin before we wrote
-    child.stdin.end(String(focus ?? ""));
+    child.stdin.end(String(text ?? ""));
   });
 }
 
 // Default backing used when no runAdvisor is injected via ctx (production). Aliased rather than
 // re-declared to avoid a TDZ reference before runAdvisor is initialised.
 const defaultRunAdvisor = runAdvisor;
+
+// The executor-side timing + advice-weight block, read once from disk and cached. Prepended to
+// the executor's system prompt whenever the advisor tool is injected, so the executor calls at
+// the official cadence (before substantive work, before declaring done). From
+// lib/advisor-executor-prompt.txt — the official "Suggested system prompt for coding tasks."
+let _executorPromptCache;
+function advisorExecutorPrompt() {
+  if (_executorPromptCache === undefined) {
+    try {
+      _executorPromptCache = fs.readFileSync(ADVISOR_EXECUTOR_PROMPT_FILE, "utf8").trim();
+    } catch {
+      _executorPromptCache = "";
+    }
+  }
+  return _executorPromptCache;
+}
+
+// Prepend the executor timing block to body.system. Idempotent: skips if the block is already
+// present (it carries its own distinctive opening line). Accepts string or array system shapes.
+function prependExecutorPrompt(body) {
+  const block = advisorExecutorPrompt();
+  if (!block) return;
+  if (typeof body.system === "string") {
+    if (!body.system.includes("You have access to an `advisor` tool")) {
+      body.system = `${block}\n\n${body.system}`.trim();
+    }
+  } else if (Array.isArray(body.system)) {
+    const first = body.system.find((b) => b?.type === "text" && typeof b.text === "string");
+    if (!first?.text?.includes("You have access to an `advisor` tool")) {
+      body.system = [{ type: "text", text: block }, ...body.system];
+    }
+  } else {
+    body.system = [{ type: "text", text: block }];
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* intercept registry — shared by both gateway modes                   */
@@ -364,9 +405,17 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
     body.tools = [ADVISOR_TOOL_DEF];
   }
 
+  // (a2) prepend the executor timing + advice-weight block to body.system so the executor
+  //     calls at the official cadence. Same gate as the tool injection above.
+  prependExecutorPrompt(body);
+
   // (b) rewrite tool_result blocks for consult_advisor calls. Claude Code synthesizes an error
   // tool_result ("Unknown tool: consult_advisor", is_error:true) for the unknown tool and
   // round-trips it in the next request; we overwrite both content AND is_error here.
+  //
+  // The advisor receives the SERIALIZED TRANSCRIPT of the whole request (system + tools +
+  // messages + budget line), not the executor's focus string — this is the official "server
+  // supplies context" behaviour. The tool_use input is now empty, so there is no focus to read.
   const call = runAdvisor || defaultRunAdvisor;
   for (const msg of body.messages ?? []) {
     if (msg?.role !== "user" || !Array.isArray(msg.content)) continue;
@@ -374,11 +423,12 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
       if (b?.type !== "tool_result") continue;
       const toolUse = toolUseMap.get(b.tool_use_id);
       if (!toolUse || !ADVISOR_TOOL_NAMES.has(toolUse.name)) continue;
-      const focus = toolUse.input?.focus ?? "";
-      const out = await call(focus);
+      const { text, elidedCount } = serializeAdvisorInput(body, { maxTokens: advisorMaxTokens() });
+      const out = await call(text);
       b.content = out ? `Advisor feedback:\n\n${out}` : "Advisor feedback: (no response)";
       b.is_error = false;
-      diagnostics.push(`advisor intercepted: focus="${focus.slice(0, 60)}"`);
+      const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
+      diagnostics.push(`advisor intercepted: transcript=${text.length} chars${elidedStr}`);
     }
   }
   return diagnostics;
@@ -1064,7 +1114,7 @@ export function createStreamTranslator(ctx, emit) {
         // Suppress the client consult_advisor tool_use from the harness: we replace it with a
         // synthetic server_tool_use + advisor_tool_result inline (see finish()/onAdvisorToolUse),
         // so the harness never dispatches a tool it has no implementation for (no error flash).
-        // We still record the block so the hook can read id + focus; marked closed + blockIndex -1
+        // We still record the block so the hook can read its id; marked closed + blockIndex -1
         // so it is never emitted and occupies no block index.
         if (name === ADVISOR_TOOL_NAME && typeof ctx.onAdvisorToolUse === "function") {
           toolBlocks.set(idx, { blockIndex: -1, closed: true, name, id, args: "" });
@@ -1077,8 +1127,9 @@ export function createStreamTranslator(ctx, emit) {
 
     const rec = toolBlocks.get(idx);
     if (!rec || rec.closed) {
-      // The suppressed advisor block is closed but we still need to accumulate its args
-      // (the focus) for the hook — just don't emit them to the harness.
+      // The suppressed advisor block is closed but we still accumulate its args for
+      // completeness — just don't emit them to the harness. (The tool input is empty, so
+      // there's nothing to read here in practice; the hook gets the id only.)
       if (rec && rec.name === ADVISOR_TOOL_NAME && typeof ctx.onAdvisorToolUse === "function") {
         const f = entry.function?.arguments;
         if (typeof f === "string") rec.args += f;
@@ -1110,12 +1161,12 @@ export function createStreamTranslator(ctx, emit) {
     // Detect a turn ending on a consult_advisor tool_use. The harness would otherwise end the
     // turn and synthesize a "No such tool" error; the gateway uses this to hold the turn open
     // and emit an inline advisor_tool_result instead. Only fires when a hook is registered.
+    // The tool input is empty (the executor signals timing only), so we pass just the id;
+    // the gateway serializes the full transcript from its own copy of the request body.
     if (pendingStop?.stop_reason === "tool_use" && typeof ctx.onAdvisorToolUse === "function") {
       const adv = [...toolBlocks.values()].reverse().find((t) => t.name === "consult_advisor");
       if (adv) {
-        let focus = "";
-        try { focus = (JSON.parse(adv.args || "{}")).focus ?? ""; } catch { focus = adv.args; }
-        advisorToolUse = { id: adv.id, focus };
+        advisorToolUse = { id: adv.id };
       }
     }
   };

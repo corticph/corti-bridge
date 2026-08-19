@@ -59,10 +59,17 @@ check("websearch: converted to function tool", wsTools?.length === 1 && wsTools[
 
 // consult_advisor: tool def injected when CORTI_ADVISOR_TOOL is set, in both gateway modes.
 process.env.CORTI_ADVISOR_TOOL = "1";
-const advBody = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }] };
+const advBody = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], system: "You are a coding agent." };
 await applyIntercepts(advBody);
 check("advisor: tool def injected", advBody.tools?.some((t) => t.name === "consult_advisor"), true);
-check("advisor: schema has focus", advBody.tools?.find((t) => t.name === "consult_advisor")?.input_schema?.properties?.focus?.type, "string");
+// Empty input_schema: the executor signals timing only — the harness forwards the transcript.
+// additionalProperties:false matters (models want to fill in a "question" field).
+const advSchema = advBody.tools?.find((t) => t.name === "consult_advisor")?.input_schema;
+check("advisor: schema is empty (additionalProperties:false)",
+  JSON.stringify(advSchema) === JSON.stringify({ type: "object", properties: {}, additionalProperties: false }), true);
+// The executor-side timing block is prepended to body.system (idempotent, original preserved).
+check("advisor: executor timing prompt prepended", String(advBody.system).startsWith("You have access to an `advisor` tool"), true);
+check("advisor: original system preserved after timing block", String(advBody.system).includes("You are a coding agent."), true);
 // The openai translate path filters tools to input_schema + string name; ours has both, so it survives.
 const advTools = (await translateRequest({
   model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }],
@@ -71,44 +78,101 @@ check("advisor: survives openai filter", advTools?.some((t) => t.function?.name 
 
 // Guard: not injected when the env var is unset.
 delete process.env.CORTI_ADVISOR_TOOL;
-const advBody2 = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [] };
+const advBody2 = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [], system: "agent" };
 await applyIntercepts(advBody2);
 check("advisor: not injected when unset", advBody2.tools.length, 0);
+// Timing prompt is NOT prepended when the advisor is off (system untouched).
+check("advisor: no timing prompt when unset", advBody2.system === "agent", true);
 
-// Result rewrite with a stubbed runAdvisor — hermetic, no child_process spawn. Mirrors the
-// shape Claude Code produces: an error tool_result ("Unknown tool: ...", is_error:true) that
-// it round-trips in the next request; the intercept overwrites both content AND is_error.
+// Transcript serializer (lib/advisor-transcript.mjs) — the heart of the official alignment.
+// The advisor receives the full serialized context, not the executor focus string.
 process.env.CORTI_ADVISOR_TOOL = "1";
-const stub = async (focus) => `stub advice for: ${focus}`;
+const stubInput = []; // captures the serialized payload the stub receives
+const stub = async (text) => { stubInput.length = 0; stubInput.push(text); return `stub advice`; };
 const advBody3 = {
-  model: "corti-s1", max_tokens: 16,
+  model: "corti-s1", max_tokens: 16, system: "You are a coding agent.",
+  tools: [{ name: "run_bash", description: "Run a bash command" }],
   messages: [
-    { role: "assistant", content: [{ type: "tool_use", id: "tu_adv1", name: "consult_advisor", input: { focus: "the plan" } }] },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_adv1", content: "Unknown tool: consult_advisor", is_error: true }] },
+    { role: "user", content: "Fix the bug in app.js" },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "secret", signature: "x" },
+      { type: "tool_use", id: "tu_adv1", name: "run_bash", input: { command: "cat app.js" } },
+    ]},
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_adv1", content: "const x = undefined;\nx.foo();" }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "tu_adv2", name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_adv2", content: "Unknown tool: consult_advisor", is_error: true }] },
   ],
 };
 await applyIntercepts(advBody3, { runAdvisor: stub });
-const advResult = advBody3.messages[1].content[0];
-check("advisor: result rewritten", advResult.content, "Advisor feedback:\n\nstub advice for: the plan");
+const advResult = advBody3.messages[4].content[0];
+check("advisor: result rewritten", advResult.content, "Advisor feedback:\n\nstub advice");
 check("advisor: is_error cleared", advResult.is_error, false);
+// The stub received the serialized transcript, not a focus string.
+const ser = stubInput[0] || "";
+check("advisor: stub receives serialized transcript (has executor_system_prompt)", ser.includes("<executor_system_prompt>"), true);
+check("advisor: stub receives serialized transcript (has transcript block)", ser.includes("<transcript>"), true);
+check("advisor: stub receives serialized transcript (has budget line)", ser.includes("remaining output budget"), true);
+// The advisor tool itself is omitted from the forwarded <available_tools> block (recursion
+// guard: the advisor must not see a tool it could call). It still appears in the transcript
+// as the executor tool_use call, so scope the check to the tools block.
+const toolsBlock = (ser.match(/<available_tools>([\s\S]*?)<\/available_tools>/) || [])[1] || "";
+check("advisor: consult_advisor omitted from forwarded tool list", toolsBlock.includes("consult_advisor"), false);
+// run_bash IS forwarded (the advisor needs to see the executor available tools).
+check("advisor: run_bash forwarded in tool list", ser.includes("run_bash"), true);
+// Thinking blocks are dropped (official: only the conclusion reaches the executor).
+check("advisor: thinking omitted in transcript", ser.includes("[thinking omitted]"), true);
+// Order: system prompt before transcript (stable prefix first).
+check("advisor: system prompt precedes transcript", ser.indexOf("<executor_system_prompt>") < ser.indexOf("<transcript>"), true);
+// The executor real tool result (the bug) reaches the advisor — the whole point.
+check("advisor: executor tool result forwarded", ser.includes("x.foo()"), true);
 
-// Idempotency: don\x27t inject twice if the tool is already present.
-const advBody4 = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [{ name: "consult_advisor", input_schema: { type: "object" } }] };
+// Truncation: large tool results are head/tail-truncated with an elision marker.
+const big = "x".repeat(20000);
+const truncBody = {
+  model: "corti-s1", max_tokens: 16,
+  messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "tb1", name: "run_bash", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tb1", content: big }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "tb2", name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tb2", content: "Unknown tool", is_error: true }] },
+  ],
+};
+const truncCap = [];
+await applyIntercepts(truncBody, { runAdvisor: async (t) => { truncCap.push(t); return "x"; } });
+check("advisor: large tool result truncated with elision marker", (truncCap[0] || "").includes("chars elided"), true);
+
+// Budget line uses CORTI_ADVISOR_MAX_TOKENS when set.
+process.env.CORTI_ADVISOR_MAX_TOKENS = "768";
+const budgetCap = [];
+await applyIntercepts({
+  model: "corti-s1", max_tokens: 16,
+  messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "bm1", name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "bm1", content: "Unknown tool", is_error: true }] },
+  ],
+}, { runAdvisor: async (t) => { budgetCap.push(t); return "x"; } });
+check("advisor: budget line honors CORTI_ADVISOR_MAX_TOKENS", (budgetCap[0] || "").includes("approximately 768 tokens"), true);
+delete process.env.CORTI_ADVISOR_MAX_TOKENS;
+
+// Idempotency: don\x27t inject twice if the tool is already present, and don\x27t re-prepend the
+// timing block if it\x27s already there.
+const advBody4 = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [{ name: "consult_advisor", input_schema: { type: "object" } }], system: "You have access to an `advisor` tool backed by a stronger reviewer model.\n\nOriginal system." };
 await applyIntercepts(advBody4);
 check("advisor: no duplicate injection", advBody4.tools.filter((t) => t.name === "consult_advisor").length, 1);
+check("advisor: no duplicate timing prompt", (String(advBody4.system).match(/You have access to an `advisor` tool/g) || []).length, 1);
 
 // Fix #2c: the advisor continuation (continueAfterAdvisor) carries a consult_advisor
 // tool_use + an already-populated tool_result. Without skipAdvisor, interceptConsultAdvisor
 // matches that tool_result and re-spawns runAdvisor. skipAdvisor:true must suppress both
-// the injection and the spawn. Mirrors the continuation body shape (assistant tool_use +
-// user tool_result) that the gateway builds in continueAfterAdvisor.
+// the injection and the spawn. Mirrors the continuation body shape (assistant tool_use with
+// EMPTY input + user tool_result) that the gateway builds in continueAfterAdvisor.
 let stubCalls = 0;
-const countingStub = async (focus) => { stubCalls++; return `stub advice for: ${focus}`; };
+const countingStub = async (text) => { stubCalls++; return `stub advice`; };
 const continuationBody = {
   model: "corti-s1", max_tokens: 16,
   messages: [
     { role: "user", content: "should I ship this?" },
-    { role: "assistant", content: [{ type: "tool_use", id: "tu_adv1", name: "consult_advisor", input: { focus: "the plan" } }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "tu_adv1", name: "consult_advisor", input: {} }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_adv1", content: "Advisor feedback:\n\nalready synthesized", is_error: false }] },
   ],
 };
