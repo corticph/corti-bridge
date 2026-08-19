@@ -122,12 +122,14 @@ function modeMarker(req) {
 }
 
 // The advisor child is spawned through this same gateway; without a guard it would re-inject
-// consult_advisor into its own request and recurse. A -noadvisor suffix on the auth token is the
-// per-request opt-out (mirrors -anthropic/-openai). runAdvisor stamps it on the child's token.
+// consult_advisor into its own request and recurse. The wrapper stamps a -noadvisor- marker
+// on the child's token (local-gateway-noadvisor-<mode>) — placed before the mode suffix so
+// modeMarker still matches the trailing -openai/-anthropic. Match the marker anywhere in the
+// token, since it now sits before the mode suffix rather than at the tail.
 function wantsNoAdvisor(req) {
   const auth = req.headers.authorization ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : (req.headers["x-api-key"] ?? "");
-  return typeof token === "string" && token.endsWith("-noadvisor");
+  return typeof token === "string" && token.includes("-noadvisor-");
 }
 
 let warnedUnmarked = false;
@@ -623,7 +625,11 @@ async function handleMessages(req, res, body) {
         content: [{ type: "tool_result", tool_use_id: toolUseId, content: advisorText, is_error: false }],
       });
       const contAnthropic = { ...anthropicBody, messages: contMessages, stream: false };
-      translateRequest(contAnthropic)
+      // skipAdvisor: the continuation already carries the consult_advisor tool_use +
+      // tool_result we synthesized; re-running interceptConsultAdvisor would match that
+      // tool_result and spawn runAdvisor a second time. The continuation is ours, not a
+      // fresh client request, so the advisor intercept must not touch it.
+      translateRequest(contAnthropic, { skipAdvisor: true })
         .then((out) => {
           const contTranslated = out.request;
           diagnostics.push(...out.dropped.map((d) => `continuation dropped: ${d}`));
@@ -718,6 +724,10 @@ async function handleMessages(req, res, body) {
 
   const writePing = () => {
     if (clientGone || res.writableEnded) return;
+    // While the translator handed the turn to the advisor hook, the stream is idle by
+    // design (runAdvisor is spawning). Pings here render as a thinking-spinner line that
+    // displaces the "Advising" indicator, so suppress them for the duration of the handoff.
+    if (translator?.advisorHandoff) return;
     const buf = Buffer.from(`event: ping\ndata: {"type":"ping"}\n\n`);
     collectEmitted(buf);
     res.write(buf);

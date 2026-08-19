@@ -96,6 +96,35 @@ check("advisor: is_error cleared", advResult.is_error, false);
 const advBody4 = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [{ name: "consult_advisor", input_schema: { type: "object" } }] };
 await applyIntercepts(advBody4);
 check("advisor: no duplicate injection", advBody4.tools.filter((t) => t.name === "consult_advisor").length, 1);
+
+// Fix #2c: the advisor continuation (continueAfterAdvisor) carries a consult_advisor
+// tool_use + an already-populated tool_result. Without skipAdvisor, interceptConsultAdvisor
+// matches that tool_result and re-spawns runAdvisor. skipAdvisor:true must suppress both
+// the injection and the spawn. Mirrors the continuation body shape (assistant tool_use +
+// user tool_result) that the gateway builds in continueAfterAdvisor.
+let stubCalls = 0;
+const countingStub = async (focus) => { stubCalls++; return `stub advice for: ${focus}`; };
+const continuationBody = {
+  model: "corti-s1", max_tokens: 16,
+  messages: [
+    { role: "user", content: "should I ship this?" },
+    { role: "assistant", content: [{ type: "tool_use", id: "tu_adv1", name: "consult_advisor", input: { focus: "the plan" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_adv1", content: "Advisor feedback:\n\nalready synthesized", is_error: false }] },
+  ],
+};
+// Without skipAdvisor: the intercept re-spawns the advisor (regression guard — proves the
+// fix is the skipAdvisor thread, not a broader no-op).
+const leakBody = JSON.parse(JSON.stringify(continuationBody));
+stubCalls = 0;
+await applyIntercepts(leakBody, { runAdvisor: countingStub });
+check("advisor continuation: re-injects WITHOUT skipAdvisor (regression guard)", stubCalls, 1);
+// With skipAdvisor: no spawn, no injection, result preserved as-is.
+const skipBody = JSON.parse(JSON.stringify(continuationBody));
+stubCalls = 0;
+await applyIntercepts(skipBody, { runAdvisor: countingStub, skipAdvisor: true });
+check("advisor continuation: no re-spawn WITH skipAdvisor", stubCalls, 0);
+check("advisor continuation: result preserved with skipAdvisor", skipBody.messages[2].content[0].content, "Advisor feedback:\n\nalready synthesized");
+check("advisor continuation: no tool injected with skipAdvisor", Boolean(skipBody.tools?.some((t) => t?.name === "consult_advisor")), false);
 delete process.env.CORTI_ADVISOR_TOOL;
 
 // Claude Code parses the digit pair out of our message to size compaction; when the match

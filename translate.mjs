@@ -263,11 +263,11 @@ export function runAdvisor(focus) {
     ];
     const env = { ...process.env };
     delete env.CORTI_ADVISOR_TOOL;
-    // Recursion guard: stamp a -noadvisor suffix on the auth token so the gateway's
-    // wantsNoAdvisor() check skips consult_advisor injection for the advisor child's own
-    // requests. The wrapper sets ANTHROPIC_AUTH_TOKEN="local-gateway-<mode>"; append the suffix.
-    if (typeof env.ANTHROPIC_AUTH_TOKEN === "string" && !env.ANTHROPIC_AUTH_TOKEN.endsWith("-noadvisor"))
-      env.ANTHROPIC_AUTH_TOKEN = env.ANTHROPIC_AUTH_TOKEN + "-noadvisor";
+    // Recursion guard: ask the corti-claude wrapper to stamp the -noadvisor marker on the
+    // child's auth token, which the gateway's wantsNoAdvisor() skips injection on. The
+    // gateway process env has no ANTHROPIC_AUTH_TOKEN (the wrapper sets it after spawning
+    // the gateway), so we can't stamp the suffix here — the wrapper must do it.
+    env.CORTI_ADVISOR_NOINJECT = "1";
     const child = execFile("corti-claude", args, {
       env,
       timeout: ADVISOR_TIMEOUT_MS,
