@@ -107,6 +107,24 @@ await applyIntercepts(advBody3, { runAdvisor: stub });
 const advResult = advBody3.messages[4].content[0];
 check("advisor: result rewritten", advResult.content, "Advisor feedback:\n\nstub advice");
 check("advisor: is_error cleared", advResult.is_error, false);
+
+// Failure path: when runAdvisor returns { ok:false, code }, the tool_result carries the
+// failure (not a fake success), so the executor sees advice was unavailable and continues.
+// Maps to the official advisor_tool_result_error error_code (e.g. execution_time_exceeded).
+const failStub = async () => ({ ok: false, code: "execution_time_exceeded" });
+const failBody = {
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [
+    { role: "user", content: "Fix the bug" },
+    { role: "assistant", content: [{ type: "tool_use", id: "tu_f1", name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_f1", content: "Unknown tool: consult_advisor", is_error: true }] },
+  ],
+};
+await applyIntercepts(failBody, { runAdvisor: failStub });
+const failResult = failBody.messages[2].content[0];
+check("advisor: failure carries error code, not fake advice",
+  failResult.content, "Advisor feedback: (unavailable — execution_time_exceeded)");
+check("advisor: failure is_error cleared (request does not fail)", failResult.is_error, false);
 // The stub received the serialized transcript, not a focus string.
 const ser = stubInput[0] || "";
 check("advisor: stub receives serialized transcript (has executor_system_prompt)", ser.includes("<executor_system_prompt>"), true);

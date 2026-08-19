@@ -170,6 +170,14 @@ if [ -n "$health" ] && ! gateway_is_ours "$health"; then
     exit 1
 fi
 
+# CORTI_NO_MANAGE_GATEWAY: use the running gateway as-is, never stop/start it. The advisor
+# child (runAdvisor in translate.mjs) sets this: it spawns `corti-claude -p` as a one-shot
+# print run through the SAME gateway the parent is serving on, and must not manage that
+# gateway's lifecycle. Without this guard a debug-mode mismatch (parent started with
+# CORTI_DEBUG=1, child with it stripped) would make the child's wrapper restart-kill its
+# own parent gateway mid-consult, orphaning the advisor turn ("Server error mid-response").
+if [ "${CORTI_NO_MANAGE_GATEWAY:-}" != 1 ]; then
+
 # The gateway outlives any single invocation, so a state mismatch needs a restart.
 if [ -n "$health" ]; then
     restart_reason=""
@@ -213,6 +221,8 @@ if ! gateway_is_ours "$(gateway_health)"; then
         exit 1
     fi
 fi
+
+fi  # CORTI_NO_MANAGE_GATEWAY
 
 if [ "$want_debug" = 1 ]; then
     log_path="$(gateway_health | sed -n 's/.*"debug":"\([^"]*\)".*/\1/p')"

@@ -227,7 +227,12 @@ function formatSearchResults(query, results) {
 const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const ADVISOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-prompt.txt");
 const ADVISOR_EXECUTOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-executor-prompt.txt");
-const ADVISOR_TIMEOUT_MS = Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 60_000;
+// The advisor is a headless Opus-tier `corti-claude -p` reasoning over a large serialized
+// transcript — a single consult can legitimately take minutes, not seconds. 60s was
+// observed timing out in real sessions. 8 minutes is the floor; raise CORTI_ADVISOR_TIMEOUT_MS
+// to extend further. The gateway's stream-idle watchdog is suppressed for the advisor
+// handoff (see gateway.mjs deadlineCheck / advisorHandoff) so this is the real ceiling.
+const ADVISOR_TIMEOUT_MS = Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 8 * 60_000;
 const ADVISOR_MODEL = process.env.CORTI_ADVISOR_MODEL || "opus";
 // Soft per-call output cap, surfaced to the advisor via the serialized transcript's budget
 // line. The official advisor tool sets a hard `max_tokens` on the tool def; corti-claude -p
@@ -251,12 +256,20 @@ const ADVISOR_TOOL_DEF = {
   input_schema: { type: "object", properties: {}, additionalProperties: false },
 };
 
-// Runs the advisor as a headless corti-claude session. Resolves to the advisor's text, or null
-// on timeout / spawn failure / unparseable output. The child env has CORTI_ADVISOR_TOOL stripped
-// so the child's own requests through the proxy don't re-inject the tool (recursion guard).
-// `text` is the serialized executor transcript (system + tools + messages + budget line), not a
-// short focus string — the advisor sees the full context the executor has, per the official
-// advisor tool's "server supplies context" behaviour.
+// Runs the advisor as a headless corti-claude session. Resolves to a discriminated result:
+//   { ok: true,  text }            — the advisor's guidance (plaintext)
+//   { ok: false, code }            — a failure, mapped to an official advisor_tool_result_error
+//                                    error_code (execution_time_exceeded | unavailable |
+//                                    prompt_too_long | overloaded | too_many_requests |
+//                                    model_not_found). See reference/advisor-tool-official.md
+//                                    §"Error results": the executor sees the error and
+//                                    continues without further advice; the request does not fail.
+// The child env has CORTI_ADVISOR_TOOL stripped so the child's own requests through the proxy
+// don't re-inject the tool (recursion guard). `text` is the serialized executor transcript
+// (system + tools + messages + budget line), not a short focus string — the advisor sees the
+// full context the executor has, per the official advisor tool's "server supplies context"
+// behaviour. A bare string return from an injected test stub is treated as { ok: true, text }
+// so tests that return plain advice strings stay unchanged.
 export function runAdvisor(text) {
   return new Promise((resolve) => {
     const args = [
@@ -269,17 +282,49 @@ export function runAdvisor(text) {
     ];
     const env = { ...process.env };
     delete env.CORTI_ADVISOR_TOOL;
+    // The child must not inherit the gateway's debug logging: CORTI_DEBUG makes corti-claude
+    // tee verbose output to stdout/stderr (and write its own gateway-*.log), which inflated
+    // the child's stdout past the 4MB maxBuffer and failed the consult with
+    // ERR_CHILD_PROCESS_STDIO_MAXBUFFER. The advisor runs silently; the gateway logs its
+    // result. Strip CORTI_DEBUG / CORTI_DEBUG_DIR alongside the recursion-guard strip.
+    delete env.CORTI_DEBUG;
+    delete env.CORTI_DEBUG_DIR;
+    // The advisor child runs through the SAME gateway the parent process is serving on, but
+    // it must never MANAGE that gateway: the wrapper's debug-mode-mismatch restart (parent
+    // started with CORTI_DEBUG=1, this child with it stripped) would otherwise make the child
+    // restart-kill its own parent gateway mid-consult ("Server error mid-response"). Tell the
+    // wrapper to use the running gateway as-is — no stop, no start, no restart.
+    env.CORTI_NO_MANAGE_GATEWAY = "1";
     // Recursion guard: ask the corti-claude wrapper to stamp the -noadvisor marker on the
     // child's auth token, which the gateway's wantsNoAdvisor() skips injection on. The
     // gateway process env has no ANTHROPIC_AUTH_TOKEN (the wrapper sets it after spawning
     // the gateway), so we can't stamp the suffix here — the wrapper must do it.
     env.CORTI_ADVISOR_NOINJECT = "1";
+    // maxBuffer bounds the child's combined stdout. The advisor is an Opus-tier model
+    // emitting --output-format json (an array of every event); even without inherited debug
+    // logging, that stream can exceed a few MB on a long consult. 32MB is generous headroom —
+    // the real advice is small (the successful consult returned 624 chars), but the event
+    // stream surrounding it is not. The `detail` capture surfaces a maxBuffer failure with its
+    // err.code if this is ever too small again.
     const child = execFile("corti-claude", args, {
       env,
       timeout: ADVISOR_TIMEOUT_MS,
-      maxBuffer: 4 * 1024 * 1024,
-    }, (err, stdout) => {
-      if (err) return resolve(null);
+      maxBuffer: 32 * 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      if (err) {
+        // Capture the raw failure so the gateway diagnostic can show WHY, not just that, it
+        // failed. execFile sets err.code === "ETIMEDOUT" when the timeout fires; other codes
+        // (ENOENT if corti-claude isn't on PATH, ERR_CHILD_PROCESS_STDIO_MAXBUFFER if stdout
+        // or stderr exceeded maxBuffer, a non-zero exit) are non-timeout failures. stderr
+        // carries the child's own error text when it exited non-zero — the most useful signal.
+        const detail = `code=${err.code || "?"} msg=${String(err.message || "").slice(0, 200)}` +
+          (stderr ? ` stderr=${String(stderr).trim().slice(0, 200)}` : "");
+        return resolve({
+          ok: false,
+          code: err.code === "ETIMEDOUT" ? "execution_time_exceeded" : "unavailable",
+          detail,
+        });
+      }
       try {
         // --output-format json emits a JSON array of event objects; the result text is on the
         // element with type === "result". Fall back to result.text, then raw stdout.
@@ -287,13 +332,19 @@ export function runAdvisor(text) {
         const arr = JSON.parse(out);
         const items = Array.isArray(arr) ? arr : [arr];
         const result = items.find((o) => o && o.type === "result");
-        const text =
+        const advice =
           (typeof result?.result === "string" && result.result) ||
           (typeof result?.text === "string" && result.text) ||
           out;
-        return resolve(text || null);
-      } catch {
-        return resolve(null);
+        // Empty advice despite a clean exit: surface the raw stdout so we can see what the
+        // child actually emitted (an error envelope, an empty result, etc.).
+        return resolve(
+          advice
+            ? { ok: true, text: advice }
+            : { ok: false, code: "unavailable", detail: `empty advice; stdout=${out.slice(0, 200)}` },
+        );
+      } catch (e) {
+        return resolve({ ok: false, code: "unavailable", detail: `unparseable: ${String(e.message || e).slice(0, 200)}; stdout=${String(stdout || "").trim().slice(0, 200)}` });
       }
     });
     child.stdin.on("error", () => {}); // child closed stdin before we wrote
@@ -425,10 +476,20 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
       if (!toolUse || !ADVISOR_TOOL_NAMES.has(toolUse.name)) continue;
       const { text, elidedCount } = serializeAdvisorInput(body, { maxTokens: advisorMaxTokens() });
       const out = await call(text);
-      b.content = out ? `Advisor feedback:\n\n${out}` : "Advisor feedback: (no response)";
-      b.is_error = false;
+      // A bare string is a test stub (backward compat) — treat as success.
+      const res = typeof out === "string" ? { ok: true, text: out } : out;
+      if (res?.ok) {
+        b.content = `Advisor feedback:\n\n${res.text}`;
+        b.is_error = false;
+      } else {
+        // The advisor failed (timeout / unavailable / etc). The executor sees the failure and
+        // continues without advice; the request itself does not fail (official §"Error results").
+        b.content = `Advisor feedback: (unavailable — ${res?.code || "unavailable"})`;
+        b.is_error = false;
+      }
       const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
-      diagnostics.push(`advisor intercepted: transcript=${text.length} chars${elidedStr}`);
+      const resStr = res?.ok ? `advisor=${res.text.length} chars` : `advisor_error=${res?.code || "unavailable"}`;
+      diagnostics.push(`advisor intercepted: transcript=${text.length} chars${elidedStr} ${resStr}`);
     }
   }
   return diagnostics;
@@ -1258,6 +1319,13 @@ export function createStreamTranslator(ctx, emit) {
     // (done() suppressed message_stop). The stream handlers use this to know not to finalize.
     get advisorHandoff() {
       return !!advisorToolUse && !terminated;
+    },
+    // Release the advisor handoff: the advisor child has finished and the gateway is about to
+    // make the continuation upstream call, which is a normal (non-advisor) request that can
+    // stall and must be guarded by the stream-idle watchdog. Call this right before the
+    // continuation so the watchdog re-arms (deadlineCheck keys on advisorHandoff).
+    releaseAdvisor() {
+      advisorToolUse = null;
     },
   };
 }

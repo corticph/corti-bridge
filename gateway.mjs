@@ -578,30 +578,56 @@ async function handleMessages(req, res, body) {
     writeEvent("content_block_stop", { type: "content_block_stop", index: srvIdx });
 
     // 2. Run the advisor on the serialized transcript. Non-blocking UI: "Advising" shows while this runs.
-    let advisorText = "Advisor feedback: (no response)";
+    // runAdvisor returns {ok:true,text} or {ok:false,code} (official advisor_tool_result_error
+    // error_code: execution_time_exceeded | unavailable | overloaded | too_many_requests |
+    // prompt_too_long | model_not_found). On failure the harness renders "Advisor declined to
+    // advise" and the executor continues without advice — never a fake success string.
+    let advisorResult;
     try {
       const out = await runAdvisor(advisorInput);
-      if (out) advisorText = `Advisor feedback:\n\n${out}`;
+      // Bare string = injected test stub; treat as success for backward compat.
+      advisorResult = typeof out === "string" ? { ok: true, text: out } : out;
+      if (!advisorResult) advisorResult = { ok: false, code: "unavailable" };
     } catch (err) {
       diagnostics.push(`advisor spawn failed: ${err?.message ?? err}`);
+      advisorResult = { ok: false, code: "unavailable" };
     }
 
     if (finalized || clientGone) return;
+    // The result block the client sees: success (advisor_result) or error (advisor_tool_result_error).
+    // The error variant lets the harness render the expected "Advisor declined to advise on this
+    // request" line instead of a success with an empty/no-response string.
+    const resultContent = advisorResult.ok
+      ? { type: "advisor_result", text: `Advisor feedback:\n\n${advisorResult.text}`, stop_reason: "end_turn" }
+      : { type: "advisor_tool_result_error", error_code: advisorResult.code };
     writeEvent("content_block_start", {
       type: "content_block_start", index: resIdx,
-      content_block: {
-        type: "advisor_tool_result", tool_use_id: id,
-        content: { type: "advisor_result", text: advisorText, stop_reason: "end_turn" },
-      },
+      content_block: { type: "advisor_tool_result", tool_use_id: id, content: resultContent },
     });
     writeEvent("content_block_stop", { type: "content_block_stop", index: resIdx });
+    diagnostics.push(
+      advisorResult.ok
+        ? `advisor ok: ${advisorResult.text.length} chars`
+        : `advisor failed: ${advisorResult.code}${advisorResult.detail ? ` — ${advisorResult.detail}` : ""}`,
+    );
 
     // 3. Continuation: a second, non-streaming upstream call. The history gains the model's
-    //    consult_advisor tool_use + a client tool_result holding the advice, so the model reads
-    //    the result and answers. We translate that response and stream it back as content blocks
-    //    under the SAME message (the harness sees one continuous turn).
+    //    consult_advisor tool_use + a client tool_result holding the advice (or the failure note),
+    //    so the model reads the result and answers. We translate that response and stream it back
+    //    as content blocks under the SAME message (the harness sees one continuous turn).
+    //    On failure the tool_result carries the error code as text so the executor knows advice
+    //    was unavailable and proceeds without it (the official "continues without further advice").
+    const continuationText = advisorResult.ok
+      ? `Advisor feedback:\n\n${advisorResult.text}`
+      : `Advisor feedback: (unavailable — ${advisorResult.code})`;
+    // The advisor child is done; the continuation is a normal upstream request that can stall
+    // and must be guarded. Release the handoff so the stream-idle watchdog re-arms, and reset
+    // the silence clock so the watchdog measures from the continuation's start, not from the
+    // advisor run (which may have taken minutes and would instantly trip STREAM_IDLE_MS).
+    translator?.releaseAdvisor?.();
+    lastActivity = Date.now();
     try {
-      await continueAfterAdvisor(id, advisorText);
+      await continueAfterAdvisor(id, continuationText);
     } catch (err) {
       diagnostics.push(`advisor continuation failed: ${err?.message ?? err}`);
       if (!finalized && !res.writableEnded) {
@@ -764,6 +790,14 @@ async function handleMessages(req, res, body) {
   inFlight.add(shutdownCloser);
 
   const deadlineCheck = () => {
+    // The advisor handoff owns the turn: runAdvisor is a headless `corti-claude -p` child that
+    // can legitimately run for minutes (see ADVISOR_TIMEOUT_MS). While it owns the turn the SSE
+    // stream is idle by design — pings are suppressed (writePing, below) so they don't displace
+    // the "Advising" indicator, and the stream-idle watchdog must stay its hand too. Without
+    // this guard a consult that exceeds STREAM_IDLE_MS (120s) would fire "upstream stalled"
+    // mid-advisor and kill the turn before the advisor finishes. The advisor's own timeout
+    // (ADVISOR_TIMEOUT_MS) is the real ceiling here.
+    if (translator?.advisorHandoff) return; // hook owns the turn; ADVISOR_TIMEOUT_MS is the ceiling
     const silence = Date.now() - lastActivity;
     const limit = headersSentToClient ? STREAM_IDLE_MS : HEADERS_TIMEOUT_MS;
     if (silence >= limit) {
