@@ -91,6 +91,7 @@ Read directly from the shell — no local secrets file.
 | `CORTI_PORT` | no | Proxy bind port, default `4192` |
 | `CORTI_HOST` | no | Proxy bind address, default `127.0.0.1` |
 | `CORTI_DEBUG` | no | Any value except `0`/`false`/`no`/`off` enables request/response logging |
+| `CORTI_ADVISOR` | no | `auto` (default) — the `consult_advisor` advisor tool is on in `openai` mode, off in `anthropic` mode; `on`/`off` force both modes. Spawns a headless Opus-tier consult on the request path. See [GUIDE.md](GUIDE.md) for the advisor mechanism, the experimental `anthropic`-mode caveat, and `CORTI_ADVISOR_*` tuning. |
 
 `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, and `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` are exported by the wrapper itself — plumbing this tool owns, not something you configure. The full variable reference (search backends, reasoning mode, debug caps, state directories) is in [GUIDE.md](GUIDE.md).
 

@@ -237,7 +237,7 @@ async function handlePassthrough(req, res, reqPath) {
   if (!isCountTokens && req.method === "POST" && reqPath === "/v1/messages") {
     try {
       const parsed = JSON.parse(body.toString());
-      await applyIntercepts(parsed, { skipAdvisor: wantsNoAdvisor(req) });
+      await applyIntercepts(parsed, { skipAdvisor: wantsNoAdvisor(req), mode: "anthropic" });
       body = Buffer.from(JSON.stringify(parsed));
     } catch {
       // JSON parse failed — forward original body; upstream will reject
@@ -532,7 +532,7 @@ async function handleMessages(req, res, body) {
 
   let translated;
   try {
-    const out = await translateRequest(anthropicBody, { skipAdvisor: wantsNoAdvisor(req) });
+    const out = await translateRequest(anthropicBody, { skipAdvisor: wantsNoAdvisor(req), mode: "openai" });
     translated = out.request;
     diagnostics.push(...out.dropped.map((d) => `dropped: ${d}`));
   } catch (err) {

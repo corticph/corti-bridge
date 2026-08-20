@@ -57,36 +57,49 @@ const wsTools = (await translateRequest({
 })).request.tools;
 check("websearch: converted to function tool", wsTools?.length === 1 && wsTools[0]?.function?.name === "WebSearch", true);
 
-// consult_advisor: tool def injected when CORTI_ADVISOR_TOOL is set, in both gateway modes.
-process.env.CORTI_ADVISOR_TOOL = "1";
+// --- advisor (consult_advisor) ------------------------------------------------
+// Gating (translate.mjs:advisorWanted): one knob, CORTI_ADVISOR=auto|on|off.
+//   auto (unset) → openai ON, anthropic OFF (the mode defaults)
+//   on           → ON in both modes
+//   off          → OFF in both modes
+//   unrecognized → warn once, fall to auto
+// skipAdvisor (the -noadvisor- recursion guard) is authoritative and wins over
+// everything. CORTI_ADVISOR_TOOL is REMOVED from the code — the one clean-slate
+// delete below clears any inherited value; it is never set again in this file.
+// mode is threaded via opts (applyIntercepts/translateRequest spread opts → ctx.mode).
+delete process.env.CORTI_ADVISOR;
+delete process.env.CORTI_ADVISOR_TOOL;
+
+// Block A — tool def injected. openai mode default-on (no env var needed).
 const advBody = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], system: "You are a coding agent." };
-await applyIntercepts(advBody);
-check("advisor: tool def injected", advBody.tools?.some((t) => t.name === "consult_advisor"), true);
+await applyIntercepts(advBody, { mode: "openai" });
+check("advisor (openai): tool def injected", advBody.tools?.some((t) => t.name === "consult_advisor"), true);
 // Empty input_schema: the executor signals timing only — the harness forwards the transcript.
 // additionalProperties:false matters (models want to fill in a "question" field).
 const advSchema = advBody.tools?.find((t) => t.name === "consult_advisor")?.input_schema;
-check("advisor: schema is empty (additionalProperties:false)",
+check("advisor (openai): schema is empty (additionalProperties:false)",
   JSON.stringify(advSchema) === JSON.stringify({ type: "object", properties: {}, additionalProperties: false }), true);
 // The executor-side timing block is prepended to body.system (idempotent, original preserved).
-check("advisor: executor timing prompt prepended", String(advBody.system).startsWith("You have access to an `advisor` tool"), true);
-check("advisor: original system preserved after timing block", String(advBody.system).includes("You are a coding agent."), true);
+check("advisor (openai): executor timing prompt prepended", String(advBody.system).startsWith("You have access to an `advisor` tool"), true);
+check("advisor (openai): original system preserved after timing block", String(advBody.system).includes("You are a coding agent."), true);
 // The openai translate path filters tools to input_schema + string name; ours has both, so it survives.
 const advTools = (await translateRequest({
   model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }],
-})).request.tools;
-check("advisor: survives openai filter", advTools?.some((t) => t.function?.name === "consult_advisor"), true);
+}, { mode: "openai" })).request.tools;
+check("advisor (openai): survives openai filter", advTools?.some((t) => t.function?.name === "consult_advisor"), true);
 
-// Guard: not injected when the env var is unset.
-delete process.env.CORTI_ADVISOR_TOOL;
+// Block B — opt-out: CORTI_ADVISOR=off turns the advisor off even in openai (default-on) mode.
+process.env.CORTI_ADVISOR = "off";
 const advBody2 = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [], system: "agent" };
-await applyIntercepts(advBody2);
-check("advisor: not injected when unset", advBody2.tools.length, 0);
+await applyIntercepts(advBody2, { mode: "openai" });
+check("advisor (openai+off): not injected when off", advBody2.tools.length, 0);
 // Timing prompt is NOT prepended when the advisor is off (system untouched).
-check("advisor: no timing prompt when unset", advBody2.system === "agent", true);
+check("advisor (openai+off): no timing prompt when off", advBody2.system === "agent", true);
+delete process.env.CORTI_ADVISOR;
 
-// Transcript serializer (lib/advisor-transcript.mjs) — the heart of the official alignment.
-// The advisor receives the full serialized context, not the executor focus string.
-process.env.CORTI_ADVISOR_TOOL = "1";
+// Block C — transcript serializer (lib/advisor-transcript.mjs): the heart of the official
+// alignment. The advisor receives the full serialized context, not the executor focus string.
+// Advisor-ON path: pass mode:"openai" explicitly.
 const stubInput = []; // captures the serialized payload the stub receives
 const stub = async (text) => { stubInput.length = 0; stubInput.push(text); return `stub advice`; };
 const advBody3 = {
@@ -103,10 +116,10 @@ const advBody3 = {
     { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_adv2", content: "Unknown tool: consult_advisor", is_error: true }] },
   ],
 };
-await applyIntercepts(advBody3, { runAdvisor: stub });
+await applyIntercepts(advBody3, { runAdvisor: stub, mode: "openai" });
 const advResult = advBody3.messages[4].content[0];
-check("advisor: result rewritten", advResult.content, "Advisor feedback:\n\nstub advice");
-check("advisor: is_error cleared", advResult.is_error, false);
+check("advisor (openai): result rewritten", advResult.content, "Advisor feedback:\n\nstub advice");
+check("advisor (openai): is_error cleared", advResult.is_error, false);
 
 // Failure path: when runAdvisor returns { ok:false, code }, the tool_result carries the
 // failure (not a fake success), so the executor sees advice was unavailable and continues.
@@ -120,31 +133,31 @@ const failBody = {
     { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_f1", content: "Unknown tool: consult_advisor", is_error: true }] },
   ],
 };
-await applyIntercepts(failBody, { runAdvisor: failStub });
+await applyIntercepts(failBody, { runAdvisor: failStub, mode: "openai" });
 const failResult = failBody.messages[2].content[0];
-check("advisor: failure carries error code, not fake advice",
+check("advisor (openai): failure carries error code, not fake advice",
   failResult.content, "Advisor feedback: (unavailable — execution_time_exceeded)");
-check("advisor: failure is_error cleared (request does not fail)", failResult.is_error, false);
+check("advisor (openai): failure is_error cleared (request does not fail)", failResult.is_error, false);
 // The stub received the serialized transcript, not a focus string.
 const ser = stubInput[0] || "";
-check("advisor: stub receives serialized transcript (has executor_system_prompt)", ser.includes("<executor_system_prompt>"), true);
-check("advisor: stub receives serialized transcript (has transcript block)", ser.includes("<transcript>"), true);
-check("advisor: stub receives serialized transcript (has budget line)", ser.includes("remaining output budget"), true);
+check("advisor (openai): stub receives serialized transcript (has executor_system_prompt)", ser.includes("<executor_system_prompt>"), true);
+check("advisor (openai): stub receives serialized transcript (has transcript block)", ser.includes("<transcript>"), true);
+check("advisor (openai): stub receives serialized transcript (has budget line)", ser.includes("remaining output budget"), true);
 // The advisor tool itself is omitted from the forwarded <available_tools> block (recursion
 // guard: the advisor must not see a tool it could call). It still appears in the transcript
 // as the executor tool_use call, so scope the check to the tools block.
 const toolsBlock = (ser.match(/<available_tools>([\s\S]*?)<\/available_tools>/) || [])[1] || "";
-check("advisor: consult_advisor omitted from forwarded tool list", toolsBlock.includes("consult_advisor"), false);
+check("advisor (openai): consult_advisor omitted from forwarded tool list", toolsBlock.includes("consult_advisor"), false);
 // run_bash IS forwarded (the advisor needs to see the executor available tools).
-check("advisor: run_bash forwarded in tool list", ser.includes("run_bash"), true);
+check("advisor (openai): run_bash forwarded in tool list", ser.includes("run_bash"), true);
 // Thinking blocks are dropped (official: only the conclusion reaches the executor).
-check("advisor: thinking omitted in transcript", ser.includes("[thinking omitted]"), true);
+check("advisor (openai): thinking omitted in transcript", ser.includes("[thinking omitted]"), true);
 // Order: system prompt before transcript (stable prefix first).
-check("advisor: system prompt precedes transcript", ser.indexOf("<executor_system_prompt>") < ser.indexOf("<transcript>"), true);
+check("advisor (openai): system prompt precedes transcript", ser.indexOf("<executor_system_prompt>") < ser.indexOf("<transcript>"), true);
 // The executor real tool result (the bug) reaches the advisor — the whole point.
-check("advisor: executor tool result forwarded", ser.includes("x.foo()"), true);
+check("advisor (openai): executor tool result forwarded", ser.includes("x.foo()"), true);
 
-// Truncation: large tool results are head/tail-truncated with an elision marker.
+// Block D — truncation: large tool results are head/tail-truncated with an elision marker.
 const big = "x".repeat(20000);
 const truncBody = {
   model: "corti-s1", max_tokens: 16,
@@ -156,10 +169,10 @@ const truncBody = {
   ],
 };
 const truncCap = [];
-await applyIntercepts(truncBody, { runAdvisor: async (t) => { truncCap.push(t); return "x"; } });
-check("advisor: large tool result truncated with elision marker", (truncCap[0] || "").includes("chars elided"), true);
+await applyIntercepts(truncBody, { runAdvisor: async (t) => { truncCap.push(t); return "x"; }, mode: "openai" });
+check("advisor (openai): large tool result truncated with elision marker", (truncCap[0] || "").includes("chars elided"), true);
 
-// Budget line uses CORTI_ADVISOR_MAX_TOKENS when set.
+// Block E — budget line uses CORTI_ADVISOR_MAX_TOKENS when set.
 process.env.CORTI_ADVISOR_MAX_TOKENS = "768";
 const budgetCap = [];
 await applyIntercepts({
@@ -168,22 +181,22 @@ await applyIntercepts({
     { role: "assistant", content: [{ type: "tool_use", id: "bm1", name: "consult_advisor", input: {} }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "bm1", content: "Unknown tool", is_error: true }] },
   ],
-}, { runAdvisor: async (t) => { budgetCap.push(t); return "x"; } });
-check("advisor: budget line honors CORTI_ADVISOR_MAX_TOKENS", (budgetCap[0] || "").includes("approximately 768 tokens"), true);
+}, { runAdvisor: async (t) => { budgetCap.push(t); return "x"; }, mode: "openai" });
+check("advisor (openai): budget line honors CORTI_ADVISOR_MAX_TOKENS", (budgetCap[0] || "").includes("approximately 768 tokens"), true);
 delete process.env.CORTI_ADVISOR_MAX_TOKENS;
 
-// Idempotency: don\x27t inject twice if the tool is already present, and don\x27t re-prepend the
-// timing block if it\x27s already there.
+// Block F — idempotency: don\x27t inject twice if the tool is already present, and don\x27t re-prepend
+// the timing block if it\x27s already there. Advisor-ON path (mode:"openai") so the guard actually runs.
 const advBody4 = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [{ name: "consult_advisor", input_schema: { type: "object" } }], system: "You have access to an `advisor` tool backed by a stronger reviewer model.\n\nOriginal system." };
-await applyIntercepts(advBody4);
-check("advisor: no duplicate injection", advBody4.tools.filter((t) => t.name === "consult_advisor").length, 1);
-check("advisor: no duplicate timing prompt", (String(advBody4.system).match(/You have access to an `advisor` tool/g) || []).length, 1);
+await applyIntercepts(advBody4, { mode: "openai" });
+check("advisor (openai): no duplicate injection", advBody4.tools.filter((t) => t.name === "consult_advisor").length, 1);
+check("advisor (openai): no duplicate timing prompt", (String(advBody4.system).match(/You have access to an `advisor` tool/g) || []).length, 1);
 
-// Fix #2c: the advisor continuation (continueAfterAdvisor) carries a consult_advisor
-// tool_use + an already-populated tool_result. Without skipAdvisor, interceptConsultAdvisor
-// matches that tool_result and re-spawns runAdvisor. skipAdvisor:true must suppress both
-// the injection and the spawn. Mirrors the continuation body shape (assistant tool_use with
-// EMPTY input + user tool_result) that the gateway builds in continueAfterAdvisor.
+// Block G — continuation (continueAfterAdvisor) carries a consult_advisor tool_use + an
+// already-populated tool_result. Without skipAdvisor, interceptConsultAdvisor matches that
+// tool_result and re-spawns runAdvisor. skipAdvisor:true must suppress both the injection and
+// the spawn. Mirrors the continuation body shape (assistant tool_use with EMPTY input + user
+// tool_result) that the gateway builds in continueAfterAdvisor. Advisor-ON via mode:"openai".
 let stubCalls = 0;
 const countingStub = async (text) => { stubCalls++; return `stub advice`; };
 const continuationBody = {
@@ -198,16 +211,85 @@ const continuationBody = {
 // fix is the skipAdvisor thread, not a broader no-op).
 const leakBody = JSON.parse(JSON.stringify(continuationBody));
 stubCalls = 0;
-await applyIntercepts(leakBody, { runAdvisor: countingStub });
+await applyIntercepts(leakBody, { runAdvisor: countingStub, mode: "openai" });
 check("advisor continuation: re-injects WITHOUT skipAdvisor (regression guard)", stubCalls, 1);
-// With skipAdvisor: no spawn, no injection, result preserved as-is.
+// With skipAdvisor: no spawn, no injection, result preserved as-is. skipAdvisor wins over the
+// openai default-on (no CORTI_ADVISOR needed — skipAdvisor is checked first in advisorWanted).
 const skipBody = JSON.parse(JSON.stringify(continuationBody));
 stubCalls = 0;
-await applyIntercepts(skipBody, { runAdvisor: countingStub, skipAdvisor: true });
+await applyIntercepts(skipBody, { runAdvisor: countingStub, skipAdvisor: true, mode: "openai" });
 check("advisor continuation: no re-spawn WITH skipAdvisor", stubCalls, 0);
 check("advisor continuation: result preserved with skipAdvisor", skipBody.messages[2].content[0].content, "Advisor feedback:\n\nalready synthesized");
 check("advisor continuation: no tool injected with skipAdvisor", Boolean(skipBody.tools?.some((t) => t?.name === "consult_advisor")), false);
-delete process.env.CORTI_ADVISOR_TOOL;
+
+// --- gating matrix ------------------------------------------------------------
+// Full truth table for advisorWanted(mode, skipAdvisor) × CORTI_ADVISOR. Each case clears
+// CORTI_ADVISOR before and after so cases are order-independent. The advisor body has no
+// consult_advisor tool_use, so injection is the only observable: tools.some(name match).
+// applyIntercepts mutates the body in place and returns diagnostics, so run it on a fresh
+// body and read tools off the body, not the return value.
+const gateBody = () => ({ model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }] });
+const injected = (b) => Boolean(b.tools?.some((t) => t?.name === "consult_advisor"));
+const runGate = async (opts) => { const b = gateBody(); await applyIntercepts(b, opts); return b; };
+
+// auto (unset) + openai → ON
+delete process.env.CORTI_ADVISOR;
+check("gate: auto + openai → ON", injected(await runGate({ mode: "openai" })), true);
+delete process.env.CORTI_ADVISOR;
+// auto (unset) + anthropic → OFF
+check("gate: auto + anthropic → OFF", injected(await runGate({ mode: "anthropic" })), false);
+delete process.env.CORTI_ADVISOR;
+
+// on + openai → ON
+process.env.CORTI_ADVISOR = "on";
+check("gate: on + openai → ON", injected(await runGate({ mode: "openai" })), true);
+delete process.env.CORTI_ADVISOR;
+// on + anthropic → ON
+process.env.CORTI_ADVISOR = "on";
+check("gate: on + anthropic → ON", injected(await runGate({ mode: "anthropic" })), true);
+delete process.env.CORTI_ADVISOR;
+
+// off + openai → OFF
+process.env.CORTI_ADVISOR = "off";
+check("gate: off + openai → OFF", injected(await runGate({ mode: "openai" })), false);
+delete process.env.CORTI_ADVISOR;
+// off + anthropic → OFF
+process.env.CORTI_ADVISOR = "off";
+check("gate: off + anthropic → OFF", injected(await runGate({ mode: "anthropic" })), false);
+delete process.env.CORTI_ADVISOR;
+
+// skipAdvisor:true → OFF in both modes (wins over on, and over the openai default-on).
+process.env.CORTI_ADVISOR = "on";
+check("gate: skipAdvisor wins over on (openai)", injected(await runGate({ skipAdvisor: true, mode: "openai" })), false);
+delete process.env.CORTI_ADVISOR;
+check("gate: skipAdvisor wins over default-on (openai)", injected(await runGate({ skipAdvisor: true, mode: "openai" })), false);
+process.env.CORTI_ADVISOR = "on";
+check("gate: skipAdvisor wins over on (anthropic)", injected(await runGate({ skipAdvisor: true, mode: "anthropic" })), false);
+delete process.env.CORTI_ADVISOR;
+
+// Unrecognized value (not auto/on/off) → warns once, falls to auto. Two openai calls with the
+// bad value: both inject (auto → openai ON), but the warning fires exactly once. Capture
+// console.error via a spy so we can assert both the message and the once-only guard.
+process.env.CORTI_ADVISOR = "maybe";
+const errSpy = [];
+const origErr = console.error;
+console.error = (...a) => { errSpy.push(a.join(" ")); };
+try {
+  await runGate({ mode: "openai" });
+  await runGate({ mode: "openai" });
+} finally {
+  console.error = origErr;
+}
+check("gate: unrecognized + openai → ON (falls to auto)", injected(await runGate({ mode: "openai" })), true);
+delete process.env.CORTI_ADVISOR;
+check("gate: unrecognized value warns once", errSpy.filter((m) => m.includes("unrecognized CORTI_ADVISOR")).length, 1);
+// (warnedAdvisorVar is process-scoped; it stays true for the rest of this run — that\x27s fine,
+// it\x27s the once-per-process guard being exercised. No further assertions depend on it firing.)
+
+// undefined mode + no vars → OFF (legacy bare-call behavior: mode === undefined ≠ "openai").
+delete process.env.CORTI_ADVISOR;
+check("gate: undefined mode + no vars → OFF", injected(await runGate()), false);
+delete process.env.CORTI_ADVISOR;
 
 // Claude Code parses the digit pair out of our message to size compaction; when the match
 // fails it tells the user the conversation cannot be compacted at all.

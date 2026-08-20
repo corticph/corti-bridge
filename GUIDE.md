@@ -206,9 +206,10 @@ Read directly from the shell — no local secrets file.
 | `CORTI_DEBUG` | no | Any value except `0`/`false`/`no`/`off` turns on request/response logging |
 | `CORTI_DEBUG_DIR` | no | Where debug logs go; defaults per platform (see [Debug logging](#debug-logging)) |
 | `CORTI_DEBUG_MAX_BODY` | no | Per-body byte cap, default `2097152` (2 MB); `0` means unlimited |
-| `CORTI_ADVISOR_TOOL` | no | Opt in the `consult_advisor` client-side tool intercept — injects an advisor tool the model can call, and synthesizes its `tool_result` by spawning a headless `corti-claude -p --model <CORTI_ADVISOR_MODEL>`. Off by default; the advisor child is spawned without this var so it can't recurse. |
+| `CORTI_ADVISOR` | no | `auto` (default) — the `consult_advisor` advisor tool is on in `openai` mode, off in `anthropic` mode. `on` — on in both modes. `off` — off in both modes. Unrecognized values warn once and use `auto`. The advisor spawns a headless `corti-claude -p` (Opus-tier by default, see `CORTI_ADVISOR_MODEL`) on the request path — a consult can take minutes; the child carries a recursion guard so it can't re-inject or recurse. |
 | `CORTI_ADVISOR_MODEL` | no | Model alias for the advisor backing (default `opus`); resolved by the wrapper, so use a tier alias (`opus`, `sonnet`, `haiku`, `fable`), not a `claude-` name |
-| `CORTI_ADVISOR_TIMEOUT_MS` | no | Bound on the advisor spawn, default `60000`; on timeout the `tool_result` becomes `(no response)` rather than hanging the turn |
+| `CORTI_ADVISOR_TIMEOUT_MS` | no | Bound on the advisor spawn, default `480000` (8 min); on timeout the `tool_result` becomes `Advisor feedback: (unavailable — execution_time_exceeded)` rather than hanging the turn |
+| `CORTI_ADVISOR_MAX_TOKENS` | no | Soft per-call output cap, surfaced to the advisor via the serialized transcript's budget line; default `2048` (the official recommended starting point). No hard `max_tokens` cap exists through `corti-claude -p`; this is a soft steer plus the hard `CORTI_ADVISOR_TIMEOUT_MS` / maxBuffer ceilings. Lower it to bias toward brevity. |
 
 `CC_PROXY_BIN_DIR` (defaults to `~/.local/bin`) controls where the wrapper is installed. `CC_PROXY_CONFIG_DIR` (defaults to `~/.corti-claude`) is the proxy's own state directory — model mapping, profile choice, gateway log. `CC_PROXY_DIR` tells the wrapper where `gateway.mjs` lives; `setup.sh` bakes your clone's real path into the installed wrapper, so you only need this if you move the clone afterwards.
 
@@ -227,6 +228,16 @@ Compared to first-party Anthropic or `anthropic` mode, this setup cannot support
 - **Reasoning signatures are synthetic** — thinking blocks emitted by the proxy carry a constant signature (`corti-proxy`, base64). Claude Code accepts and re-sends them; the proxy strips them from history on re-entry. If you ever take a session from `~/.corti-claude` and resume it against real Anthropic, those blocks will fail server-side signature validation — filter them out first.
 - **Overflow is decided by tokens, not bytes** — upstream accepts multi-megabyte bodies, so the model's context window is what binds. Over-window turns become `prompt is too long` with a real token count, which is what drives compaction; only bodies over the gateway's own 8 MB byte cap get a local 413 instead.
 
+### The advisor (openai mode)
+
+The `consult_advisor` advisor tool is **on by default in `openai` mode** (`CORTI_ADVISOR=auto`); set `CORTI_ADVISOR=off` to disable it. When the model calls the tool, the gateway **holds the turn**: it emits a synthetic `server_tool_use` + `advisor_tool_result` inline — the shape the harness renders as "Advising…" — runs the advisor (a headless `corti-claude -p`), then makes a second upstream call so the model answers in the same turn. That "Advising" via hold-and-continue is the openai experience.
+
+Each consult spawns a headless session **on the request path**, so a turn that consults blocks for up to `CORTI_ADVISOR_TIMEOUT_MS` (8 min default) while the advisor reasons over the serialized transcript. The executor timing prompt (`lib/advisor-executor-prompt.txt`, ~2 KB / ~500-700 tokens) is prepended to every `openai` system prompt while the advisor is on, consulted or not — that is the per-request cost of default-on.
+
+The advisor receives the executor's **full serialized transcript** (system + tools + messages + a budget line carrying `CORTI_ADVISOR_MAX_TOKENS`), not a focus string; the tool takes empty input (`additionalProperties: false`) — the executor signals timing only, and the harness forwards context automatically. A three-part guard keeps the advisor child from re-injecting or recursing: (1) `CORTI_ADVISOR_NOINJECT=1` stamps a `noadvisor-` marker on the child's token, which the gateway's `wantsNoAdvisor` turns into `skipAdvisor: true`; (2) `CORTI_NO_MANAGE_GATEWAY=1` keeps a debug-mode mismatch from making the child restart-kill its parent gateway mid-consult; (3) `maxBuffer: 32 MB` bounds the child's combined stdout.
+
+> **Upgrading from `CORTI_ADVISOR_TOOL`:** the advisor is now controlled by `CORTI_ADVISOR`; the former `CORTI_ADVISOR_TOOL` is removed — set `CORTI_ADVISOR=on` to get the old behavior, or leave it unset for the mode default (on in `openai`).
+
 ## `anthropic` mode
 
 ```bash
@@ -242,6 +253,12 @@ Mechanically, the wrapper exports `ANTHROPIC_BASE_URL=http://127.0.0.1:4192/anth
 Use `anthropic` mode to escape-hatch a translation bug, or as a comparison harness: run `corti-claude` and `corti-claude --anthropic` **at the same time**. Both write to the same debug log, so the two modes interleave by timestamp in one file — compare by request id rather than diffing two logs from two gateway lifetimes.
 
 The cost is specific and worth knowing before you reach for it: Corti's `/anthropic` endpoint drops input-token accounting on streaming responses. `message_start` reports `usage: {"input_tokens": 0, "output_tokens": 0}` and `message_delta` carries only `output_tokens` — no input count, no cache fields. Claude Code always streams, so in this mode every transcript records zero input tokens and context/cost readouts stop working. Non-streaming requests to the same endpoint return full usage, so no request parameter fixes it. Tool use is unaffected.
+
+### The advisor in `anthropic` mode (experimental, off by default)
+
+The advisor is **off by default in `anthropic` mode** (`CORTI_ADVISOR=auto`). The inline hold-and-continue above is a translator-stream hook: pass-through has no translator stream, so it can't fire here. With `CORTI_ADVISOR=on` the tool is still injected and its `tool_result` is synthesized by the same spawn, but the delivery differs — it arrives as a **next-turn `tool_result` rewrite, not inline**. The flow: the model calls `consult_advisor`, the client (Claude Code does this) synthesizes an `is_error` `tool_result` for the unknown tool and round-trips it, and the intercept rewrites that result with the advisor's output on the next request. There is no "Advising" indicator; the executor reads the advice on its next turn.
+
+This depends on the client synthesizing an `is_error` tool_result for the unknown tool — if it doesn't, the model sees an unhandled-tool error with no recovery. Because of that client dependency and the loss of the inline experience, prefer `openai` mode for the advisor.
 
 ## PATH and uninstalling
 

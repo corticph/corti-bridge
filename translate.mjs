@@ -264,8 +264,10 @@ const ADVISOR_TOOL_DEF = {
 //                                    model_not_found). See reference/advisor-tool-official.md
 //                                    §"Error results": the executor sees the error and
 //                                    continues without further advice; the request does not fail.
-// The child env has CORTI_ADVISOR_TOOL stripped so the child's own requests through the proxy
-// don't re-inject the tool (recursion guard). `text` is the serialized executor transcript
+// The child env carries a recursion guard so the child's own requests through the proxy
+// don't re-inject the tool: CORTI_ADVISOR_NOINJECT stamps the -noadvisor- token (primary),
+// and CORTI_ADVISOR=off is a belt-and-suspenders env backstop (the child's advisorWanted
+// sees `off` regardless of its mode). `text` is the serialized executor transcript
 // (system + tools + messages + budget line), not a short focus string — the advisor sees the
 // full context the executor has, per the official advisor tool's "server supplies context"
 // behaviour. A bare string return from an injected test stub is treated as { ok: true, text }
@@ -281,7 +283,6 @@ export function runAdvisor(text) {
       "--input-format", "text",
     ];
     const env = { ...process.env };
-    delete env.CORTI_ADVISOR_TOOL;
     // The child must not inherit the gateway's debug logging: CORTI_DEBUG makes corti-claude
     // tee verbose output to stdout/stderr (and write its own gateway-*.log), which inflated
     // the child's stdout past the 4MB maxBuffer and failed the consult with
@@ -300,6 +301,10 @@ export function runAdvisor(text) {
     // gateway process env has no ANTHROPIC_AUTH_TOKEN (the wrapper sets it after spawning
     // the gateway), so we can't stamp the suffix here — the wrapper must do it.
     env.CORTI_ADVISOR_NOINJECT = "1";
+    // Belt-and-suspenders: even if the -noadvisor- token guard somehow failed, the child's
+    // openai-mode advisorWanted("openai", false) sees CORTI_ADVISOR=off → no injection.
+    // Primary guard remains CORTI_ADVISOR_NOINJECT (the token stamp → skipAdvisor:true).
+    env.CORTI_ADVISOR = "off";
     // maxBuffer bounds the child's combined stdout. The advisor is an Opus-tier model
     // emitting --output-format json (an array of every event); even without inherited debug
     // logging, that stream can exceed a few MB on a long consult. 32MB is generous headroom —
@@ -442,11 +447,38 @@ function isTruthyEnv(v) {
   return v != null && !["", "0", "false", "no", "off"].includes(String(v).toLowerCase());
 }
 
+let warnedAdvisorVar = false;
+
+// One knob, mode-aware default. skipAdvisor (the -noadvisor- recursion guard) is
+// authoritative and checked FIRST so no env var can override it.
+//   CORTI_ADVISOR=auto (unset) → openai ON, anthropic OFF (the mode defaults)
+//   CORTI_ADVISOR=on           → ON in both modes
+//   CORTI_ADVISOR=off          → OFF in both modes
+//   CORTI_ADVISOR_TOOL is REMOVED — CORTI_ADVISOR is the only knob.
+// An unrecognized value (not auto/on/off/unset) warns once and falls to auto.
+function advisorWanted(mode, skipAdvisor) {
+  if (skipAdvisor) return false;
+  const v = process.env.CORTI_ADVISOR;
+  if (v === "off") return false;
+  if (v === "on") return true;
+  if (v != null && v !== "" && v !== "auto") {
+    // Unrecognized value — warn once per process, then fall to auto (mode default).
+    if (!warnedAdvisorVar) {
+      warnedAdvisorVar = true;
+      console.error(`corti-proxy: unrecognized CORTI_ADVISOR=${JSON.stringify(v)}, using auto (expected auto|on|off)`);
+    }
+  }
+  // "auto" (unset, or unrecognized) → mode default: openai on, anthropic (and undefined) off.
+  return mode === "openai";
+}
+
 // Injects the consult_advisor tool def and rewrites its tool_result blocks with the advisor's
-// output. Gated by CORTI_ADVISOR_TOOL; the runAdvisor dependency is injectable via ctx so tests
-// stay hermetic (no child_process spawn).
-async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor } = {}) {
-  if (skipAdvisor || !isTruthyEnv(process.env.CORTI_ADVISOR_TOOL)) return [];
+// output. Gated by CORTI_ADVISOR (auto/on/off): auto is the mode default (openai on, anthropic
+// off), on/off force both modes. skipAdvisor (the -noadvisor- recursion guard) is authoritative
+// and checked first inside advisorWanted so no env var can override it. The runAdvisor
+// dependency is injectable via ctx so tests stay hermetic (no child_process spawn).
+async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor, mode } = {}) {
+  if (!advisorWanted(mode, skipAdvisor)) return [];
   const diagnostics = [];
 
   // (a) inject the tool def so the model sees it (idempotent — don't push if present)
