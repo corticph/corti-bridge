@@ -530,9 +530,17 @@ async function handleMessages(req, res, body) {
 
   /* ---- request translation ---- */
 
+  // The advisor child (wantsNoAdvisor) reasons at high effort by default — the official advisor
+  // default — rather than the medium that adaptive thinking maps to. CORTI_ADVISOR_EFFORT
+  // overrides (e.g. "medium" to keep consults cheap). Read at call time so a change takes effect
+  // on the next consult without a gateway restart.
+  const noAdvisor = wantsNoAdvisor(req);
+  const advisorEffort = noAdvisor
+    ? (process.env.CORTI_ADVISOR_EFFORT || "high")
+    : undefined;
   let translated;
   try {
-    const out = await translateRequest(anthropicBody, { skipAdvisor: wantsNoAdvisor(req), mode: "openai" });
+    const out = await translateRequest(anthropicBody, { skipAdvisor: noAdvisor, mode: "openai", advisorEffort });
     translated = out.request;
     diagnostics.push(...out.dropped.map((d) => `dropped: ${d}`));
   } catch (err) {
@@ -596,9 +604,10 @@ async function handleMessages(req, res, body) {
     if (finalized || clientGone) return;
     // The result block the client sees: success (advisor_result) or error (advisor_tool_result_error).
     // The error variant lets the harness render the expected "Advisor declined to advise on this
-    // request" line instead of a success with an empty/no-response string.
+    // request" line instead of a success with an empty/no-response string. The success text is the
+    // RAW advisor output (the official advisor_result carries the advisor's text verbatim, no prefix).
     const resultContent = advisorResult.ok
-      ? { type: "advisor_result", text: `Advisor feedback:\n\n${advisorResult.text}`, stop_reason: "end_turn" }
+      ? { type: "advisor_result", text: advisorResult.text, stop_reason: "end_turn" }
       : { type: "advisor_tool_result_error", error_code: advisorResult.code };
     writeEvent("content_block_start", {
       type: "content_block_start", index: resIdx,
@@ -615,11 +624,13 @@ async function handleMessages(req, res, body) {
     //    consult_advisor tool_use + a client tool_result holding the advice (or the failure note),
     //    so the model reads the result and answers. We translate that response and stream it back
     //    as content blocks under the SAME message (the harness sees one continuous turn).
-    //    On failure the tool_result carries the error code as text so the executor knows advice
-    //    was unavailable and proceeds without it (the official "continues without further advice").
+    //    On failure the tool_result carries an unavailable note so the executor knows advice was
+    //    unavailable and proceeds without it (the official "continues without further advice").
+    //    Model-facing text wraps the advice in <advisor_guidance> — a distinct channel the
+    //    executor treats as first-class advice, not ordinary tool output (reconstruction §3.3).
     const continuationText = advisorResult.ok
-      ? `Advisor feedback:\n\n${advisorResult.text}`
-      : `Advisor feedback: (unavailable — ${advisorResult.code})`;
+      ? `<advisor_guidance>\n${advisorResult.text}\n</advisor_guidance>`
+      : `<advisor_guidance>\nadvisor unavailable (${advisorResult.code})\n</advisor_guidance>`;
     // The advisor child is done; the continuation is a normal upstream request that can stall
     // and must be guarded. Release the handoff so the stream-idle watchdog re-arms, and reset
     // the silence clock so the watchdog measures from the continuation's start, not from the

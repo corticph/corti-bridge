@@ -9,6 +9,7 @@ REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
 import { translateRequest, translateError, promptTooLong, applyIntercepts } from "'"$REPO"'/translate.mjs";
+import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 
 let failed = 0;
 const check = (name, got, want) => {
@@ -118,7 +119,7 @@ const advBody3 = {
 };
 await applyIntercepts(advBody3, { runAdvisor: stub, mode: "openai" });
 const advResult = advBody3.messages[4].content[0];
-check("advisor (openai): result rewritten", advResult.content, "Advisor feedback:\n\nstub advice");
+check("advisor (openai): result rewritten as <advisor_guidance>", advResult.content, "<advisor_guidance>\nstub advice\n</advisor_guidance>");
 check("advisor (openai): is_error cleared", advResult.is_error, false);
 
 // Failure path: when runAdvisor returns { ok:false, code }, the tool_result carries the
@@ -135,8 +136,8 @@ const failBody = {
 };
 await applyIntercepts(failBody, { runAdvisor: failStub, mode: "openai" });
 const failResult = failBody.messages[2].content[0];
-check("advisor (openai): failure carries error code, not fake advice",
-  failResult.content, "Advisor feedback: (unavailable — execution_time_exceeded)");
+check("advisor (openai): failure carries unavailable guidance, not fake advice",
+  failResult.content, "<advisor_guidance>\nadvisor unavailable (execution_time_exceeded)\n</advisor_guidance>");
 check("advisor (openai): failure is_error cleared (request does not fail)", failResult.is_error, false);
 // The stub received the serialized transcript, not a focus string.
 const ser = stubInput[0] || "";
@@ -204,7 +205,7 @@ const continuationBody = {
   messages: [
     { role: "user", content: "should I ship this?" },
     { role: "assistant", content: [{ type: "tool_use", id: "tu_adv1", name: "consult_advisor", input: {} }] },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_adv1", content: "Advisor feedback:\n\nalready synthesized", is_error: false }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_adv1", content: "<advisor_guidance>\nalready synthesized\n</advisor_guidance>", is_error: false }] },
   ],
 };
 // Without skipAdvisor: the intercept re-spawns the advisor (regression guard — proves the
@@ -219,8 +220,101 @@ const skipBody = JSON.parse(JSON.stringify(continuationBody));
 stubCalls = 0;
 await applyIntercepts(skipBody, { runAdvisor: countingStub, skipAdvisor: true, mode: "openai" });
 check("advisor continuation: no re-spawn WITH skipAdvisor", stubCalls, 0);
-check("advisor continuation: result preserved with skipAdvisor", skipBody.messages[2].content[0].content, "Advisor feedback:\n\nalready synthesized");
+check("advisor continuation: result preserved with skipAdvisor", skipBody.messages[2].content[0].content, "<advisor_guidance>\nalready synthesized\n</advisor_guidance>");
 check("advisor continuation: no tool injected with skipAdvisor", Boolean(skipBody.tools?.some((t) => t?.name === "consult_advisor")), false);
+
+// Block H — C6: prior-turn advisor advice round-trips into history instead of being dropped.
+// advisor_tool_result is NOT in SERVER_BLOCK_TYPES (only server_tool_use is); before the fix it
+// fell through to the drop branch. Now it renders as <advisor_guidance> text the model keeps.
+// Build a body whose assistant history carries an advisor_tool_result and translate it; the
+// advice must land in the assistant message text, not in the dropped diagnostics.
+const histBody = {
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [
+    { role: "user", content: "Fix the bug" },
+    { role: "assistant", content: [
+      { type: "text", text: "Let me consult the advisor." },
+      { type: "server_tool_use", id: "srv1", name: "advisor", input: {} },
+      { type: "advisor_tool_result", tool_use_id: "srv1", content: { type: "advisor_result", text: "Use a channel-based pattern; drain in-flight work on shutdown.", stop_reason: "end_turn" } },
+      { type: "text", text: "Here is the implementation." },
+    ]},
+    { role: "user", content: "Now add a max-in-flight limit." },
+  ],
+};
+const histOut = await translateRequest(histBody, { mode: "openai" });
+const histAssist = histOut.request.messages.find((m) => m.role === "assistant" && typeof m.content === "string" && m.content.includes("implementation"));
+check("advisor C6: prior advice kept in assistant history (not dropped)",
+  histAssist?.content?.includes("Use a channel-based pattern"), true);
+check("advisor C6: prior advice wrapped in <advisor_guidance> tag",
+  histAssist?.content?.includes("<advisor_guidance>"), true);
+check("advisor C6: advisor_tool_result not in dropped diagnostics",
+  histOut.dropped.some((d) => /advisor_tool_result \(assistant history\)/.test(d)), false);
+// The paired server_tool_use is still dropped (the executor doesn\x27t need the call shape).
+check("advisor C6: server_tool_use still dropped from history",
+  histOut.dropped.some((d) => /server_tool_use \(assistant history\)/.test(d)), true);
+
+// Block H2 — C6: a prior advisor_tool_result_error also round-trips (as an unavailable note).
+const histErrBody = {
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [
+    { role: "user", content: "Fix the bug" },
+    { role: "assistant", content: [
+      { type: "advisor_tool_result", tool_use_id: "srv2", content: { type: "advisor_tool_result_error", error_code: "overloaded" } },
+    ]},
+    { role: "user", content: "Retry?" },
+  ],
+};
+const histErrOut = await translateRequest(histErrBody, { mode: "openai" });
+const histErrAssist = histErrOut.request.messages.find((m) => m.role === "assistant");
+check("advisor C6: error advice kept as unavailable note", histErrAssist?.content?.includes("advisor unavailable (overloaded)"), true);
+
+// Block H3 — C6 advisor-side: the advisor\x27s OWN serializer (lib/advisor-transcript.mjs) must
+// surface prior advisor_tool_result advice in the transcript it sends to the advisor child.
+// Before the fix the block hit the default case and emitted only "[advisor_tool_result]",
+// so the advisor couldn\x27t see what it said last turn — breaking its reconcile guidance.
+const advSerBody = {
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [
+    { role: "user", content: "Fix the bug" },
+    { role: "assistant", content: [
+      { type: "server_tool_use", id: "srv3", name: "advisor", input: {} },
+      { type: "advisor_tool_result", tool_use_id: "srv3", content: { type: "advisor_result", text: "Drain in-flight work on shutdown before closing the channel.", stop_reason: "end_turn" } },
+    ]},
+    { role: "assistant", content: [{ type: "tool_use", id: "tu_adv3", name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_adv3", content: "Unknown tool", is_error: true }] },
+  ],
+};
+const advSerText = serializeAdvisorInput(advSerBody).text;
+check("advisor C6 advisor-side: prior advice surfaced in transcript (not just a label)",
+  advSerText.includes("Drain in-flight work on shutdown"), true);
+check("advisor C6 advisor-side: prior advice marked as advisor guidance line",
+  advSerText.includes("advisor guidance:"), true);
+// A prior error also surfaces as a note (the advisor can see the prior consult failed).
+const advSerErrBody = {
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [
+    { role: "assistant", content: [{ type: "advisor_tool_result", tool_use_id: "srv4", content: { type: "advisor_tool_result_error", error_code: "overloaded" } }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "tu_adv4", name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_adv4", content: "Unknown tool", is_error: true }] },
+  ],
+};
+const advSerErrText = serializeAdvisorInput(advSerErrBody).text;
+check("advisor C6 advisor-side: prior error surfaces as unavailable note",
+  advSerErrText.includes("advisor unavailable (overloaded)"), true);
+
+// Block I — C2: advisorEffort overrides reasoning_effort (the advisor child reasons at high,
+// not the medium adaptive maps to). The gateway passes advisorEffort for the advisor child.
+const noThink = await translateRequest({ model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }, { advisorEffort: "high" });
+check("advisor C2: advisorEffort=high overrides even with no thinking block", noThink.request.reasoning_effort, "high");
+const adaptiveMed = await translateRequest({ model: "corti-s1", max_tokens: 16, thinking: { type: "adaptive" }, messages: [{ role: "user", content: "hi" }] }, { advisorEffort: "high" });
+check("advisor C2: advisorEffort=high overrides adaptive→medium", adaptiveMed.request.reasoning_effort, "high");
+const budgetLow = await translateRequest({ model: "corti-s1", max_tokens: 16, thinking: { type: "enabled", budget_tokens: 1024 }, messages: [{ role: "user", content: "hi" }] }, { advisorEffort: "high" });
+check("advisor C2: advisorEffort=high overrides low budget mapping", budgetLow.request.reasoning_effort, "high");
+// Without advisorEffort, the thinking mapping is untouched (regression guard).
+const noOverride = await translateRequest({ model: "corti-s1", max_tokens: 16, thinking: { type: "adaptive" }, messages: [{ role: "user", content: "hi" }] });
+check("advisor C2: no advisorEffort leaves adaptive→medium untouched", noOverride.request.reasoning_effort, "medium");
+// CORTI_ADVISOR_EFFORT overrides the default — read at call time by the gateway (not tested here
+// at the translate level, which only honors the explicit opt).
 
 // --- gating matrix ------------------------------------------------------------
 // Full truth table for advisorWanted(mode, skipAdvisor) × CORTI_ADVISOR. Each case clears

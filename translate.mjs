@@ -396,6 +396,29 @@ function prependExecutorPrompt(body) {
   }
 }
 
+// Extract the advice text from an advisor_tool_result block for history round-tripping (C6).
+// The block's content is a discriminated union: {type:"advisor_result", text} (success) or
+// {type:"advisor_tool_result_error", error_code} (failure). We previously wrapped the advice in
+// a leading "Advisor feedback:\n\n" prefix when emitting it (C7 removed that); here we strip any
+// legacy prefix so the tag holds the raw advice. Errors render as a short unavailable note.
+function advisorResultText(block) {
+  const c = block?.content;
+  if (!c || typeof c !== "object") return "";
+  if (c.type === "advisor_result" && typeof c.text === "string") {
+    return c.text.replace(/^Advisor feedback:\n\n/, "");
+  }
+  if (c.type === "advisor_tool_result_error") return `advisor unavailable (${c.error_code || "unavailable"})`;
+  return "";
+}
+
+// Wrap advisor advice for the model-facing channel: a distinct <advisor_guidance> tag so the
+// executor treats it as a first-class advice channel rather than ordinary tool output
+// (reconstruction §3.3). Used in the continuation tool_result, the anthropic next-turn rewrite,
+// and the C6 history round-trip — every place the advice text meets the model.
+function advisorGuidanceText(advice) {
+  return `<advisor_guidance>\n${advice}\n</advisor_guidance>`;
+}
+
 /* ------------------------------------------------------------------ */
 /* intercept registry — shared by both gateway modes                   */
 /* ------------------------------------------------------------------ */
@@ -511,12 +534,12 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
       // A bare string is a test stub (backward compat) — treat as success.
       const res = typeof out === "string" ? { ok: true, text: out } : out;
       if (res?.ok) {
-        b.content = `Advisor feedback:\n\n${res.text}`;
+        b.content = advisorGuidanceText(res.text);
         b.is_error = false;
       } else {
         // The advisor failed (timeout / unavailable / etc). The executor sees the failure and
         // continues without advice; the request itself does not fail (official §"Error results").
-        b.content = `Advisor feedback: (unavailable — ${res?.code || "unavailable"})`;
+        b.content = advisorGuidanceText(`advisor unavailable (${res?.code || "unavailable"})`);
         b.is_error = false;
       }
       const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
@@ -671,6 +694,17 @@ export async function translateRequest(body, opts) {
             type: "function",
             function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) },
           });
+        } else if (b.type === "advisor_tool_result") {
+          // C6: prior-turn advisor advice must round-trip into the model's view, not be dropped.
+          // The official doc: "Pass the full assistant content, including advisor_tool_result
+          // blocks, back to the API on subsequent turns. Round-trip the result blocks verbatim."
+          // We can't replay the server-tool wire shape to an OpenAI upstream, so we surface the
+          // advice as text wrapped in a distinct tag — a first-class channel the executor treats
+          // as advice rather than ordinary (skeptically-treated) tool output (reconstruction §3.3).
+          // server_tool_use (the paired call) is in SERVER_BLOCK_TYPES and dropped above — the
+          // executor doesn't need to see the call shape, only the advice it carried.
+          const advice = advisorResultText(b);
+          if (advice) texts.push(advisorGuidanceText(advice));
         } else if (b.type === "thinking" || b.type === "redacted_thinking" || SERVER_BLOCK_TYPES.has(b.type)) {
           dropped.push(`${b.type} (assistant history)`);
         } else if (b.type !== "text") {
@@ -864,6 +898,13 @@ export async function translateRequest(body, opts) {
       req.reasoning_effort = "medium";
     }
   }
+
+  // C2: the advisor child should reason at high (the official default), not the medium that
+  // adaptive thinking maps to above. The gateway sets advisorEffort for the advisor child
+  // (detected via the -noadvisor- token); it overrides whatever the thinking block produced,
+  // including the adaptive→medium mapping. A model that rejects this effort level will 400 at
+  // upstream — that surfaces a real capability gap rather than silently reasoning shallow.
+  if (opts?.advisorEffort) req.reasoning_effort = opts.advisorEffort;
 
   return { request: req, dropped };
 }
