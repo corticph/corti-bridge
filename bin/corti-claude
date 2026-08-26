@@ -279,5 +279,8 @@ unset _noadvisor_marker
 export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 # The [1M] badge newer Claude Code versions show for proxied models is misleading here.
 export CLAUDE_CODE_DISABLE_1M_CONTEXT=1
+# Unreachable through the proxy — need a claude.ai login the gateway doesn't carry.
+export CLAUDE_CODE_DISABLE_ARTIFACT=1
+unset CLAUDE_CODE_ENABLE_DESIGN_SYNC
 
 CLAUDE_CONFIG_DIR="$profile_dir" exec claude "$@"
