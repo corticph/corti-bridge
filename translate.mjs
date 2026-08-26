@@ -272,7 +272,7 @@ const ADVISOR_TOOL_DEF = {
 // full context the executor has, per the official advisor tool's "server supplies context"
 // behaviour. A bare string return from an injected test stub is treated as { ok: true, text }
 // so tests that return plain advice strings stay unchanged.
-export function runAdvisor(text) {
+export function runAdvisor(text, opts = {}) {
   return new Promise((resolve) => {
     const args = [
       "-p",
@@ -301,6 +301,10 @@ export function runAdvisor(text) {
     // gateway process env has no ANTHROPIC_AUTH_TOKEN (the wrapper sets it after spawning
     // the gateway), so we can't stamp the suffix here — the wrapper must do it.
     env.CORTI_ADVISOR_NOINJECT = "1";
+    // Carry the parent's session id so the wrapper can stamp it as x-corti-advisor-for on the
+    // child's request, letting the gateway file the advisor's log entries under the parent.
+    const parentSessionId = opts?.parentSessionId;
+    if (parentSessionId) env.CORTI_ADVISOR_PARENT_SESSION = parentSessionId;
     // Belt-and-suspenders: even if the -noadvisor- token guard somehow failed, the child's
     // openai-mode advisorWanted("openai", false) sees CORTI_ADVISOR=off → no injection.
     // Primary guard remains CORTI_ADVISOR_NOINJECT (the token stamp → skipAdvisor:true).
@@ -500,7 +504,7 @@ function advisorWanted(mode, skipAdvisor) {
 // off), on/off force both modes. skipAdvisor (the -noadvisor- recursion guard) is authoritative
 // and checked first inside advisorWanted so no env var can override it. The runAdvisor
 // dependency is injectable via ctx so tests stay hermetic (no child_process spawn).
-async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor, mode } = {}) {
+async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor, mode, parentSessionId } = {}) {
   if (!advisorWanted(mode, skipAdvisor)) return [];
   const diagnostics = [];
 
@@ -530,7 +534,7 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
       const toolUse = toolUseMap.get(b.tool_use_id);
       if (!toolUse || !ADVISOR_TOOL_NAMES.has(toolUse.name)) continue;
       const { text, elidedCount } = serializeAdvisorInput(body, { maxTokens: advisorMaxTokens() });
-      const out = await call(text);
+      const out = await call(text, { parentSessionId });
       // A bare string is a test stub (backward compat) — treat as success.
       const res = typeof out === "string" ? { ok: true, text: out } : out;
       if (res?.ok) {
@@ -673,13 +677,20 @@ export async function translateRequest(body, opts) {
   for (const msg of body.messages) {
     if (!msg || typeof msg !== "object") continue;
 
+    // Mid-conversation role:system messages are harness-injected reminders (task-tool nudges,
+    // agent-type lists, CLAUDE.md content replays, plan-mode exits). Folding them into sysParts
+    // grows the upstream system prefix and breaks Corti's automatic prefix cache every turn.
+    // Emit them as user content at their original position instead — the prefix stays byte-stable
+    // (cached) and the reminders still reach the model. body.system carries the real base prompt.
     if (msg.role === "system") {
+      const texts = [];
       for (const b of blocksOf(msg.content)) {
-        if (b.type === "text" && typeof b.text === "string") sysParts.push(b.text);
+        if (b.type === "text" && typeof b.text === "string" && b.text) texts.push(b.text);
         else if (b.type === "mid_conv_system") {
-          for (const t of b.content ?? []) if (t?.type === "text") sysParts.push(t.text);
+          for (const t of b.content ?? []) if (t?.type === "text" && t.text) texts.push(t.text);
         }
       }
+      if (texts.length) messages.push({ role: "user", content: texts.join("\n\n") });
       continue;
     }
 
@@ -766,7 +777,8 @@ export async function translateRequest(body, opts) {
         } else if (SERVER_BLOCK_TYPES.has(b.type)) {
           dropped.push(`${b.type} (user)`);
         } else if (b.type === "mid_conv_system") {
-          for (const t of b.content ?? []) if (t?.type === "text") sysParts.push(t.text);
+          for (const t of b.content ?? []) if (t?.type === "text" && t.text)
+            userParts.push({ type: "text", text: t.text });
         } else {
           dropped.push(`${b.type} (user)`);
         }
@@ -1198,7 +1210,10 @@ export function createStreamTranslator(ctx, emit) {
         stop_reason: null,
         stop_sequence: null,
         usage: {
-          input_tokens: ctx.estimatedInput ?? 1,
+          // message_start is provisional — message_delta's anthropicUsage (the real value)
+          // overrides it. Reporting the char/4 estimate here lets the harness merge it with
+          // message_delta's cache fields and double-count the prefix (~329k shown for ~170k).
+          input_tokens: 0,
           output_tokens: 1,
           cache_creation_input_tokens: 0,
           cache_read_input_tokens: 0,

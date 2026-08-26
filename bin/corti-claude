@@ -275,6 +275,11 @@ if [ "${CORTI_ADVISOR_NOINJECT:-}" = 1 ]; then
 fi
 export ANTHROPIC_AUTH_TOKEN="local-gateway-${_noadvisor_marker}$want_mode"
 unset _noadvisor_marker
+# Advisor children carry the parent's session id here so the wrapper can stamp it as a custom
+# header the gateway reads back, filing the advisor's log entries under the parent's session.
+if [ -n "${CORTI_ADVISOR_PARENT_SESSION:-}" ]; then
+  export ANTHROPIC_CUSTOM_HEADERS="x-corti-advisor-for: $CORTI_ADVISOR_PARENT_SESSION"
+fi
 # Per-request attribution text in the system prompt defeats upstream prefix caching.
 export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 # The [1M] badge newer Claude Code versions show for proxied models is misleading here.

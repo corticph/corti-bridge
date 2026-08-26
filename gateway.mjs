@@ -90,7 +90,12 @@ const DEBUG = isTruthy(process.env.CORTI_DEBUG);
 const _debugMaxBody = Number(process.env.CORTI_DEBUG_MAX_BODY);
 // 0 stays 0 (the "unlimited" sentinel); NaN (a non-numeric env value) falls back to the default.
 const DEBUG_MAX_BODY = Number.isFinite(_debugMaxBody) ? _debugMaxBody : 2097152;
-const LOG_FILE = DEBUG ? openDebugLog() : null;
+// Per-session debug logs: each session's traffic lands in its own file under LOG_DIR,
+// keyed on x-claude-code-session-id (advisors override to their parent's id via
+// x-corti-advisor-for). sessionFiles caches the path per session key for the gateway's life.
+const LOG_DIR = DEBUG ? debugDir() : null;
+const sessionFiles = new Map();
+if (LOG_DIR) fs.mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 });
 
 const agent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 32 });
 
@@ -177,7 +182,7 @@ function healthPayload() {
     // bare-path behaviour rather than naming a process-wide mode that no longer exists.
     mode: BARE_PATH_IS_ANTHROPIC ? "anthropic" : "openai",
     upstream: BASE_URL,
-    debug: LOG_FILE ?? false,
+    debug: LOG_DIR ?? false,
   };
 }
 
@@ -187,7 +192,7 @@ server.listen(PORT, HOST, () => {
   console.log(
     `corti-proxy on http://${HOST}:${PORT} (openai: /, anthropic: ${ANTHROPIC_PREFIX}, reasoning: ${REASONING_MODE})`,
   );
-  if (LOG_FILE) console.log(`corti-proxy debug log: ${LOG_FILE}`);
+  if (LOG_DIR) console.log(`corti-proxy debug log dir: ${LOG_DIR}`);
 });
 
 // Without this, SIGTERM is the OS default: the process dies instantly and every open stream
@@ -228,6 +233,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 
 async function handlePassthrough(req, res, reqPath) {
   const id = ++requestId;
+  const sessionFile = DEBUG ? sessionLogFile(req) : null;
   const isCountTokens = reqPath.startsWith("/v1/messages/count_tokens");
   const target = isCountTokens ? null : new URL(`${UPSTREAM_ANTHROPIC}${reqPath}`);
 
@@ -244,12 +250,13 @@ async function handlePassthrough(req, res, reqPath) {
     }
   }
 
-  logRequest(id, req, target, body);
+  logRequest(id, sessionFile, req, target, body);
 
   if (isCountTokens) {
     const counted = countTokens(body);
     logResponse({
       id,
+      sessionFile,
       started,
       status: counted.status,
       body: JSON.stringify(counted.payload),
@@ -274,14 +281,14 @@ async function handlePassthrough(req, res, reqPath) {
     (upstream) => {
       console.log(`${req.method} ${reqPath} ${upstream.statusCode}`);
       res.writeHead(upstream.statusCode ?? 502, upstream.headers);
-      if (LOG_FILE) teeResponse(id, started, upstream, res);
+      teeResponse(id, sessionFile, started, upstream, res);
       upstream.pipe(res);
     },
   );
 
   proxyReq.on("error", (err) => {
     console.error(err.message);
-    logResponse({ id, started, status: null, body: "", note: `upstream request error: ${err.message}` });
+    logResponse({ id, sessionFile, started, status: null, body: "", note: `upstream request error: ${err.message}` });
     if (!res.headersSent)
       send(res, 502, { type: "error", error: { type: "api_error", message: err.message } });
   });
@@ -376,6 +383,8 @@ function handleModels(res) {
 
 async function handleMessages(req, res, body) {
   const id = ++requestId;
+  const sessionFile = DEBUG ? sessionLogFile(req) : null;
+  const parentSessionId = req.headers["x-claude-code-session-id"];
   const started = Date.now();
   const url = `${UPSTREAM_OPENAI}/chat/completions`;
   const diagnostics = [];
@@ -402,7 +411,7 @@ async function handleMessages(req, res, body) {
   const emittedFrames = [];
   const upstreamChunks = [];
 
-  logRequest(id, req, url, body);
+  logRequest(id, sessionFile, req, url, body);
 
   const finalize = (note) => {
     if (finalized) return;
@@ -412,12 +421,13 @@ async function handleMessages(req, res, body) {
     if (retryTimer) clearTimeout(retryTimer);
     if (shutdownCloser) inFlight.delete(shutdownCloser);
     if (proxyReq && !proxyReq.destroyed) proxyReq.destroy();
-    if (LOG_FILE && note) {
+    if (sessionFile && note) {
       if (translator && !loggedResponse)
-        logUpstreamResponse(id, upstreamStatus ?? null, cap(Buffer.concat(upstreamChunks))[0]);
+        logUpstreamResponse(id, sessionFile, upstreamStatus ?? null, cap(Buffer.concat(upstreamChunks))[0]);
       if (!loggedResponse)
         logResponse({
           id,
+          sessionFile,
           started,
           status: res.statusCode ?? null,
           body: emittedFrames.length ? Buffer.concat(emittedFrames) : "",
@@ -432,7 +442,7 @@ async function handleMessages(req, res, body) {
     // PRE_STREAM envelope; only valid while the client response is still unwritten
     if (res.headersSent || clientGone) return finalize(note);
     loggedResponse = true;
-    logResponse({ id, started, status: mapped.status, body: JSON.stringify(mapped.envelope), note, diagnostics });
+    logResponse({ id, sessionFile, started, status: mapped.status, body: JSON.stringify(mapped.envelope), note, diagnostics });
     send(res, mapped.status, mapped.envelope, mapped.headers);
     finalize(note);
   };
@@ -540,7 +550,7 @@ async function handleMessages(req, res, body) {
     : undefined;
   let translated;
   try {
-    const out = await translateRequest(anthropicBody, { skipAdvisor: noAdvisor, mode: "openai", advisorEffort });
+    const out = await translateRequest(anthropicBody, { skipAdvisor: noAdvisor, mode: "openai", advisorEffort, parentSessionId });
     translated = out.request;
     diagnostics.push(...out.dropped.map((d) => `dropped: ${d}`));
   } catch (err) {
@@ -592,7 +602,7 @@ async function handleMessages(req, res, body) {
     // advise" and the executor continues without advice — never a fake success string.
     let advisorResult;
     try {
-      const out = await runAdvisor(advisorInput);
+      const out = await runAdvisor(advisorInput, { parentSessionId });
       // Bare string = injected test stub; treat as success for backward compat.
       advisorResult = typeof out === "string" ? { ok: true, text: out } : out;
       if (!advisorResult) advisorResult = { ok: false, code: "unavailable" };
@@ -730,12 +740,12 @@ async function handleMessages(req, res, body) {
   };
 
   const upstreamBody = Buffer.from(JSON.stringify(translated));
-  logUpstreamRequest(id, url, upstreamBody);
+  logUpstreamRequest(id, sessionFile, url, upstreamBody);
 
   /* ---- response plumbing ---- */
 
   const collectEmitted = (buf) => {
-    if (!LOG_FILE) return;
+    if (!sessionFile) return;
     if (DEBUG_MAX_BODY > 0 && emittedSize + buf.length > DEBUG_MAX_BODY) {
       const room = DEBUG_MAX_BODY - emittedSize;
       if (room > 0) emittedFrames.push(buf.subarray(0, room));
@@ -809,6 +819,11 @@ async function handleMessages(req, res, body) {
     // mid-advisor and kill the turn before the advisor finishes. The advisor's own timeout
     // (ADVISOR_TIMEOUT_MS) is the real ceiling here.
     if (translator?.advisorHandoff) return; // hook owns the turn; ADVISOR_TIMEOUT_MS is the ceiling
+    // An advisor child (wantsNoAdvisor) is its own handleMessages whose translator never sets
+    // advisorHandoff, so the guard above doesn't cover it. The same ADVISOR_TIMEOUT_MS ceiling
+    // applies — applied at the child's execFile layer. Exempt the child from this 120s watchdog
+    // too, or it kills a slow advisor generation mid-stream ("watchdog-timeout").
+    if (noAdvisor) return;
     const silence = Date.now() - lastActivity;
     const limit = headersSentToClient ? STREAM_IDLE_MS : HEADERS_TIMEOUT_MS;
     if (silence >= limit) {
@@ -881,7 +896,7 @@ async function handleMessages(req, res, body) {
             console.log(`POST /v1/messages ${status}${myAttempt > 1 ? ` (attempt ${myAttempt})` : ""}`);
             // The only place upstream headers reach the log: what fail() records is the
             // envelope sent to the client, which drops server/retry-after/x-request-id.
-            logUpstreamResponse(id, status, Buffer.from(text), upstreamRaw.headers);
+            logUpstreamResponse(id, sessionFile, status, Buffer.from(text), upstreamRaw.headers);
             if (isRetryableStatus(status) && canRetry())
               return scheduleRetry(
                 myAttempt,
@@ -921,12 +936,13 @@ async function handleMessages(req, res, body) {
           });
           upstreamRes.on("end", () => {
             const raw = Buffer.concat(chunks);
-            logUpstreamResponse(id, upstreamStatus, cap(raw)[0]);
+            logUpstreamResponse(id, sessionFile, upstreamStatus, cap(raw)[0]);
             try {
               const msg = translateCompletion(JSON.parse(raw.toString()), ctx);
               loggedResponse = true;
               logResponse({
                 id,
+                sessionFile,
                 started,
                 status: 200,
                 body: JSON.stringify(msg),
@@ -990,7 +1006,7 @@ async function handleMessages(req, res, body) {
               "x-accel-buffering": "no",
             });
             res.flushHeaders();
-            logUpstreamResponse(id, upstreamStatus, cap(raw)[0]);
+            logUpstreamResponse(id, sessionFile, upstreamStatus, cap(raw)[0]);
             writeEvent("message_start", {
               type: "message_start",
               message: {
@@ -999,7 +1015,8 @@ async function handleMessages(req, res, body) {
                 stop_reason: null,
                 stop_sequence: null,
                 usage: {
-                  input_tokens: est,
+                  // provisional: message_delta below carries the real anthropicUsage
+                  input_tokens: 0,
                   output_tokens: 1,
                   cache_creation_input_tokens: 0,
                   cache_read_input_tokens: 0,
@@ -1096,7 +1113,7 @@ async function handleMessages(req, res, body) {
 
         upstreamRes.on("data", (chunk) => {
           lastActivity = Date.now();
-          if (LOG_FILE && (DEBUG_MAX_BODY <= 0 || upstreamSize < DEBUG_MAX_BODY)) {
+          if (sessionFile && (DEBUG_MAX_BODY <= 0 || upstreamSize < DEBUG_MAX_BODY)) {
             upstreamChunks.push(chunk);
             upstreamSize += chunk.length;
           }
@@ -1210,32 +1227,45 @@ function isTruthy(value) {
   return value != null && !["", "0", "false", "no", "off"].includes(value.toLowerCase());
 }
 
-function openDebugLog() {
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  for (const dir of [debugDir(), path.join(os.tmpdir(), "corti-claude-proxy")]) {
-    const file = path.join(dir, `gateway-${stamp}.log`);
+function writeBanner(file) {
+  fs.appendFileSync(
+    file,
+    [
+      `=== corti-claude-proxy debug log ===`,
+      `started:  ${new Date().toISOString()}`,
+      `pid:      ${process.pid}`,
+      `upstream (openai):    ${UPSTREAM_OPENAI}`,
+      `upstream (anthropic): ${UPSTREAM_ANTHROPIC}`,
+      `body cap: ${DEBUG_MAX_BODY > 0 ? `${DEBUG_MAX_BODY} bytes` : "unlimited"}`,
+      "",
+      "",
+    ].join("\n"),
+    { mode: 0o600 },
+  );
+}
+
+// Resolves the per-session log file for a request. Advisor children carry
+// x-corti-advisor-for (their parent's id) and file under the parent; everything else
+// keys on its own x-claude-code-session-id; requests with neither share one untracked file.
+// Must be called once per request, synchronously, where req is in scope — the returned path
+// is threaded into async closures (finalize/teeResponse) that fire after the handler returns.
+function sessionLogFile(req) {
+  const advisorFor = req.headers["x-corti-advisor-for"];
+  const sessionId = advisorFor || req.headers["x-claude-code-session-id"];
+  const key = sessionId || "__untracked__";
+  let file = sessionFiles.get(key);
+  if (!file) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const shortId = sessionId ? sessionId.slice(0, 12) : "untracked";
+    file = path.join(LOG_DIR, `gateway-session-${shortId}-${stamp}.log`);
+    sessionFiles.set(key, file);
     try {
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      fs.appendFileSync(
-        file,
-        [
-          `=== corti-claude-proxy debug log ===`,
-          `started:  ${new Date().toISOString()}`,
-          `pid:      ${process.pid}`,
-          `upstream (openai):    ${UPSTREAM_OPENAI}`,
-          `upstream (anthropic): ${UPSTREAM_ANTHROPIC}`,
-          `body cap: ${DEBUG_MAX_BODY > 0 ? `${DEBUG_MAX_BODY} bytes` : "unlimited"}`,
-          "",
-          "",
-        ].join("\n"),
-        { mode: 0o600 },
-      );
-      return file;
+      writeBanner(file);
     } catch (err) {
-      console.error(`corti-proxy: cannot write debug log to ${dir}: ${err.message}`);
+      console.error(`corti-proxy: cannot write debug log to ${file}: ${err.message}`);
     }
   }
-  return null;
+  return file;
 }
 
 function debugDir() {
@@ -1247,37 +1277,45 @@ function debugDir() {
 }
 
 // One entry per write: concurrent requests would otherwise interleave mid-entry.
-function writeEntry(lines) {
-  if (!LOG_FILE) return;
+function writeEntry(sessionFile, lines) {
+  if (!sessionFile) return;
   try {
-    fs.appendFileSync(LOG_FILE, `${lines.join("\n")}\n\n`, { mode: 0o600 });
+    fs.appendFileSync(sessionFile, `${lines.join("\n")}\n\n`, { mode: 0o600 });
   } catch (err) {
     console.error(`corti-proxy: debug log write failed: ${err.message}`);
   }
 }
 
-function logRequest(id, req, target, body) {
-  if (!LOG_FILE) return;
-  writeEntry([
-    `=== #${id} REQUEST ${new Date().toISOString()} ===`,
+function logRequest(id, sessionFile, req, target, body) {
+  if (!sessionFile) return;
+  const advisorFor = req.headers["x-corti-advisor-for"];
+  // Fallback tag when the advisor's parent-id header didn't round-trip (CLI below 2.1.227):
+  // still recognizable as an advisor turn, filed under the child's own session.
+  const tag = advisorFor
+    ? ` [advisor for ${advisorFor.slice(0, 12)}]`
+    : wantsNoAdvisor(req)
+      ? " [advisor]"
+      : "";
+  writeEntry(sessionFile, [
+    `=== #${id} REQUEST${tag} ${new Date().toISOString()} ===`,
     `${req.method} ${req.url}${target ? ` -> ${target}` : " (handled locally)"}`,
     `headers: ${JSON.stringify(redact(req.headers))}`,
     ...formatBody(...cap(body)),
   ]);
 }
 
-function logUpstreamRequest(id, url, body) {
-  if (!LOG_FILE) return;
-  writeEntry([
+function logUpstreamRequest(id, sessionFile, url, body) {
+  if (!sessionFile) return;
+  writeEntry(sessionFile, [
     `=== #${id} UPSTREAM-REQUEST ${new Date().toISOString()} ===`,
     `POST ${url}`,
     ...formatBody(...cap(body)),
   ]);
 }
 
-function logUpstreamResponse(id, status, body, headers) {
-  if (!LOG_FILE) return;
-  writeEntry([
+function logUpstreamResponse(id, sessionFile, status, body, headers) {
+  if (!sessionFile) return;
+  writeEntry(sessionFile, [
     `=== #${id} UPSTREAM-RESPONSE ${new Date().toISOString()} ===`,
     `status: ${status ?? "none"}`,
     ...(headers ? [`headers: ${JSON.stringify(redact(headers))}`] : []),
@@ -1285,9 +1323,9 @@ function logUpstreamResponse(id, status, body, headers) {
   ]);
 }
 
-function logResponse({ id, started, status, headers, body, note, diagnostics, truncated }) {
-  if (!LOG_FILE) return;
-  writeEntry([
+function logResponse({ id, sessionFile, started, status, headers, body, note, diagnostics, truncated }) {
+  if (!sessionFile) return;
+  writeEntry(sessionFile, [
     `=== #${id} RESPONSE ${new Date().toISOString()} (${Date.now() - started}ms) ===`,
     `status: ${status ?? "none"}${note ? ` — ${note}` : ""}`,
     ...(headers ? [`headers: ${JSON.stringify(redact(headers))}`] : []),
@@ -1296,7 +1334,7 @@ function logResponse({ id, started, status, headers, body, note, diagnostics, tr
   ]);
 }
 
-function teeResponse(id, started, upstream, res) {
+function teeResponse(id, sessionFile, started, upstream, res) {
   const chunks = [];
   let size = 0;
   let truncated = false;
@@ -1322,6 +1360,7 @@ function teeResponse(id, started, upstream, res) {
     logged = true;
     logResponse({
       id,
+      sessionFile,
       started,
       status: upstream.statusCode,
       headers: upstream.headers,

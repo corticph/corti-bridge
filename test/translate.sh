@@ -8,7 +8,7 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
-import { translateRequest, translateError, promptTooLong, applyIntercepts } from "'"$REPO"'/translate.mjs";
+import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 
 let failed = 0;
@@ -410,6 +410,49 @@ const local = CC_OVERFLOW_RE.exec(promptTooLong(600000, 524288, "proxy estimate"
 check("overflow: local guard message parses", local !== null, true);
 check("overflow: local guard reports the estimate", local?.[1], "600000");
 check("overflow: local guard reports the window", local?.[2], "524288");
+
+// --- A1: mid-conversation role:system stays out of the system prefix ------------
+// A harness-injected reminder as a top-level role:system in body.messages must land as
+// user content in the stream, NOT folded into messages[0] (the cached system prefix).
+const a1top = (await translateRequest({
+  model: "corti-s1", max_tokens: 16, system: "base system prompt",
+  messages: [
+    { role: "user", content: "hi" },
+    { role: "system", content: "The task tools haven\x27t been used recently." },
+    { role: "user", content: "bye" },
+  ],
+})).request;
+check("A1 top: messages[0] is system", a1top.messages[0]?.role === "system", true);
+check("A1 top: prefix is body.system only", a1top.messages[0]?.content === "base system prompt", true);
+const a1relocated = a1top.messages.find((m) => m.role === "user" && /task tools haven/.test(m.content));
+check("A1 top: reminder relocated to a user message", !!a1relocated, true);
+
+// A mid_conv_system block inside a user message must likewise stay in the user content,
+// not get promoted into the system prefix.
+const a1mc = (await translateRequest({
+  model: "corti-s1", max_tokens: 16, system: "base system prompt",
+  messages: [{
+    role: "user",
+    content: [
+      { type: "mid_conv_system", content: [{ type: "text", text: "mid conv reminder" }] },
+      { type: "text", text: "actual user text" },
+    ],
+  }],
+})).request;
+check("A1 mid_conv: prefix is body.system only", a1mc.messages[0]?.content === "base system prompt", true);
+const a1mcuser = a1mc.messages.find((m) => m.role === "user" && /mid conv reminder/.test(m.content));
+check("A1 mid_conv: reminder stays in user content", !!a1mcuser, true);
+
+// --- A2: message_start reports input_tokens: 0 (provisional; message_delta is truth) -
+const a2events = [];
+const a2ctx = { msgId: "msg_test", requestedModel: "corti-s1", reasoningMode: "drop" };
+const a2tx = createStreamTranslator(a2ctx, (ev, data) => a2events.push({ ev, data }));
+a2tx.feed({ choices: [{ delta: { content: "pong" } }] });
+a2tx.done();
+const a2start = a2events.find((e) => e.ev === "message_start");
+check("A2: message_start input_tokens is 0", a2start?.data?.message?.usage?.input_tokens, 0);
+const a2delta = a2events.find((e) => e.ev === "message_delta");
+check("A2: message_delta follows message_start", !!a2delta, true);
 
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }
