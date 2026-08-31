@@ -1109,8 +1109,11 @@ function anthropicUsage(usage) {
   const cacheRead = details?.cached_tokens ?? 0;
   const cacheCreation = details?.created_cache_tokens ?? 0;
   const prompt = usage?.prompt_tokens ?? 0;
+  // Floor at 1: the harness's S2 usage-merge keeps message_start's estimate when the incoming
+  // input_tokens is 0, double-counting the cached prefix on the statusline. Non-zero forces it
+  // to overwrite with the real remainder.
   return {
-    input_tokens: details ? Math.max(0, prompt - cacheRead - cacheCreation) : prompt,
+    input_tokens: details ? Math.max(1, prompt - cacheRead - cacheCreation) : prompt,
     output_tokens: usage?.completion_tokens ?? 0,
     cache_creation_input_tokens: cacheCreation,
     cache_read_input_tokens: cacheRead,
@@ -1210,10 +1213,10 @@ export function createStreamTranslator(ctx, emit) {
         stop_reason: null,
         stop_sequence: null,
         usage: {
-          // message_start is provisional — message_delta's anthropicUsage (the real value)
-          // overrides it. Reporting the char/4 estimate here lets the harness merge it with
-          // message_delta's cache fields and double-count the prefix (~329k shown for ~170k).
-          input_tokens: 0,
+          // The live per-agent counter reads this off each streamed event; the estimate is its
+          // only growth signal (message_delta's real usage arrives too late). anthropicUsage
+          // floors input_tokens at 1 so the statusline merge overwrites this with the real value.
+          input_tokens: ctx.estimatedInput ?? 1,
           output_tokens: 1,
           cache_creation_input_tokens: 0,
           cache_read_input_tokens: 0,

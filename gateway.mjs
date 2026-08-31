@@ -1015,8 +1015,10 @@ async function handleMessages(req, res, body) {
                 stop_reason: null,
                 stop_sequence: null,
                 usage: {
-                  // provisional: message_delta below carries the real anthropicUsage
-                  input_tokens: 0,
+                  // The live per-agent counter reads this off the streamed event; the estimate is
+                  // its only growth signal. anthropicUsage floors input_tokens at 1 so the
+                  // statusline merge overwrites this with the real value (no cached-prefix double-count).
+                  input_tokens: est,
                   output_tokens: 1,
                   cache_creation_input_tokens: 0,
                   cache_read_input_tokens: 0,

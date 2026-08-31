@@ -443,16 +443,31 @@ check("A1 mid_conv: prefix is body.system only", a1mc.messages[0]?.content === "
 const a1mcuser = a1mc.messages.find((m) => m.role === "user" && /mid conv reminder/.test(m.content));
 check("A1 mid_conv: reminder stays in user content", !!a1mcuser, true);
 
-// --- A2: message_start reports input_tokens: 0 (provisional; message_delta is truth) -
+// --- A2: message_start seeds the prompt estimate; message_delta carries the real value ---
+// The live per-agent counter reads the message_start value off each streamed event; the
+// estimate is its only growth signal. message_delta overrides it for the statusline.
 const a2events = [];
-const a2ctx = { msgId: "msg_test", requestedModel: "corti-s1", reasoningMode: "drop" };
+const a2ctx = { msgId: "msg_test", requestedModel: "corti-s1", reasoningMode: "drop", estimatedInput: 12345 };
 const a2tx = createStreamTranslator(a2ctx, (ev, data) => a2events.push({ ev, data }));
 a2tx.feed({ choices: [{ delta: { content: "pong" } }] });
 a2tx.done();
 const a2start = a2events.find((e) => e.ev === "message_start");
-check("A2: message_start input_tokens is 0", a2start?.data?.message?.usage?.input_tokens, 0);
+check("A2: message_start seeds the estimate", a2start?.data?.message?.usage?.input_tokens, 12345);
 const a2delta = a2events.find((e) => e.ev === "message_delta");
 check("A2: message_delta follows message_start", !!a2delta, true);
+check("A2: message_delta input_tokens is non-zero (no double-count)", a2delta?.data?.usage?.input_tokens > 0, true);
+
+// --- A2b: anthropicUsage floors input_tokens at 1 on a fully-cached turn (no double-count) ---
+const a2bevents = [];
+const a2bctx = { msgId: "msg_test2", requestedModel: "corti-s1", reasoningMode: "drop", estimatedInput: 50000 };
+const a2btx = createStreamTranslator(a2bctx, (ev, data) => a2bevents.push({ ev, data }));
+a2btx.feed({ choices: [{ delta: { content: "x" } }] });
+// Fully cached: prompt_tokens == cached_tokens, created_cache_tokens 0 -> remainder 0.
+a2btx.feed({ usage: { prompt_tokens: 50000, completion_tokens: 7, prompt_tokens_details: { cached_tokens: 50000, created_cache_tokens: 0 } } });
+a2btx.done();
+const a2bdelta = a2bevents.find((e) => e.ev === "message_delta");
+check("A2b: fully-cached turn input_tokens floored at 1 (not 0)", a2bdelta?.data?.usage?.input_tokens, 1);
+check("A2b: fully-cached turn cache_read preserved", a2bdelta?.data?.usage?.cache_read_input_tokens, 50000);
 
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }
