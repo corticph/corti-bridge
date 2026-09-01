@@ -72,7 +72,7 @@ One gateway process serves both modes simultaneously, chosen per request by URL 
 - Deploying wrapper (`bin/corti-claude`) changes requires `./setup.sh` (it copies the wrapper to `~/.local/bin`); gateway/translate changes require `corti-claude --restart`. Avoid `--restart` while an advisor consult is in flight — it kills the continuation.
 - Advisor sessions: children are marked via a `-noadvisor-` token placed *before* the mode marker (matched with `includes("-noadvisor-")`, not `endsWith`); they skip the 120s stream-idle watchdog and the advisor intercept (recursion guard). Debug logs are per-session (`x-claude-code-session-id`); advisor children log into the parent's file via `x-corti-advisor-for` through `ANTHROPIC_CUSTOM_HEADERS`.
 - Three context readouts legitimately disagree: `/context` shows the harness's own estimate of the raw Anthropic body; the statusline shows the model's real usage from the *last successful* turn; the proxy's `count_tokens` is a local char/4 estimate. Divergence alone is not a bug.
-- `test/models.sh` has 2 pre-existing failures (model-tier selection) as of 2026-08-31 — don't chase them as regressions of unrelated work.
+- `test/models.sh` covers `lib/models.mjs` tier/caps logic against captured fixtures; it should stay green.
 
 ## Debugging
 

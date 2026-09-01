@@ -102,6 +102,48 @@ case "${1:-}" in
         echo "corti-claude: gateway restarted" >&2
         exit 0
         ;;
+    doctor)
+        # Diagnostics run without creds, claude, or a gateway — a no-creds first-run is exactly
+        # when you'd run it. Source the libs relative to this wrapper's clone (the same dir
+        # gateway.mjs lives in); an uninstalled wrapper holds the placeholder and the lib is
+        # missing, so fall back to the checks that need nothing.
+        _cc_lib_ok=0
+        if [ -f "$PROXY_DIR/lib/doctor.sh" ]; then
+            . "$PROXY_DIR/lib/ui.sh"
+            . "$PROXY_DIR/lib/pathrc.sh"
+            . "$PROXY_DIR/lib/models.sh"
+            . "$PROXY_DIR/lib/doctor.sh"
+            _cc_lib_ok=1
+        fi
+        if [ "$_cc_lib_ok" != 1 ]; then
+            echo "corti-claude: doctor needs the full lib (run ./setup.sh from your clone first, or set CC_PROXY_DIR)" >&2
+            exit 1
+        fi
+        unset _cc_lib_ok
+        shift
+        doctor_run "$@"
+        exit $?
+        ;;
+    models)
+        # The interactive model picker. Needs creds (like --restart) but not claude or a gateway
+        # — it only talks to Corti's /models and writes models.env.
+        if [ -z "${CORTI_BEARER:-}" ] || [ -z "${CORTI_BASE_URL:-}" ]; then
+            echo "corti-claude: CORTI_BEARER and CORTI_BASE_URL must be set to pick models" >&2
+            echo "corti-claude: run 'npx @corti/cli models init', then open a new terminal" >&2
+            exit 1
+        fi
+        if [ ! -f "$PROXY_DIR/lib/models.sh" ]; then
+            echo "corti-claude: models needs the full lib (run ./setup.sh from your clone first, or set CC_PROXY_DIR)" >&2
+            exit 1
+        fi
+        CC_REPO_DIR="$PROXY_DIR"
+        export CC_REPO_DIR
+        . "$PROXY_DIR/lib/ui.sh"
+        . "$PROXY_DIR/lib/models.sh"
+        shift
+        models_pick "$@"
+        exit $?
+        ;;
     --help|-h)
         cat >&2 <<EOF
 corti-claude — Claude Code on Corti models.
@@ -109,11 +151,18 @@ corti-claude — Claude Code on Corti models.
 Usage: corti-claude [--anthropic] [args passed to claude]
        corti-claude --stop
        corti-claude --restart
+       corti-claude doctor [--deep]
+       corti-claude models [--experimental] [--reset]
 
   (default)    Start the gateway if needed, then launch claude
   --anthropic  Use Corti's /anthropic pass-through mode (default: openai translator)
   --stop       Stop the gateway and exit
   --restart    Stop then start the gateway and exit (needs CORTI_BEARER/CORTI_BASE_URL)
+  doctor       Run diagnostics on the install, gateway, and state (no creds needed)
+  doctor --deep  Also probe Corti's /models endpoint (active; needs CORTI_BEARER)
+  models       Interactively pick which Corti model backs each tier (needs creds)
+  models --reset     Clear all pins and re-rank from scratch, no prompts
+  models --experimental  Include beta models in the lists
   --help       Show this
 EOF
         exit 0

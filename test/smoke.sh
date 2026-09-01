@@ -53,15 +53,18 @@ run_shell_case() {
   _box="$SCRATCH/$_name"
   mkdir -p "$_box/home"
 
-  # Two runs: a naive impl checks $PATH instead of the rc file and appends its block a second time.
+  # Creds set (shape-valid; the model step will fail on a dummy token, which is State B, not an
+  # early-stop) so the wrapper installs and the rc block is written — giving the two-run
+  # idempotency check something to be idempotent about. A naive impl checks $PATH instead of the
+  # rc file and appends its block a second time.
   for _i in 1 2; do
     (
       HOME="$_box/home"
       CC_PROXY_BIN_DIR="$_box/bin"
       CC_PROXY_CONFIG_DIR="$_box/state"
       SHELL="$_shell"
-      export HOME CC_PROXY_BIN_DIR CC_PROXY_CONFIG_DIR SHELL
-      unset CORTI_BEARER CORTI_BASE_URL
+      CORTI_BEARER=dummy CORTI_BASE_URL=https://ai.eu.corti.app/v1
+      export HOME CC_PROXY_BIN_DIR CC_PROXY_CONFIG_DIR SHELL CORTI_BEARER CORTI_BASE_URL
       cd "$REPO" && sh ./setup.sh --yes
     ) >/dev/null 2>&1 || true
   done
@@ -109,10 +112,11 @@ run_shell_case bash /bin/bash .bash_profile
 run_shell_case fish "$(command -v fish 2>/dev/null || echo /nonexistent)" \
   .config/fish/conf.d/corti-claude.fish
 
-# Unattended and without --yes, nothing may edit a shell config: a bare `read` on closed stdin
-# would also abort the script outright under `set -e`.
+# A no-creds FIRST run (no wrapper present) must stop early: exit 1, install nothing, edit no
+# rc file. This is the redesign's headline change — `./setup.sh && corti-claude` becomes safe.
 box="$SCRATCH/noninteractive"
 mkdir -p "$box/home"
+set +e
 (
   HOME="$box/home"
   CC_PROXY_BIN_DIR="$box/bin"
@@ -121,16 +125,60 @@ mkdir -p "$box/home"
   export HOME CC_PROXY_BIN_DIR CC_PROXY_CONFIG_DIR SHELL
   unset CORTI_BEARER CORTI_BASE_URL
   cd "$REPO" && sh ./setup.sh </dev/null
-) >/dev/null 2>&1 || true
+) >/dev/null 2>&1
+_ni_rc=$?
+set -e
+
+check "noninteractive: no-creds first run exits 1" "$_ni_rc" "1"
 
 if [ -x "$box/bin/corti-claude" ]; then
-  pass "noninteractive: wrapper still installed"
+  fail "noninteractive: wrapper installed despite no-creds early-stop"
 else
-  fail "noninteractive: wrapper missing (did a prompt abort the run?)"
+  pass "noninteractive: nothing installed on no-creds first run"
 fi
 
 nmark=$(count_markers "$box/home/.zshrc")
 check "noninteractive: no rc file edited without consent" "$nmark" "0"
+
+# A no-creds RE-run (wrapper already present) must NOT hard-stop: it warns and continues so the
+# model step skips idempotently. Missing creds on an existing install is a runtime concern.
+rebox="$SCRATCH/rerun"
+mkdir -p "$rebox/home"
+# First, install the wrapper with creds so the re-run sees it.
+(
+  HOME="$rebox/home"
+  CC_PROXY_BIN_DIR="$rebox/bin"
+  CC_PROXY_CONFIG_DIR="$rebox/state"
+  SHELL=/bin/zsh
+  CORTI_BEARER=dummy CORTI_BASE_URL=https://ai.eu.corti.app/v1
+  export HOME CC_PROXY_BIN_DIR CC_PROXY_CONFIG_DIR SHELL CORTI_BEARER CORTI_BASE_URL
+  cd "$REPO" && sh ./setup.sh --yes
+) >/dev/null 2>&1 || true
+# Then re-run WITHOUT creds. It must NOT early-stop (missing creds on an existing install is a
+# runtime concern, not an install blocker): it proceeds past the creds step and lands in State B
+# (exit 1) only because the model step skips — not because it hard-stopped at creds. The wrapper
+# survives either way.
+set +e
+(
+  HOME="$rebox/home"
+  CC_PROXY_BIN_DIR="$rebox/bin"
+  CC_PROXY_CONFIG_DIR="$rebox/state"
+  SHELL=/bin/zsh
+  export HOME CC_PROXY_BIN_DIR CC_PROXY_CONFIG_DIR SHELL
+  unset CORTI_BEARER CORTI_BASE_URL
+  cd "$REPO" && sh ./setup.sh --yes
+) >/dev/null 2>&1
+_re_rc=$?
+set -e
+
+# The distinguishing signal is the early-stop message, not the exit code: State B (model step
+# skipped) also exits 1. A re-run that early-stopped would print "Nothing was installed" and
+# leave no wrapper; one that continued reaches the verdict with the wrapper intact.
+if [ -x "$rebox/bin/corti-claude" ]; then
+  pass "rerun: wrapper survives a no-creds re-run (no early-stop)"
+else
+  fail "rerun: no-creds re-run early-stopped (wrapper gone)"
+fi
 
 # An uninstalled wrapper still holds the placeholder PROXY_DIR; it must say so, not poll for 20s.
 # --restart reaches gateway_start without needing claude on PATH, which keeps this hermetic.
