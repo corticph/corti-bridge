@@ -72,7 +72,8 @@ pathrc_on_path() {
   esac
 }
 
-# 0 = already usable, 1 = written (needs a new shell), 2 = not written (caller records it).
+# 0 = already usable, 1 = written (needs a new shell), 2 = not written (caller records it),
+# 3 = not written because --no-modify-path was given (informational, not a problem).
 # Sets CC_RC_FILE to whatever was written, for the closing message.
 CC_RC_FILE=''
 
@@ -108,7 +109,8 @@ pathrc_ensure() {
 
   if [ "${CC_NO_MODIFY_PATH:-0}" = 1 ]; then
     ui_detail "  --no-modify-path given, so nothing was edited"
-    return 2
+    ui_detail "  to use corti-claude now: export PATH=\"$(pathrc_portable_dir "$_prc_bin"):\$PATH\""
+    return 3
   fi
 
   _prc_display=''
