@@ -5,7 +5,10 @@ set -eu
 
 CORTI_DIR="${CC_PROXY_CONFIG_DIR:-$HOME/.corti-claude}"
 PROXY_DIR="${CC_PROXY_DIR:-/path/to/corti-claude-proxy}"  # setup.sh rewrites this to the real clone path at install time
-GATEWAY="http://${CORTI_HOST:-127.0.0.1}:${CORTI_PORT:-4192}"
+PORT="${CORTI_PORT:-4192}"
+GATEWAY="http://${CORTI_HOST:-127.0.0.1}:$PORT"
+# Per-port, so stopping one gateway cannot take down another started from the same clone.
+PID_FILE="$CORTI_DIR/gateway-$PORT.pid"
 
 # Gateway lifecycle. Defined up here so --stop / --restart (parsed next) can use them
 # before the credential and claude-installed guards run; the launch flow calls them too.
@@ -18,10 +21,29 @@ gateway_is_ours() {
     case "${1:-}" in *'"status":"healthy"'*) return 0 ;; *) return 1 ;; esac
 }
 
+# Echo the pid of this port's gateway, or return 1. Liveness alone is not enough: pids are
+# recycled, so the command line has to confirm it is still our process.
+gateway_pid() {
+    [ -f "$PID_FILE" ] || return 1
+    _pid=$(cat "$PID_FILE" 2>/dev/null) || return 1
+    [ -n "$_pid" ] || return 1
+    kill -0 "$_pid" 2>/dev/null || return 1
+    ps -o command= -p "$_pid" 2>/dev/null | grep -q 'gateway\.mjs' || return 1
+    printf '%s' "$_pid"
+}
+
 # Stop the gateway if it is ours; idempotent; returns 1 if it will not die.
 gateway_stop() {
     [ -n "$(gateway_health)" ] || return 0
-    pkill -f "$PROXY_DIR/gateway.mjs" 2>/dev/null || true
+    if _pid=$(gateway_pid); then
+        kill -TERM "$_pid" 2>/dev/null || true
+    else
+        # No usable pid file — a gateway predating this wrapper, or started by hand. This
+        # pattern matches the clone path, so it cannot tell two ports apart; it is the
+        # fallback precisely because there is nothing better to go on.
+        pkill -f "$PROXY_DIR/gateway.mjs" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
     sleep 1
     # pkill may be absent or may not match; re-check so a stale gateway isn't used silently.
     if [ -n "$(gateway_health)" ]; then
@@ -39,6 +61,8 @@ gateway_start() {
         exit 1
     fi
     nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 &
+    # Temp-then-move so a concurrent reader never sees a half-written pid.
+    printf '%s' "$!" > "$PID_FILE.tmp" && mv "$PID_FILE.tmp" "$PID_FILE"
     i=1
     while [ "$i" -le 40 ]; do
         gateway_is_ours "$(gateway_health)" && return 0
@@ -78,6 +102,48 @@ case "${1:-}" in
         echo "corti-claude: gateway restarted" >&2
         exit 0
         ;;
+    doctor)
+        # Diagnostics run without creds, claude, or a gateway — a no-creds first-run is exactly
+        # when you'd run it. Source the libs relative to this wrapper's clone (the same dir
+        # gateway.mjs lives in); an uninstalled wrapper holds the placeholder and the lib is
+        # missing, so fall back to the checks that need nothing.
+        _cc_lib_ok=0
+        if [ -f "$PROXY_DIR/lib/doctor.sh" ]; then
+            . "$PROXY_DIR/lib/ui.sh"
+            . "$PROXY_DIR/lib/pathrc.sh"
+            . "$PROXY_DIR/lib/models.sh"
+            . "$PROXY_DIR/lib/doctor.sh"
+            _cc_lib_ok=1
+        fi
+        if [ "$_cc_lib_ok" != 1 ]; then
+            echo "corti-claude: doctor needs the full lib (run ./setup.sh from your clone first, or set CC_PROXY_DIR)" >&2
+            exit 1
+        fi
+        unset _cc_lib_ok
+        shift
+        doctor_run "$@"
+        exit $?
+        ;;
+    models)
+        # The interactive model picker. Needs creds (like --restart) but not claude or a gateway
+        # — it only talks to Corti's /models and writes models.env.
+        if [ -z "${CORTI_BEARER:-}" ] || [ -z "${CORTI_BASE_URL:-}" ]; then
+            echo "corti-claude: CORTI_BEARER and CORTI_BASE_URL must be set to pick models" >&2
+            echo "corti-claude: run 'npx @corti/cli models init', then open a new terminal" >&2
+            exit 1
+        fi
+        if [ ! -f "$PROXY_DIR/lib/models.sh" ]; then
+            echo "corti-claude: models needs the full lib (run ./setup.sh from your clone first, or set CC_PROXY_DIR)" >&2
+            exit 1
+        fi
+        CC_REPO_DIR="$PROXY_DIR"
+        export CC_REPO_DIR
+        . "$PROXY_DIR/lib/ui.sh"
+        . "$PROXY_DIR/lib/models.sh"
+        shift
+        models_pick "$@"
+        exit $?
+        ;;
     --help|-h)
         cat >&2 <<EOF
 corti-claude — Claude Code on Corti models.
@@ -85,11 +151,18 @@ corti-claude — Claude Code on Corti models.
 Usage: corti-claude [--anthropic] [args passed to claude]
        corti-claude --stop
        corti-claude --restart
+       corti-claude doctor [--deep]
+       corti-claude models [--experimental] [--reset]
 
   (default)    Start the gateway if needed, then launch claude
   --anthropic  Use Corti's /anthropic pass-through mode (default: openai translator)
   --stop       Stop the gateway and exit
   --restart    Stop then start the gateway and exit (needs CORTI_BEARER/CORTI_BASE_URL)
+  doctor       Run diagnostics on the install, gateway, and state (no creds needed)
+  doctor --deep  Also probe Corti's /models endpoint (active; needs CORTI_BEARER)
+  models       Interactively pick which Corti model backs each tier (needs creds)
+  models --reset     Clear all pins and re-rank from scratch, no prompts
+  models --experimental  Include beta models in the lists
   --help       Show this
 EOF
         exit 0
@@ -122,34 +195,37 @@ mkdir -p "$CORTI_DIR"
 # --anthropic selects anthropic pass-through mode; default is openai (translating gateway).
 # The flag is consumed here; remaining args pass through to claude.
 want_mode=openai
-new_args=""
+# shift drops each original arg off the front; kept ones are appended to the back, so "$@"
+# ends up holding exactly the pass-through args with word boundaries intact. No eval, and
+# therefore no quoting to get wrong.
 for _arg in "$@"; do
+    shift
     if [ "$_arg" = "--anthropic" ]; then
         want_mode=anthropic
     else
-        _esc=$(printf '%s' "$_arg" | sed "s/'/'\\\\''/g")
-        new_args="${new_args:+$new_args }'$_esc'"
+        set -- "$@" "$_arg"
     fi
 done
-unset _arg _esc
-export CORTI_UPSTREAM_MODE="$want_mode"
+unset _arg
 
 case "${CORTI_DEBUG:-}" in
     '' | 0 | false | no | off) want_debug=0 ;;
     *) want_debug=1 ;;
 esac
 
-if [ "$want_mode" = anthropic ]; then
-    want_upstream="${CORTI_BASE_URL%/v1}/anthropic"
-else
-    want_upstream="$CORTI_BASE_URL"
-fi
-
 health="$(gateway_health)"
 if [ -n "$health" ] && ! gateway_is_ours "$health"; then
     echo "corti-claude: something else is listening on $GATEWAY - set CORTI_PORT to a free port" >&2
     exit 1
 fi
+
+# CORTI_NO_MANAGE_GATEWAY: use the running gateway as-is, never stop/start it. The advisor
+# child (runAdvisor in translate.mjs) sets this: it spawns `corti-claude -p` as a one-shot
+# print run through the SAME gateway the parent is serving on, and must not manage that
+# gateway's lifecycle. Without this guard a debug-mode mismatch (parent started with
+# CORTI_DEBUG=1, child with it stripped) would make the child's wrapper restart-kill its
+# own parent gateway mid-consult, orphaning the advisor turn ("Server error mid-response").
+if [ "${CORTI_NO_MANAGE_GATEWAY:-}" != 1 ]; then
 
 # The gateway outlives any single invocation, so a state mismatch needs a restart.
 if [ -n "$health" ]; then
@@ -161,16 +237,21 @@ if [ -n "$health" ]; then
     if [ "$want_debug" != "$has_debug" ]; then
         restart_reason="debug mode changed"
     fi
+    # No gatewayVersion means a gateway from before per-request mode dispatch.
     case "$health" in
-        *"\"mode\":\"$want_mode\""*) ;;
-        *'"mode":'*)
-            if [ -z "$restart_reason" ]; then restart_reason="upstream mode changed"; fi ;;
+        *'"gatewayVersion":'*) ;;
         *)
             if [ -z "$restart_reason" ]; then restart_reason="gateway is an older build (restarting to upgrade)"; fi ;;
     esac
+    # mode:"anthropic" means the gateway was booted by a pre-dispatch wrapper and is serving
+    # pass-through on bare paths. This wrapper never sets that, so a restart clears it.
+    case "$health" in
+        *'"mode":"anthropic"'*)
+            if [ -z "$restart_reason" ]; then restart_reason="gateway is in legacy pass-through mode"; fi ;;
+    esac
     # A changed CORTI_BASE_URL means the running gateway is ours but stale — restart, not fail.
     case "$health" in
-        *"\"upstream\":\"$want_upstream\""*) ;;
+        *"\"upstream\":\"$CORTI_BASE_URL\""*) ;;
         *'"upstream":'*)
             if [ -z "$restart_reason" ]; then restart_reason="CORTI_BASE_URL changed"; fi ;;
     esac
@@ -190,9 +271,10 @@ if ! gateway_is_ours "$(gateway_health)"; then
     fi
 fi
 
+fi  # CORTI_NO_MANAGE_GATEWAY
+
 if [ "$want_debug" = 1 ]; then
-    log_path="$(curl -sf --max-time 1 "$GATEWAY/health" 2>/dev/null |
-        sed -n 's/.*"debug":"\([^"]*\)".*/\1/p')"
+    log_path="$(gateway_health | sed -n 's/.*"debug":"\([^"]*\)".*/\1/p')"
     if [ -n "$log_path" ]; then
         echo "corti-claude: debug log -> $log_path" >&2
     else
@@ -225,11 +307,34 @@ if [ -f "$CORTI_DIR/profile.env" ]; then
     profile_dir="${CLAUDE_CONFIG_DIR:-$CORTI_DIR}"
 fi
 
-export ANTHROPIC_BASE_URL="$GATEWAY"
-export ANTHROPIC_AUTH_TOKEN="local-gateway"
+# The only thing --anthropic does: point this session at the gateway's pass-through path.
+# The gateway serves both, so nothing about it has to change.
+if [ "$want_mode" = anthropic ]; then
+    export ANTHROPIC_BASE_URL="$GATEWAY/anthropic"
+else
+    export ANTHROPIC_BASE_URL="$GATEWAY"
+fi
+# The gateway discards this token; the suffixes exist only so it can tell the mode and
+# the advisor-noinject marker apart. Placed before the mode suffix so modeMarker still
+# matches the trailing -openai/-anthropic, and wantsNoAdvisor matches the -noadvisor- marker
+# (see gateway.mjs modeMarker / wantsNoAdvisor).
+_noadvisor_marker=""
+if [ "${CORTI_ADVISOR_NOINJECT:-}" = 1 ]; then
+  _noadvisor_marker="noadvisor-"
+fi
+export ANTHROPIC_AUTH_TOKEN="local-gateway-${_noadvisor_marker}$want_mode"
+unset _noadvisor_marker
+# Advisor children carry the parent's session id here so the wrapper can stamp it as a custom
+# header the gateway reads back, filing the advisor's log entries under the parent's session.
+if [ -n "${CORTI_ADVISOR_PARENT_SESSION:-}" ]; then
+  export ANTHROPIC_CUSTOM_HEADERS="x-corti-advisor-for: $CORTI_ADVISOR_PARENT_SESSION"
+fi
 # Per-request attribution text in the system prompt defeats upstream prefix caching.
 export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 # The [1M] badge newer Claude Code versions show for proxied models is misleading here.
 export CLAUDE_CODE_DISABLE_1M_CONTEXT=1
+# Unreachable through the proxy — need a claude.ai login the gateway doesn't carry.
+export CLAUDE_CODE_DISABLE_ARTIFACT=1
+unset CLAUDE_CODE_ENABLE_DESIGN_SYNC
 
-CLAUDE_CONFIG_DIR="$profile_dir" eval exec claude $new_args
+CLAUDE_CONFIG_DIR="$profile_dir" exec claude "$@"

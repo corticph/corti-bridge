@@ -10,12 +10,12 @@ Local gateway that lets Claude Code talk to Corti's OpenAI-compatible API while 
 
 - **Bidirectional translation** — Anthropic Messages ⇄ OpenAI Chat Completions both ways: system prompts, tools, model names, tool_use/tool_result pairing, thinking config, and images
 - **Streaming** — SSE; parallel tool calls round-trip by index
-- **Pass-through mode** — `--anthropic` skips translation and forwards to Corti's `/anthropic` endpoint (auth swap only); `openai` translation is the default
+- **Pass-through mode** — `--anthropic` skips translation and forwards to Corti's `/anthropic` endpoint (auth swap only); `openai` translation is the default. One gateway serves both routes at once, so switching costs no restart and leaves other sessions alone
 - **Auth swap** — discards the client's token, sends `CORTI_BEARER` upstream; writes nothing to any `settings.json`, so a plain `claude` session stays on Anthropic models
 - **Model tiers** — maps fable/opus/sonnet/haiku to Corti models by model-ID shape, so a new generation needs no code change
 - **WebSearch** — converted to a function tool, results intercepted via Tavily with a keyless DuckDuckGo fallback
 - **Upstream retries** — bounded, pre-stream retry with back-off absorbs the empty-bodied `5xx` bursts Corti's edge emits, which are otherwise too fast for Claude Code's own retry ladder to outlast
-- **Persistent gateway** — keeps running between sessions and auto-restarts when stale (wrong mode, moved base URL, old build)
+- **Persistent gateway** — keeps running between sessions and auto-restarts when stale (moved base URL, old build)
 
 &nbsp;
 
@@ -91,6 +91,7 @@ Read directly from the shell — no local secrets file.
 | `CORTI_PORT` | no | Proxy bind port, default `4192` |
 | `CORTI_HOST` | no | Proxy bind address, default `127.0.0.1` |
 | `CORTI_DEBUG` | no | Any value except `0`/`false`/`no`/`off` enables request/response logging |
+| `CORTI_ADVISOR` | no | `auto` (default) — the `consult_advisor` advisor tool is on in `openai` mode, off in `anthropic` mode; `on`/`off` force both modes. Spawns a headless Opus-tier consult on the request path. See [GUIDE.md](GUIDE.md) for the advisor mechanism, the experimental `anthropic`-mode caveat, and `CORTI_ADVISOR_*` tuning. |
 
 `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, and `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` are exported by the wrapper itself — plumbing this tool owns, not something you configure. The full variable reference (search backends, reasoning mode, debug caps, state directories) is in [GUIDE.md](GUIDE.md).
 

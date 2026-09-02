@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=sh
 # Output primitives for setup.sh. Sourced first; defines functions and colour variables only.
 #
 # Everything prints to stderr so `./setup.sh 2>/dev/null` leaves a clean exit-code-only signal
@@ -51,6 +51,14 @@ ui_fatal() {
   ui_blank
   printf 'Nothing was installed.\n' >&2
   exit 1
+}
+
+# A non-fatal multi-line block (ui_detail looped): indented prose under a step.
+ui_explain() {
+  for _ui_line in "$@"; do
+    printf '    %s\n' "$_ui_line" >&2
+  done
+  unset _ui_line
 }
 
 # Prompt on stderr, answer on stdout.

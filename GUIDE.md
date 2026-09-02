@@ -134,7 +134,7 @@ corti-claude --restart    # stop then start it (needs CORTI_BEARER/CORTI_BASE_UR
 
 `--stop` needs nothing — not even credentials — so it works when something's wrong. `--restart` checks credentials *before* stopping, so a typo'd `CORTI_BEARER` won't take down a working gateway. Stopping a gateway that's already stopped is not an error.
 
-Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require restarting the gateway: the gateway doesn't read `models.env` (the wrapper does, at launch), so a new mapping takes effect the next time you run `corti-claude`. You only need `--restart` if you've changed `CORTI_BASE_URL` or switched `--anthropic` mode — and even then, a normal `corti-claude` run detects the staleness and restarts it for you.
+Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require restarting the gateway: the gateway doesn't read `models.env` (the wrapper does, at launch), so a new mapping takes effect the next time you run `corti-claude`. You only need `--restart` if you've changed `CORTI_BASE_URL` — and even then, a normal `corti-claude` run detects the staleness and restarts it for you. Switching `--anthropic` never needs one: both modes are always being served.
 
 ## Upstream failures and retries
 
@@ -156,17 +156,22 @@ Separately, silence *before* upstream sends response headers now has its own dea
 
 ## Debug logging
 
-Set `CORTI_DEBUG` and the gateway writes every request and response to a timestamped file, one per gateway start:
+Set `CORTI_DEBUG` and the gateway writes every request and response to a **per-session** log file — one file per Claude Code session (keyed on `x-claude-code-session-id`), not one per gateway start:
 
 ```bash
 CORTI_DEBUG=1 corti-claude
 ```
 
-The wrapper prints the log path on startup, and `/health` reports it too:
+Each session's traffic lands in its own file under the debug directory, named `gateway-session-<shortId>-<timestamp>.log`. Advisor consults file under their parent session's id (via `x-corti-advisor-for`), so an advisor turn appears in the same file as the executor request that spawned it; requests carrying no session id share one `__untracked__` file.
+
+The wrapper prints the log directory on startup, and `/health` reports it too — note `debug` is the log **directory**, not a file path (or `false` when `CORTI_DEBUG` is unset):
 
 ```bash
 curl -s http://127.0.0.1:4192/health
-# {"status":"healthy","mode":"openai","upstream":"https://ai.eu.corti.app/v1","debug":"/Users/you/Library/Logs/corti-claude-proxy/gateway-2026-01-01T00-00-00-000Z.log"}
+# {"status":"healthy","gatewayVersion":2,"mode":"openai","upstream":"https://ai.eu.corti.app/v1","debug":"/Users/you/Library/Logs/corti-claude-proxy"}
+#
+# `mode` is not a process-wide setting — it reports what a request carrying no path prefix
+# resolves to, which is what the wrapper compares when deciding whether to restart.
 ```
 
 In `openai` mode each request id gets up to four entries — REQUEST (what the client sent), UPSTREAM-REQUEST (translated OpenAI body), UPSTREAM-RESPONSE (raw upstream bytes, plus upstream headers when the status was an error — that's the only place `server`, `retry-after` and `x-request-id` survive), RESPONSE (translated bytes sent to the client, with a `note` of `completed`/`upstream-error`/`client-abort`/`watchdog-timeout`/`parse-fail` and per-request diagnostics). Mistranslation debugging is a diff problem: compare REQUEST→UPSTREAM-REQUEST and UPSTREAM-RESPONSE→RESPONSE.
@@ -184,7 +189,7 @@ Where they go, in order of precedence:
 
 Bodies are capped at 2 MB each by default so a long streaming response doesn't produce a giant file; raise it with `CORTI_DEBUG_MAX_BODY`, or set `0` for no cap. Truncated bodies are marked as such.
 
-The gateway is a background process that outlives any single `corti-claude` run, so toggling `CORTI_DEBUG` (or switching to `--anthropic`) has to restart it — the wrapper handles that automatically, in both directions. If you started the gateway some other way, stop it yourself first.
+The gateway is a background process that outlives any single `corti-claude` run, so toggling `CORTI_DEBUG` has to restart it — the wrapper handles that automatically, in both directions. If you started the gateway some other way, stop it yourself first.
 
 ## Environment reference
 
@@ -196,7 +201,6 @@ Read directly from the shell — no local secrets file.
 | `CORTI_BASE_URL` | yes | Must match `https://ai.<env>.corti.app/v1`; used as-is (OpenAI-compatible endpoints) |
 | `CORTI_HOST` | no | Proxy bind address, default `127.0.0.1` |
 | `CORTI_PORT` | no | Proxy bind port, default `4192` |
-| `CORTI_UPSTREAM_MODE` | no | Set internally by `--anthropic`; don't set directly |
 | `CORTI_REASONING_MODE` | no | `thinking` (default: reasoning becomes Anthropic thinking blocks), `text` (fold into reply text), `drop` |
 | `TAVILY_API_KEY` | no | Enables Tavily as the primary WebSearch backend; when unset (or when Tavily fails/rate-limits) the keyless DuckDuckGo scrape is used instead |
 | `CORTI_SEARCH_DEPTH` | no | Tavily search depth: `basic` (default, 1 credit) or `advanced` (2 credits, richer snippets); ignored without `TAVILY_API_KEY` |
@@ -204,6 +208,11 @@ Read directly from the shell — no local secrets file.
 | `CORTI_DEBUG` | no | Any value except `0`/`false`/`no`/`off` turns on request/response logging |
 | `CORTI_DEBUG_DIR` | no | Where debug logs go; defaults per platform (see [Debug logging](#debug-logging)) |
 | `CORTI_DEBUG_MAX_BODY` | no | Per-body byte cap, default `2097152` (2 MB); `0` means unlimited |
+| `CORTI_ADVISOR` | no | `auto` (default) — the `consult_advisor` advisor tool is on in `openai` mode, off in `anthropic` mode. `on` — on in both modes. `off` — off in both modes. Unrecognized values warn once and use `auto`. The advisor spawns a headless `corti-claude -p` (Opus-tier by default, see `CORTI_ADVISOR_MODEL`) on the request path — a consult can take minutes; the child carries a recursion guard so it can't re-inject or recurse. |
+| `CORTI_ADVISOR_MODEL` | no | Model alias for the advisor backing (default `opus`); resolved by the wrapper, so use a tier alias (`opus`, `sonnet`, `haiku`, `fable`), not a `claude-` name |
+| `CORTI_ADVISOR_TIMEOUT_MS` | no | Bound on the advisor spawn, default `480000` (8 min); on timeout the `tool_result` becomes `<advisor_guidance>advisor unavailable (execution_time_exceeded)</advisor_guidance>` rather than hanging the turn |
+| `CORTI_ADVISOR_MAX_TOKENS` | no | Soft per-call output cap, surfaced to the advisor via the serialized transcript's budget line; default `2048` (the official recommended starting point). No hard `max_tokens` cap exists through `corti-claude -p`; this is a soft steer plus the hard `CORTI_ADVISOR_TIMEOUT_MS` / maxBuffer ceilings. Lower it to bias toward brevity. |
+| `CORTI_ADVISOR_EFFORT` | no | Reasoning effort for the advisor child, default `high` (the official advisor default, not the `medium` that adaptive thinking maps to). The gateway applies this only to the advisor child (detected via the `-noadvisor-` token). Override with `medium` to keep consults cheaper, `low` is not recommended (it undermines the advisor's value). A model that rejects the level will 400 upstream. |
 
 `CC_PROXY_BIN_DIR` (defaults to `~/.local/bin`) controls where the wrapper is installed. `CC_PROXY_CONFIG_DIR` (defaults to `~/.corti-claude`) is the proxy's own state directory — model mapping, profile choice, gateway log. `CC_PROXY_DIR` tells the wrapper where `gateway.mjs` lives; `setup.sh` bakes your clone's real path into the installed wrapper, so you only need this if you move the clone afterwards.
 
@@ -222,19 +231,39 @@ Compared to first-party Anthropic or `anthropic` mode, this setup cannot support
 - **Reasoning signatures are synthetic** — thinking blocks emitted by the proxy carry a constant signature (`corti-proxy`, base64). Claude Code accepts and re-sends them; the proxy strips them from history on re-entry. If you ever take a session from `~/.corti-claude` and resume it against real Anthropic, those blocks will fail server-side signature validation — filter them out first.
 - **Overflow is decided by tokens, not bytes** — upstream accepts multi-megabyte bodies, so the model's context window is what binds. Over-window turns become `prompt is too long` with a real token count, which is what drives compaction; only bodies over the gateway's own 8 MB byte cap get a local 413 instead.
 
+### The advisor (openai mode)
+
+The `consult_advisor` advisor tool is **on by default in `openai` mode** (`CORTI_ADVISOR=auto`); set `CORTI_ADVISOR=off` to disable it. When the model calls the tool, the gateway **holds the turn**: it emits a synthetic `server_tool_use` + `advisor_tool_result` inline — the shape the harness renders as "Advising…" — runs the advisor (a headless `corti-claude -p`), then makes a second upstream call so the model answers in the same turn. That "Advising" via hold-and-continue is the openai experience.
+
+Each consult spawns a headless session **on the request path**, so a turn that consults blocks for up to `CORTI_ADVISOR_TIMEOUT_MS` (8 min default) while the advisor reasons over the serialized transcript. The executor timing prompt (`lib/advisor-executor-prompt.txt`, ~2 KB / ~500-700 tokens) is prepended to every `openai` system prompt while the advisor is on, consulted or not — that is the per-request cost of default-on.
+
+The advisor receives the executor's **full serialized transcript** (system + tools + messages + a budget line carrying `CORTI_ADVISOR_MAX_TOKENS`), not a focus string; the tool takes empty input (`additionalProperties: false`) — the executor signals timing only, and the harness forwards context automatically. Prior advisor advice **round-trips** into both views: the executor sees past `<advisor_guidance>` blocks in its history, and the advisor sees its own prior guidance in the transcript it's sent — so a follow-up consult can build on or correct earlier advice rather than starting blind. A three-part guard keeps the advisor child from re-injecting or recursing: (1) `CORTI_ADVISOR_NOINJECT=1` stamps a `noadvisor-` marker on the child's token, which the gateway's `wantsNoAdvisor` turns into `skipAdvisor: true`; (2) `CORTI_NO_MANAGE_GATEWAY=1` keeps a debug-mode mismatch from making the child restart-kill its parent gateway mid-consult; (3) `maxBuffer: 32 MB` bounds the child's combined stdout.
+
+The advisor child reasons at **high effort by default** (`CORTI_ADVISOR_EFFORT`, the official advisor default), not the `medium` that adaptive thinking maps to — the advisor's value is in its reasoning, so it gets a deeper pass than a routine turn.
+
+> **Upgrading from `CORTI_ADVISOR_TOOL`:** the advisor is now controlled by `CORTI_ADVISOR`; the former `CORTI_ADVISOR_TOOL` is removed — set `CORTI_ADVISOR=on` to get the old behavior, or leave it unset for the mode default (on in `openai`).
+
 ## `anthropic` mode
 
 ```bash
 corti-claude --anthropic
 ```
 
-Runs the gateway as a thin pass-through to Corti's `/anthropic` endpoint — no translation, every path forwarded, auth swap only. Two intentional deltas: `/health` reports the mode field, and `count_tokens` uses the current estimator.
+Points **this session** at the gateway's pass-through route instead of the translating one — no translation, every path forwarded, auth swap only. It changes nothing about the gateway: one process serves both routes at all times, so the flag costs no restart and does not disturb sessions running in the other mode. `count_tokens` is still answered locally by the estimator on both routes.
 
-`openai` mode is the default because pass-through currently loses something Claude Code relies on (see below), which the translation layer supplies. Use `openai` mode unless you have a reason not to.
+Mechanically, the wrapper exports `ANTHROPIC_BASE_URL=http://127.0.0.1:4192/anthropic` rather than the bare origin, and the gateway dispatches on that prefix. You only need to know this if you are curling the gateway by hand or reading raw debug-log paths.
 
-Use `anthropic` mode today to escape hatch a translation bug, or as a comparison harness: run a session in each mode and diff the debug logs.
+`openai` mode is the default because pass-through loses something Claude Code relies on (see below), which the translation layer supplies. Use `openai` mode unless you have a reason not to.
+
+Use `anthropic` mode to escape-hatch a translation bug, or as a comparison harness: run `corti-claude` and `corti-claude --anthropic` **at the same time**. Both write to the same debug log, so the two modes interleave by timestamp in one file — compare by request id rather than diffing two logs from two gateway lifetimes.
 
 The cost is specific and worth knowing before you reach for it: Corti's `/anthropic` endpoint drops input-token accounting on streaming responses. `message_start` reports `usage: {"input_tokens": 0, "output_tokens": 0}` and `message_delta` carries only `output_tokens` — no input count, no cache fields. Claude Code always streams, so in this mode every transcript records zero input tokens and context/cost readouts stop working. Non-streaming requests to the same endpoint return full usage, so no request parameter fixes it. Tool use is unaffected.
+
+### The advisor in `anthropic` mode (experimental, off by default)
+
+The advisor is **off by default in `anthropic` mode** (`CORTI_ADVISOR=auto`). The inline hold-and-continue above is a translator-stream hook: pass-through has no translator stream, so it can't fire here. With `CORTI_ADVISOR=on` the tool is still injected and its `tool_result` is synthesized by the same spawn, but the delivery differs — it arrives as a **next-turn `tool_result` rewrite, not inline**. The flow: the model calls `consult_advisor`, the client (Claude Code does this) synthesizes an `is_error` `tool_result` for the unknown tool and round-trips it, and the intercept rewrites that result with the advisor's output on the next request. There is no "Advising" indicator; the executor reads the advice on its next turn.
+
+This depends on the client synthesizing an `is_error` tool_result for the unknown tool — if it doesn't, the model sees an unhandled-tool error with no recovery. Because of that client dependency and the loss of the inline experience, prefer `openai` mode for the advisor.
 
 ## PATH and uninstalling
 

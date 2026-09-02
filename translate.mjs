@@ -1,6 +1,11 @@
 // translate.mjs — Anthropic Messages ⇄ OpenAI Chat Completions wire translation.
 
 import https from "node:https";
+import path from "node:path";
+import fs from "node:fs";
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { serializeAdvisorInput } from "./lib/advisor-transcript.mjs";
 
 export const REASONING_SIGNATURE = "Y29ydGktcHJveHk="; // base64 "corti-proxy"
 
@@ -212,6 +217,213 @@ function formatSearchResults(query, results) {
 }
 
 /* ------------------------------------------------------------------ */
+/* advisor: headless corti-claude backing (consult_advisor intercept)  */
+/* ------------------------------------------------------------------ */
+
+// The advisor runs as a headless `corti-claude -p` session through this same gateway, so it
+// inherits the Corti model mapping. The recursion guard has two layers: the env var below
+// gates injection on the gateway, and the advisor child is spawned WITHOUT it (so its own
+// requests don't re-inject) and with `--tools ""` (so it can't emit a tool_use at all).
+const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
+const ADVISOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-prompt.txt");
+const ADVISOR_EXECUTOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-executor-prompt.txt");
+// The advisor is a headless Opus-tier `corti-claude -p` reasoning over a large serialized
+// transcript — a single consult can legitimately take minutes, not seconds. 60s was
+// observed timing out in real sessions. 8 minutes is the floor; raise CORTI_ADVISOR_TIMEOUT_MS
+// to extend further. The gateway's stream-idle watchdog is suppressed for the advisor
+// handoff (see gateway.mjs deadlineCheck / advisorHandoff) so this is the real ceiling.
+const ADVISOR_TIMEOUT_MS = Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 8 * 60_000;
+const ADVISOR_MODEL = process.env.CORTI_ADVISOR_MODEL || "opus";
+// Soft per-call output cap, surfaced to the advisor via the serialized transcript's budget
+// line. The official advisor tool sets a hard `max_tokens` on the tool def; corti-claude -p
+// exposes no such flag, so this is a soft steer (the advisor shapes to fit) plus the hard
+// ADVISOR_TIMEOUT_MS / maxBuffer ceilings. 2048 is the official "recommended starting point."
+// Read at call time (not module load) so per-test env changes take effect.
+const advisorMaxTokens = () => Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2048;
+
+const ADVISOR_TOOL_NAME = "consult_advisor";
+const ADVISOR_TOOL_NAMES = new Set([ADVISOR_TOOL_NAME]);
+// Empty input_schema: the executor signals *timing only*. Letting it write a query loses
+// exactly the detail the advisor is there to catch — the harness forwards the full transcript
+// automatically (see serializeAdvisorInput). `additionalProperties: false` matters: models
+// want to fill in a "question" field.
+const ADVISOR_TOOL_DEF = {
+  name: ADVISOR_TOOL_NAME,
+  description:
+    "Consult a stronger reviewer model. Takes no parameters — your entire conversation " +
+    "history is forwarded automatically. Call before committing to an approach, when stuck, " +
+    "and before declaring a task complete.",
+  input_schema: { type: "object", properties: {}, additionalProperties: false },
+};
+
+// Runs the advisor as a headless corti-claude session. Resolves to a discriminated result:
+//   { ok: true,  text }            — the advisor's guidance (plaintext)
+//   { ok: false, code }            — a failure, mapped to an official advisor_tool_result_error
+//                                    error_code (execution_time_exceeded | unavailable |
+//                                    prompt_too_long | overloaded | too_many_requests |
+//                                    model_not_found). See reference/advisor-tool-official.md
+//                                    §"Error results": the executor sees the error and
+//                                    continues without further advice; the request does not fail.
+// The child env carries a recursion guard so the child's own requests through the proxy
+// don't re-inject the tool: CORTI_ADVISOR_NOINJECT stamps the -noadvisor- token (primary),
+// and CORTI_ADVISOR=off is a belt-and-suspenders env backstop (the child's advisorWanted
+// sees `off` regardless of its mode). `text` is the serialized executor transcript
+// (system + tools + messages + budget line), not a short focus string — the advisor sees the
+// full context the executor has, per the official advisor tool's "server supplies context"
+// behaviour. A bare string return from an injected test stub is treated as { ok: true, text }
+// so tests that return plain advice strings stay unchanged.
+export function runAdvisor(text, opts = {}) {
+  return new Promise((resolve) => {
+    const args = [
+      "-p",
+      "--model", ADVISOR_MODEL,
+      "--output-format", "json",
+      "--system-prompt-file", ADVISOR_PROMPT_FILE,
+      "--tools", "",
+      "--input-format", "text",
+    ];
+    const env = { ...process.env };
+    // The child must not inherit the gateway's debug logging: CORTI_DEBUG makes corti-claude
+    // tee verbose output to stdout/stderr (and write its own gateway-*.log), which inflated
+    // the child's stdout past the 4MB maxBuffer and failed the consult with
+    // ERR_CHILD_PROCESS_STDIO_MAXBUFFER. The advisor runs silently; the gateway logs its
+    // result. Strip CORTI_DEBUG / CORTI_DEBUG_DIR alongside the recursion-guard strip.
+    delete env.CORTI_DEBUG;
+    delete env.CORTI_DEBUG_DIR;
+    // The advisor child runs through the SAME gateway the parent process is serving on, but
+    // it must never MANAGE that gateway: the wrapper's debug-mode-mismatch restart (parent
+    // started with CORTI_DEBUG=1, this child with it stripped) would otherwise make the child
+    // restart-kill its own parent gateway mid-consult ("Server error mid-response"). Tell the
+    // wrapper to use the running gateway as-is — no stop, no start, no restart.
+    env.CORTI_NO_MANAGE_GATEWAY = "1";
+    // Recursion guard: ask the corti-claude wrapper to stamp the -noadvisor marker on the
+    // child's auth token, which the gateway's wantsNoAdvisor() skips injection on. The
+    // gateway process env has no ANTHROPIC_AUTH_TOKEN (the wrapper sets it after spawning
+    // the gateway), so we can't stamp the suffix here — the wrapper must do it.
+    env.CORTI_ADVISOR_NOINJECT = "1";
+    // Carry the parent's session id so the wrapper can stamp it as x-corti-advisor-for on the
+    // child's request, letting the gateway file the advisor's log entries under the parent.
+    const parentSessionId = opts?.parentSessionId;
+    if (parentSessionId) env.CORTI_ADVISOR_PARENT_SESSION = parentSessionId;
+    // Belt-and-suspenders: even if the -noadvisor- token guard somehow failed, the child's
+    // openai-mode advisorWanted("openai", false) sees CORTI_ADVISOR=off → no injection.
+    // Primary guard remains CORTI_ADVISOR_NOINJECT (the token stamp → skipAdvisor:true).
+    env.CORTI_ADVISOR = "off";
+    // maxBuffer bounds the child's combined stdout. The advisor is an Opus-tier model
+    // emitting --output-format json (an array of every event); even without inherited debug
+    // logging, that stream can exceed a few MB on a long consult. 32MB is generous headroom —
+    // the real advice is small (the successful consult returned 624 chars), but the event
+    // stream surrounding it is not. The `detail` capture surfaces a maxBuffer failure with its
+    // err.code if this is ever too small again.
+    const child = execFile("corti-claude", args, {
+      env,
+      timeout: ADVISOR_TIMEOUT_MS,
+      maxBuffer: 32 * 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      if (err) {
+        // Capture the raw failure so the gateway diagnostic can show WHY, not just that, it
+        // failed. execFile sets err.code === "ETIMEDOUT" when the timeout fires; other codes
+        // (ENOENT if corti-claude isn't on PATH, ERR_CHILD_PROCESS_STDIO_MAXBUFFER if stdout
+        // or stderr exceeded maxBuffer, a non-zero exit) are non-timeout failures. stderr
+        // carries the child's own error text when it exited non-zero — the most useful signal.
+        const detail = `code=${err.code || "?"} msg=${String(err.message || "").slice(0, 200)}` +
+          (stderr ? ` stderr=${String(stderr).trim().slice(0, 200)}` : "");
+        return resolve({
+          ok: false,
+          code: err.code === "ETIMEDOUT" ? "execution_time_exceeded" : "unavailable",
+          detail,
+        });
+      }
+      try {
+        // --output-format json emits a JSON array of event objects; the result text is on the
+        // element with type === "result". Fall back to result.text, then raw stdout.
+        const out = stdout.toString().trim();
+        const arr = JSON.parse(out);
+        const items = Array.isArray(arr) ? arr : [arr];
+        const result = items.find((o) => o && o.type === "result");
+        const advice =
+          (typeof result?.result === "string" && result.result) ||
+          (typeof result?.text === "string" && result.text) ||
+          out;
+        // Empty advice despite a clean exit: surface the raw stdout so we can see what the
+        // child actually emitted (an error envelope, an empty result, etc.).
+        return resolve(
+          advice
+            ? { ok: true, text: advice }
+            : { ok: false, code: "unavailable", detail: `empty advice; stdout=${out.slice(0, 200)}` },
+        );
+      } catch (e) {
+        return resolve({ ok: false, code: "unavailable", detail: `unparseable: ${String(e.message || e).slice(0, 200)}; stdout=${String(stdout || "").trim().slice(0, 200)}` });
+      }
+    });
+    child.stdin.on("error", () => {}); // child closed stdin before we wrote
+    child.stdin.end(String(text ?? ""));
+  });
+}
+
+// Default backing used when no runAdvisor is injected via ctx (production). Aliased rather than
+// re-declared to avoid a TDZ reference before runAdvisor is initialised.
+const defaultRunAdvisor = runAdvisor;
+
+// The executor-side timing + advice-weight block, read once from disk and cached. Prepended to
+// the executor's system prompt whenever the advisor tool is injected, so the executor calls at
+// the official cadence (before substantive work, before declaring done). From
+// lib/advisor-executor-prompt.txt — the official "Suggested system prompt for coding tasks."
+let _executorPromptCache;
+function advisorExecutorPrompt() {
+  if (_executorPromptCache === undefined) {
+    try {
+      _executorPromptCache = fs.readFileSync(ADVISOR_EXECUTOR_PROMPT_FILE, "utf8").trim();
+    } catch {
+      _executorPromptCache = "";
+    }
+  }
+  return _executorPromptCache;
+}
+
+// Prepend the executor timing block to body.system. Idempotent: skips if the block is already
+// present (it carries its own distinctive opening line). Accepts string or array system shapes.
+function prependExecutorPrompt(body) {
+  const block = advisorExecutorPrompt();
+  if (!block) return;
+  if (typeof body.system === "string") {
+    if (!body.system.includes("You have access to an `advisor` tool")) {
+      body.system = `${block}\n\n${body.system}`.trim();
+    }
+  } else if (Array.isArray(body.system)) {
+    const first = body.system.find((b) => b?.type === "text" && typeof b.text === "string");
+    if (!first?.text?.includes("You have access to an `advisor` tool")) {
+      body.system = [{ type: "text", text: block }, ...body.system];
+    }
+  } else {
+    body.system = [{ type: "text", text: block }];
+  }
+}
+
+// Extract the advice text from an advisor_tool_result block for history round-tripping (C6).
+// The block's content is a discriminated union: {type:"advisor_result", text} (success) or
+// {type:"advisor_tool_result_error", error_code} (failure). We previously wrapped the advice in
+// a leading "Advisor feedback:\n\n" prefix when emitting it (C7 removed that); here we strip any
+// legacy prefix so the tag holds the raw advice. Errors render as a short unavailable note.
+function advisorResultText(block) {
+  const c = block?.content;
+  if (!c || typeof c !== "object") return "";
+  if (c.type === "advisor_result" && typeof c.text === "string") {
+    return c.text.replace(/^Advisor feedback:\n\n/, "");
+  }
+  if (c.type === "advisor_tool_result_error") return `advisor unavailable (${c.error_code || "unavailable"})`;
+  return "";
+}
+
+// Wrap advisor advice for the model-facing channel: a distinct <advisor_guidance> tag so the
+// executor treats it as a first-class advice channel rather than ordinary tool output
+// (reconstruction §3.3). Used in the continuation tool_result, the anthropic next-turn rewrite,
+// and the C6 history round-trip — every place the advice text meets the model.
+function advisorGuidanceText(advice) {
+  return `<advisor_guidance>\n${advice}\n</advisor_guidance>`;
+}
+
+/* ------------------------------------------------------------------ */
 /* intercept registry — shared by both gateway modes                   */
 /* ------------------------------------------------------------------ */
 
@@ -256,13 +468,96 @@ async function interceptWebSearch(body, { toolUseMap }) {
   return diagnostics;
 }
 
+let warnedAdvisorVar = false;
+
+// One knob, mode-aware default. skipAdvisor (the -noadvisor- recursion guard) is
+// authoritative and checked FIRST so no env var can override it.
+//   CORTI_ADVISOR=auto (unset) → openai ON, anthropic OFF (the mode defaults)
+//   CORTI_ADVISOR=on           → ON in both modes
+//   CORTI_ADVISOR=off          → OFF in both modes
+//   CORTI_ADVISOR_TOOL is REMOVED — CORTI_ADVISOR is the only knob.
+// An unrecognized value (not auto/on/off/unset) warns once and falls to auto.
+function advisorWanted(mode, skipAdvisor) {
+  if (skipAdvisor) return false;
+  const raw = process.env.CORTI_ADVISOR;
+  const v = raw == null ? "" : String(raw).trim().toLowerCase();
+  if (v === "off") return false;
+  if (v === "on") return true;
+  if (raw != null && raw !== "" && v !== "auto") {
+    // Unrecognized value — warn once per process, then fall to auto (mode default).
+    // Warn against the raw value so the user sees exactly what they set (case/whitespace).
+    if (!warnedAdvisorVar) {
+      warnedAdvisorVar = true;
+      console.error(`corti-proxy: unrecognized CORTI_ADVISOR=${JSON.stringify(raw)}, using auto (expected auto|on|off)`);
+    }
+  }
+  // "auto" (unset, or unrecognized) → mode default: openai on, anthropic (and undefined) off.
+  return mode === "openai";
+}
+
+// Injects the consult_advisor tool def and rewrites its tool_result blocks with the advisor's
+// output. Gated by CORTI_ADVISOR (auto/on/off): auto is the mode default (openai on, anthropic
+// off), on/off force both modes. skipAdvisor (the -noadvisor- recursion guard) is authoritative
+// and checked first inside advisorWanted so no env var can override it. The runAdvisor
+// dependency is injectable via ctx so tests stay hermetic (no child_process spawn).
+async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor, mode, parentSessionId } = {}) {
+  if (!advisorWanted(mode, skipAdvisor)) return [];
+  const diagnostics = [];
+
+  // (a) inject the tool def so the model sees it (idempotent — don't push if present)
+  if (Array.isArray(body.tools)) {
+    if (!body.tools.some((t) => t && t.name === ADVISOR_TOOL_NAME)) body.tools.push(ADVISOR_TOOL_DEF);
+  } else {
+    body.tools = [ADVISOR_TOOL_DEF];
+  }
+
+  // (a2) prepend the executor timing + advice-weight block to body.system so the executor
+  //     calls at the official cadence. Same gate as the tool injection above.
+  prependExecutorPrompt(body);
+
+  // (b) rewrite tool_result blocks for consult_advisor calls. Claude Code synthesizes an error
+  // tool_result ("Unknown tool: consult_advisor", is_error:true) for the unknown tool and
+  // round-trips it in the next request; we overwrite both content AND is_error here.
+  //
+  // The advisor receives the SERIALIZED TRANSCRIPT of the whole request (system + tools +
+  // messages + budget line), not the executor's focus string — this is the official "server
+  // supplies context" behaviour. The tool_use input is now empty, so there is no focus to read.
+  const call = runAdvisor || defaultRunAdvisor;
+  for (const msg of body.messages ?? []) {
+    if (msg?.role !== "user" || !Array.isArray(msg.content)) continue;
+    for (const b of msg.content) {
+      if (b?.type !== "tool_result") continue;
+      const toolUse = toolUseMap.get(b.tool_use_id);
+      if (!toolUse || !ADVISOR_TOOL_NAMES.has(toolUse.name)) continue;
+      const { text, elidedCount } = serializeAdvisorInput(body, { maxTokens: advisorMaxTokens() });
+      const out = await call(text, { parentSessionId });
+      // A bare string is a test stub (backward compat) — treat as success.
+      const res = typeof out === "string" ? { ok: true, text: out } : out;
+      if (res?.ok) {
+        b.content = advisorGuidanceText(res.text);
+        b.is_error = false;
+      } else {
+        // The advisor failed (timeout / unavailable / etc). The executor sees the failure and
+        // continues without advice; the request itself does not fail (official §"Error results").
+        b.content = advisorGuidanceText(`advisor unavailable (${res?.code || "unavailable"})`);
+        b.is_error = false;
+      }
+      const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
+      const resStr = res?.ok ? `advisor=${res.text.length} chars` : `advisor_error=${res?.code || "unavailable"}`;
+      diagnostics.push(`advisor intercepted: transcript=${text.length} chars${elidedStr} ${resStr}`);
+    }
+  }
+  return diagnostics;
+}
+
 const intercepts = [
   interceptModelMapping,
   interceptWebSearch,
+  interceptConsultAdvisor,
 ];
 
-export async function applyIntercepts(body) {
-  const ctx = { toolUseMap: buildToolUseMap(body) };
+export async function applyIntercepts(body, opts) {
+  const ctx = { toolUseMap: buildToolUseMap(body), ...(opts || {}) };
   const diagnostics = [];
   for (const fn of intercepts) {
     const diags = await fn(body, ctx);
@@ -339,7 +634,7 @@ function documentText(block) {
 }
 
 
-export async function translateRequest(body) {
+export async function translateRequest(body, opts) {
   if (!body || typeof body !== "object")
     reject(400, "invalid_request_error", "request body is not valid JSON");
   if (typeof body.model !== "string" || !body.model)
@@ -347,7 +642,7 @@ export async function translateRequest(body) {
   if (!Array.isArray(body.messages))
     reject(400, "invalid_request_error", "Field required: messages");
 
-  const interceptDiags = await applyIntercepts(body);
+  const interceptDiags = await applyIntercepts(body, opts);
 
   const dropped = [...interceptDiags];
   const sysParts = [];
@@ -378,13 +673,20 @@ export async function translateRequest(body) {
   for (const msg of body.messages) {
     if (!msg || typeof msg !== "object") continue;
 
+    // Mid-conversation role:system messages are harness-injected reminders (task-tool nudges,
+    // agent-type lists, CLAUDE.md content replays, plan-mode exits). Folding them into sysParts
+    // grows the upstream system prefix and breaks Corti's automatic prefix cache every turn.
+    // Emit them as user content at their original position instead — the prefix stays byte-stable
+    // (cached) and the reminders still reach the model. body.system carries the real base prompt.
     if (msg.role === "system") {
+      const texts = [];
       for (const b of blocksOf(msg.content)) {
-        if (b.type === "text" && typeof b.text === "string") sysParts.push(b.text);
+        if (b.type === "text" && typeof b.text === "string" && b.text) texts.push(b.text);
         else if (b.type === "mid_conv_system") {
-          for (const t of b.content ?? []) if (t?.type === "text") sysParts.push(t.text);
+          for (const t of b.content ?? []) if (t?.type === "text" && t.text) texts.push(t.text);
         }
       }
+      if (texts.length) messages.push({ role: "user", content: texts.join("\n\n") });
       continue;
     }
 
@@ -399,6 +701,17 @@ export async function translateRequest(body) {
             type: "function",
             function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) },
           });
+        } else if (b.type === "advisor_tool_result") {
+          // C6: prior-turn advisor advice must round-trip into the model's view, not be dropped.
+          // The official doc: "Pass the full assistant content, including advisor_tool_result
+          // blocks, back to the API on subsequent turns. Round-trip the result blocks verbatim."
+          // We can't replay the server-tool wire shape to an OpenAI upstream, so we surface the
+          // advice as text wrapped in a distinct tag — a first-class channel the executor treats
+          // as advice rather than ordinary (skeptically-treated) tool output (reconstruction §3.3).
+          // server_tool_use (the paired call) is in SERVER_BLOCK_TYPES and dropped above — the
+          // executor doesn't need to see the call shape, only the advice it carried.
+          const advice = advisorResultText(b);
+          if (advice) texts.push(advisorGuidanceText(advice));
         } else if (b.type === "thinking" || b.type === "redacted_thinking" || SERVER_BLOCK_TYPES.has(b.type)) {
           dropped.push(`${b.type} (assistant history)`);
         } else if (b.type !== "text") {
@@ -460,7 +773,8 @@ export async function translateRequest(body) {
         } else if (SERVER_BLOCK_TYPES.has(b.type)) {
           dropped.push(`${b.type} (user)`);
         } else if (b.type === "mid_conv_system") {
-          for (const t of b.content ?? []) if (t?.type === "text") sysParts.push(t.text);
+          for (const t of b.content ?? []) if (t?.type === "text" && t.text)
+            userParts.push({ type: "text", text: t.text });
         } else {
           dropped.push(`${b.type} (user)`);
         }
@@ -592,6 +906,13 @@ export async function translateRequest(body) {
       req.reasoning_effort = "medium";
     }
   }
+
+  // C2: the advisor child should reason at high (the official default), not the medium that
+  // adaptive thinking maps to above. The gateway sets advisorEffort for the advisor child
+  // (detected via the -noadvisor- token); it overrides whatever the thinking block produced,
+  // including the adaptive→medium mapping. A model that rejects this effort level will 400 at
+  // upstream — that surfaces a real capability gap rather than silently reasoning shallow.
+  if (opts?.advisorEffort) req.reasoning_effort = opts.advisorEffort;
 
   return { request: req, dropped };
 }
@@ -784,8 +1105,11 @@ function anthropicUsage(usage) {
   const cacheRead = details?.cached_tokens ?? 0;
   const cacheCreation = details?.created_cache_tokens ?? 0;
   const prompt = usage?.prompt_tokens ?? 0;
+  // Floor at 1: the harness's S2 usage-merge keeps message_start's estimate when the incoming
+  // input_tokens is 0, double-counting the cached prefix on the statusline. Non-zero forces it
+  // to overwrite with the real remainder.
   return {
-    input_tokens: details ? Math.max(0, prompt - cacheRead - cacheCreation) : prompt,
+    input_tokens: details ? Math.max(1, prompt - cacheRead - cacheCreation) : prompt,
     output_tokens: usage?.completion_tokens ?? 0,
     cache_creation_input_tokens: cacheCreation,
     cache_read_input_tokens: cacheRead,
@@ -840,13 +1164,13 @@ export function createStreamTranslator(ctx, emit) {
   let messageStarted = false;
   let open = null; // { kind: "thinking"|"text"|"tool", index }
   let nextBlockIndex = 0;
-  const toolBlocks = new Map(); // upstream tool_calls index -> { blockIndex, closed }
+  const toolBlocks = new Map(); // upstream tool_calls index -> { blockIndex, closed, name, id, args }
   let pendingStop = null;
-  let finishSeen = false;
   let doneEmitted = false;
   let terminated = false;
   let latestUsage = null;
   let outputChars = 0;
+  let advisorToolUse = null; // { id, name, args } when the turn ends on a consult_advisor tool_use
 
   const closeOpen = () => {
     if (!open) return;
@@ -885,6 +1209,9 @@ export function createStreamTranslator(ctx, emit) {
         stop_reason: null,
         stop_sequence: null,
         usage: {
+          // The live per-agent counter reads this off each streamed event; the estimate is its
+          // only growth signal (message_delta's real usage arrives too late). anthropicUsage
+          // floors input_tokens at 1 so the statusline merge overwrites this with the real value.
           input_tokens: ctx.estimatedInput ?? 1,
           output_tokens: 1,
           cache_creation_input_tokens: 0,
@@ -932,15 +1259,31 @@ export function createStreamTranslator(ctx, emit) {
         const name = entry.function?.name ?? "";
         if (!entry.id || !name)
           ctx.onDiagnostic?.(`tool head missing ${!entry.id ? "id" : "name"} at index ${idx}`);
-        openBlock("tool", { type: "tool_use", id, name, input: {} });
-        toolBlocks.set(idx, { blockIndex: open.index, closed: false });
+        // Suppress the client consult_advisor tool_use from the harness: we replace it with a
+        // synthetic server_tool_use + advisor_tool_result inline (see finish()/onAdvisorToolUse),
+        // so the harness never dispatches a tool it has no implementation for (no error flash).
+        // We still record the block so the hook can read its id; marked closed + blockIndex -1
+        // so it is never emitted and occupies no block index.
+        if (name === ADVISOR_TOOL_NAME && typeof ctx.onAdvisorToolUse === "function") {
+          toolBlocks.set(idx, { blockIndex: -1, closed: true, name, id, args: "" });
+        } else {
+          openBlock("tool", { type: "tool_use", id, name, input: {} });
+          toolBlocks.set(idx, { blockIndex: open.index, closed: false, name, id, args: "" });
+        }
       }
     }
 
     const rec = toolBlocks.get(idx);
     if (!rec || rec.closed) {
-      if (entry.function?.arguments)
+      // The suppressed advisor block is closed but we still accumulate its args for
+      // completeness — just don't emit them to the harness. (The tool input is empty, so
+      // there's nothing to read here in practice; the hook gets the id only.)
+      if (rec && rec.name === ADVISOR_TOOL_NAME && typeof ctx.onAdvisorToolUse === "function") {
+        const f = entry.function?.arguments;
+        if (typeof f === "string") rec.args += f;
+      } else if (entry.function?.arguments) {
         ctx.onDiagnostic?.(`tool args for unknown/closed index ${idx}: skipped`);
+      }
       return;
     }
     const frag = entry.function?.arguments;
@@ -950,6 +1293,7 @@ export function createStreamTranslator(ctx, emit) {
         ctx.onDiagnostic?.(`tool args for non-open block ${rec.blockIndex}: skipped`);
         return;
       }
+      rec.args += frag;
       outputChars += frag.length;
       emit("content_block_delta", {
         type: "content_block_delta",
@@ -960,9 +1304,19 @@ export function createStreamTranslator(ctx, emit) {
   };
 
   const finish = (choice) => {
-    finishSeen = true;
     pendingStop = anthropicStop(choice);
     closeOpen();
+    // Detect a turn ending on a consult_advisor tool_use. The harness would otherwise end the
+    // turn and synthesize a "No such tool" error; the gateway uses this to hold the turn open
+    // and emit an inline advisor_tool_result instead. Only fires when a hook is registered.
+    // The tool input is empty (the executor signals timing only), so we pass just the id;
+    // the gateway serializes the full transcript from its own copy of the request body.
+    if (pendingStop?.stop_reason === "tool_use" && typeof ctx.onAdvisorToolUse === "function") {
+      const adv = [...toolBlocks.values()].reverse().find((t) => t.name === "consult_advisor");
+      if (adv) {
+        advisorToolUse = { id: adv.id };
+      }
+    }
   };
 
   const usageEvent = (usage) => {
@@ -972,6 +1326,12 @@ export function createStreamTranslator(ctx, emit) {
   const emitDeltaEvent = () => {
     if (doneEmitted) return;
     doneEmitted = true;
+    // Hand the turn to the gateway instead of terminating, so it can emit an inline
+    // advisor_tool_result and a continuation. The gateway owns the terminal events then.
+    if (advisorToolUse && typeof ctx.onAdvisorToolUse === "function") {
+      ctx.onAdvisorToolUse(advisorToolUse);
+      return;
+    }
     const usage = latestUsage
       ? anthropicUsage(latestUsage)
       : {
@@ -1025,22 +1385,34 @@ export function createStreamTranslator(ctx, emit) {
     // [DONE] or upstream end/close: single terminal entry point
     done() {
       if (terminated) return;
-      terminated = true;
       startMessage();
       closeOpen();
       emitDeltaEvent();
-      emit("message_stop", { type: "message_stop" });
-    },
-
-    abort() {
-      terminated = true;
+      // When the turn is handed off for an inline advisor result, the gateway owns the rest
+      // of the stream — do not emit message_stop or mark terminated.
+      if (!advisorToolUse) {
+        terminated = true;
+        emit("message_stop", { type: "message_stop" });
+      }
     },
 
     get terminated() {
       return terminated;
     },
-    get finishSeen() {
-      return finishSeen;
+    get nextBlockIndex() {
+      return nextBlockIndex;
+    },
+    // True when the translator handed the turn to the gateway for an inline advisor result
+    // (done() suppressed message_stop). The stream handlers use this to know not to finalize.
+    get advisorHandoff() {
+      return !!advisorToolUse && !terminated;
+    },
+    // Release the advisor handoff: the advisor child has finished and the gateway is about to
+    // make the continuation upstream call, which is a normal (non-advisor) request that can
+    // stall and must be guarded by the stream-idle watchdog. Call this right before the
+    // continuation so the watchdog re-arms (deadlineCheck keys on advisorHandoff).
+    releaseAdvisor() {
+      advisorToolUse = null;
     },
   };
 }

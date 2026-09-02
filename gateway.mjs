@@ -13,12 +13,14 @@ import {
   createStreamTranslator,
   estimateTokens,
   promptTooLong,
+  runAdvisor,
   translateCompletion,
   translateError,
   translateModels,
   translateNetworkError,
   translateRequest,
 } from "./translate.mjs";
+import { serializeAdvisorInput } from "./lib/advisor-transcript.mjs";
 import {
   RETRY_MAX_ATTEMPTS,
   isRetryableNetworkError,
@@ -30,7 +32,10 @@ const HOST = process.env.CORTI_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.CORTI_PORT ?? 4192);
 const BEARER = process.env.CORTI_BEARER;
 const BASE_URL = process.env.CORTI_BASE_URL;
-const MODE = process.env.CORTI_UPSTREAM_MODE === "anthropic" ? "anthropic" : "openai";
+// What a request carrying no mode prefix resolves to. Normally openai; a wrapper predating
+// path dispatch sets CORTI_UPSTREAM_MODE and cannot add a prefix, so its bare requests have
+// to keep meaning pass-through. Read once at boot — mode is otherwise per request.
+const BARE_PATH_IS_ANTHROPIC = process.env.CORTI_UPSTREAM_MODE === "anthropic";
 const REASONING_MODE = ["thinking", "text", "drop"].includes(process.env.CORTI_REASONING_MODE)
   ? process.env.CORTI_REASONING_MODE
   : "thinking";
@@ -53,7 +58,11 @@ if (!BASE_URL_PATTERN.test(BASE_URL)) {
   process.exit(1);
 }
 
-const UPSTREAM = MODE === "anthropic" ? BASE_URL.replace(/\/v1$/, "/anthropic") : BASE_URL;
+const UPSTREAM_OPENAI = BASE_URL;
+const UPSTREAM_ANTHROPIC = BASE_URL.replace(/\/v1$/, "/anthropic");
+// Claude Code preserves a path prefix in ANTHROPIC_BASE_URL, so the wrapper selects a mode by
+// pointing a session at "$GATEWAY" or "$GATEWAY/anthropic".
+const ANTHROPIC_PREFIX = "/anthropic";
 
 // Probe-locked constants
 const PING_INTERVAL_MS = 15_000;
@@ -69,6 +78,7 @@ const HEADERS_TIMEOUT_MS = !Number.isFinite(_headersTimeout)
     ? _headersTimeout
     : STREAM_IDLE_MS;
 const NONSTREAM_TIMEOUT_MS = 600_000;
+const SHUTDOWN_GRACE_MS = 5_000;
 // Upstream's own 400 is authoritative for whichever model is called; this just bounds the backstop.
 const CONTEXT_WINDOW = 524_288;
 // estimateTokens undercounts real usage, so this trips only on absurd bodies.
@@ -80,43 +90,152 @@ const DEBUG = isTruthy(process.env.CORTI_DEBUG);
 const _debugMaxBody = Number(process.env.CORTI_DEBUG_MAX_BODY);
 // 0 stays 0 (the "unlimited" sentinel); NaN (a non-numeric env value) falls back to the default.
 const DEBUG_MAX_BODY = Number.isFinite(_debugMaxBody) ? _debugMaxBody : 2097152;
-const LOG_FILE = DEBUG ? openDebugLog() : null;
+// Per-session debug logs: each session's traffic lands in its own file under LOG_DIR,
+// keyed on x-claude-code-session-id (advisors override to their parent's id via
+// x-corti-advisor-for). sessionFiles caches the path per session key for the gateway's life.
+const LOG_DIR = DEBUG ? debugDir() : null;
+const sessionFiles = new Map();
+if (LOG_DIR) fs.mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 });
 
 const agent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 32 });
 
 let requestId = 0;
 
+// Closers for responses still streaming. Shutdown ends each one with a terminal frame
+// instead of letting the socket reset, so the client sees a decodable error.
+const inFlight = new Set();
+let shuttingDown = false;
+
+// Splits the mode prefix off a URL. Anchored on purpose: "/v1/anthropic/messages" and
+// "/anthropicabc/x" are openai paths, not pass-through ones.
+function splitPath(url) {
+  const reqPath = (url ?? "").split("?")[0];
+  if (reqPath === ANTHROPIC_PREFIX || reqPath.startsWith(`${ANTHROPIC_PREFIX}/`))
+    return { anthropic: true, path: reqPath.slice(ANTHROPIC_PREFIX.length) || "/" };
+  return { anthropic: BARE_PATH_IS_ANTHROPIC, path: reqPath };
+}
+
+// The wrapper stamps the mode it asked for onto the auth token, which the gateway otherwise
+// discards. Headers are untouched by URL resolution, so a stamp that disagrees with the path
+// means the prefix was lost in transit — the one failure that would otherwise be silent,
+// serving pass-through traffic through the translator.
+function modeMarker(req) {
+  const auth = req.headers.authorization ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : (req.headers["x-api-key"] ?? "");
+  if (token.endsWith("-anthropic")) return "anthropic";
+  if (token.endsWith("-openai")) return "openai";
+  return null;
+}
+
+// The advisor child is spawned through this same gateway; without a guard it would re-inject
+// consult_advisor into its own request and recurse. The wrapper stamps a -noadvisor- marker
+// on the child's token (local-gateway-noadvisor-<mode>) — placed before the mode suffix so
+// modeMarker still matches the trailing -openai/-anthropic. Match the marker anywhere in the
+// token, since it now sits before the mode suffix rather than at the tail.
+function wantsNoAdvisor(req) {
+  const auth = req.headers.authorization ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : (req.headers["x-api-key"] ?? "");
+  return typeof token === "string" && token.includes("-noadvisor-");
+}
+
+let warnedUnmarked = false;
+
 const server = http.createServer((req, res) => {
   if (req.method === "OPTIONS") return cors(res);
 
-  if (req.url === "/health")
-    return send(res, 200, {
-      status: "healthy",
-      mode: MODE,
-      upstream: UPSTREAM,
-      debug: LOG_FILE ?? false,
-    });
+  // Unprefixed on purpose: the wrapper curls it before it knows which mode a session wants.
+  if (req.url === "/health") return send(res, 200, healthPayload());
 
-  if (MODE === "anthropic") return handlePassthrough(req, res);
-  return handleOpenAI(req, res);
+  const { anthropic, path: reqPath } = splitPath(req.url);
+
+  const marker = modeMarker(req);
+  if (marker === "anthropic" && !anthropic)
+    return send(res, 400, {
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message:
+          `pass-through was requested but the "${ANTHROPIC_PREFIX}" path prefix did not arrive — ` +
+          `the client dropped it from ANTHROPIC_BASE_URL. Re-run ./setup.sh; if that does not ` +
+          `help, the client changed how it joins a base URL to a request path.`,
+      },
+    });
+  if (marker === null && !warnedUnmarked) {
+    warnedUnmarked = true;
+    // Hand-curling and pre-dispatch wrappers land here. The path is authoritative for them.
+    console.log("corti-proxy: request without a mode marker — routing by path alone");
+  }
+
+  // Claude Code probes this against the base URL before its first request. Answering locally
+  // keeps both modes identical; pass-through would otherwise forward it upstream.
+  if (req.method === "HEAD" && reqPath === "/api/hello") return void res.writeHead(200).end();
+
+  if (anthropic) return void handlePassthrough(req, res, reqPath).catch(proxyFailure(res));
+  return handleOpenAI(req, res, reqPath);
 });
+
+function healthPayload() {
+  return {
+    status: "healthy",
+    gatewayVersion: 2,
+    // A pre-dispatch wrapper compares this against the mode it wants, so it has to describe
+    // bare-path behaviour rather than naming a process-wide mode that no longer exists.
+    mode: BARE_PATH_IS_ANTHROPIC ? "anthropic" : "openai",
+    upstream: BASE_URL,
+    debug: LOG_DIR ?? false,
+  };
+}
 
 // CC streams can be long-lived; don't let Node's request timeout kill them.
 server.requestTimeout = 0;
 server.listen(PORT, HOST, () => {
-  console.log(`corti-proxy on http://${HOST}:${PORT} (mode: ${MODE}, reasoning: ${REASONING_MODE})`);
-  if (LOG_FILE) console.log(`corti-proxy debug log: ${LOG_FILE}`);
+  console.log(
+    `corti-proxy on http://${HOST}:${PORT} (openai: /, anthropic: ${ANTHROPIC_PREFIX}, reasoning: ${REASONING_MODE})`,
+  );
+  if (LOG_DIR) console.log(`corti-proxy debug log dir: ${LOG_DIR}`);
 });
+
+// Without this, SIGTERM is the OS default: the process dies instantly and every open stream
+// resets mid-frame, which the client surfaces as ECONNRESET rather than an API error.
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`corti-proxy: ${signal} — shutting down`);
+
+  // server.close() only stops the listener; it resolves once every socket is gone, and an
+  // idle keep-alive client would hold it open indefinitely.
+  server.close(() => process.exit(0));
+  server.closeIdleConnections();
+
+  for (const closer of inFlight) {
+    try {
+      closer();
+    } catch {
+      // a closer racing its own socket teardown must not block the rest
+    }
+  }
+
+  // Backstop: a wedged socket, or the outbound pool's ref'd sockets, would otherwise
+  // keep the process alive past the point of usefulness.
+  setTimeout(() => {
+    server.closeAllConnections();
+    agent.destroy();
+    process.exit(0);
+  }, SHUTDOWN_GRACE_MS).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 /* ================================================================== */
 /* anthropic mode: thin pass-through                                     */
 /* ================================================================== */
 
-async function handlePassthrough(req, res) {
+async function handlePassthrough(req, res, reqPath) {
   const id = ++requestId;
-  const reqPath = (req.url ?? "").split("?")[0];
+  const sessionFile = DEBUG ? sessionLogFile(req) : null;
   const isCountTokens = reqPath.startsWith("/v1/messages/count_tokens");
-  const target = isCountTokens ? null : new URL(`${UPSTREAM}${reqPath}`);
+  const target = isCountTokens ? null : new URL(`${UPSTREAM_ANTHROPIC}${reqPath}`);
 
   let body = await rawBody(req);
   const started = Date.now();
@@ -124,28 +243,26 @@ async function handlePassthrough(req, res) {
   if (!isCountTokens && req.method === "POST" && reqPath === "/v1/messages") {
     try {
       const parsed = JSON.parse(body.toString());
-      await applyIntercepts(parsed);
+      await applyIntercepts(parsed, { skipAdvisor: wantsNoAdvisor(req), mode: "anthropic" });
       body = Buffer.from(JSON.stringify(parsed));
     } catch {
       // JSON parse failed — forward original body; upstream will reject
     }
   }
 
-  logRequest(id, req, target, body);
+  logRequest(id, sessionFile, req, target, body);
 
   if (isCountTokens) {
-    try {
-      const result = { input_tokens: estimateTokens(JSON.parse(body.toString())) };
-      logResponse({ id, started, status: 200, body: JSON.stringify(result), note: "handled locally" });
-      return send(res, 200, result);
-    } catch {
-      const envelope = {
-        type: "error",
-        error: { type: "invalid_request_error", message: "request body is not valid JSON" },
-      };
-      logResponse({ id, started, status: 400, body: JSON.stringify(envelope), note: "handled locally" });
-      return send(res, 400, envelope);
-    }
+    const counted = countTokens(body);
+    logResponse({
+      id,
+      sessionFile,
+      started,
+      status: counted.status,
+      body: JSON.stringify(counted.payload),
+      note: "handled locally",
+    });
+    return send(res, counted.status, counted.payload);
   }
 
   const proxyReq = https.request(
@@ -164,17 +281,25 @@ async function handlePassthrough(req, res) {
     (upstream) => {
       console.log(`${req.method} ${reqPath} ${upstream.statusCode}`);
       res.writeHead(upstream.statusCode ?? 502, upstream.headers);
-      if (LOG_FILE) teeResponse(id, started, upstream, res);
+      teeResponse(id, sessionFile, started, upstream, res);
       upstream.pipe(res);
     },
   );
 
   proxyReq.on("error", (err) => {
     console.error(err.message);
-    logResponse({ id, started, status: null, body: "", note: `upstream request error: ${err.message}` });
+    logResponse({ id, sessionFile, started, status: null, body: "", note: `upstream request error: ${err.message}` });
     if (!res.headersSent)
       send(res, 502, { type: "error", error: { type: "api_error", message: err.message } });
   });
+
+  // Passthrough carries Corti's raw wire bytes, so there is no Anthropic frame we could
+  // honestly synthesise here — ending the response is the truthful signal.
+  const closer = () => {
+    if (!res.writableEnded) res.end();
+  };
+  inFlight.add(closer);
+  res.on("close", () => inFlight.delete(closer));
 
   req.on("close", () => {
     if (!res.writableEnded) proxyReq.destroy();
@@ -187,12 +312,14 @@ async function handlePassthrough(req, res) {
 /* openai mode: translating gateway                                    */
 /* ================================================================== */
 
-function handleOpenAI(req, res) {
-  const reqPath = (req.url ?? "").split("?")[0];
+function handleOpenAI(req, res, reqPath) {
   return rawBody(req)
     .then((body) => {
       if (req.method === "POST" && reqPath === "/v1/messages") return handleMessages(req, res, body);
-      if (req.method === "POST" && reqPath === "/v1/messages/count_tokens") return handleCountTokens(res, body);
+      if (req.method === "POST" && reqPath === "/v1/messages/count_tokens") {
+        const counted = countTokens(body);
+        return send(res, counted.status, counted.payload);
+      }
       if (req.method === "GET" && reqPath === "/v1/models") return handleModels(res);
       if (req.method === "POST" && reqPath === "/api/event_logging/batch") return send(res, 200, {});
       return send(res, 404, {
@@ -200,27 +327,28 @@ function handleOpenAI(req, res) {
         error: { type: "not_found_error", message: `unknown route: ${req.method} ${reqPath}` },
       });
     })
-    .catch((err) => {
-      console.error(err);
-      if (!res.headersSent)
-        send(res, 500, { type: "error", error: { type: "api_error", message: "proxy failure" } });
-    });
+    .catch(proxyFailure(res));
 }
 
-function handleCountTokens(res, body) {
+// Neither upstream offers token counting — the OpenAI API has no such endpoint and Corti's
+// /anthropic 404s on it — so both routes answer locally from the same estimate.
+function countTokens(body) {
   try {
-    return send(res, 200, { input_tokens: estimateTokens(JSON.parse(body.toString())) });
+    return { status: 200, payload: { input_tokens: estimateTokens(JSON.parse(body.toString())) } };
   } catch {
-    return send(res, 400, {
-      type: "error",
-      error: { type: "invalid_request_error", message: "request body is not valid JSON" },
-    });
+    return {
+      status: 400,
+      payload: {
+        type: "error",
+        error: { type: "invalid_request_error", message: "request body is not valid JSON" },
+      },
+    };
   }
 }
 
 function handleModels(res) {
   const proxyReq = https.request(
-    new URL(`${UPSTREAM}/models`),
+    new URL(`${UPSTREAM_OPENAI}/models`),
     { agent, method: "GET", headers: { authorization: `Bearer ${BEARER}` } },
     (upstream) => {
       const chunks = [];
@@ -255,8 +383,10 @@ function handleModels(res) {
 
 async function handleMessages(req, res, body) {
   const id = ++requestId;
+  const sessionFile = DEBUG ? sessionLogFile(req) : null;
+  const parentSessionId = req.headers["x-claude-code-session-id"];
   const started = Date.now();
-  const url = `${UPSTREAM}/chat/completions`;
+  const url = `${UPSTREAM_OPENAI}/chat/completions`;
   const diagnostics = [];
 
   // all mutable request state up front: fail()/finalize() may run at any point after this
@@ -273,6 +403,7 @@ async function handleMessages(req, res, body) {
   let attempt = 0;
   let retryTimer = null;
   let drainPending = false;
+  let shutdownCloser = null;
   let upstreamStatus = null;
   let emittedTruncated = false;
   let emittedSize = 0;
@@ -280,7 +411,7 @@ async function handleMessages(req, res, body) {
   const emittedFrames = [];
   const upstreamChunks = [];
 
-  logRequest(id, req, url, body);
+  logRequest(id, sessionFile, req, url, body);
 
   const finalize = (note) => {
     if (finalized) return;
@@ -288,13 +419,15 @@ async function handleMessages(req, res, body) {
     if (interval) clearInterval(interval);
     if (absolute) clearTimeout(absolute);
     if (retryTimer) clearTimeout(retryTimer);
+    if (shutdownCloser) inFlight.delete(shutdownCloser);
     if (proxyReq && !proxyReq.destroyed) proxyReq.destroy();
-    if (LOG_FILE && note) {
+    if (sessionFile && note) {
       if (translator && !loggedResponse)
-        logUpstreamResponse(id, upstreamStatus ?? null, cap(Buffer.concat(upstreamChunks))[0]);
+        logUpstreamResponse(id, sessionFile, upstreamStatus ?? null, cap(Buffer.concat(upstreamChunks))[0]);
       if (!loggedResponse)
         logResponse({
           id,
+          sessionFile,
           started,
           status: res.statusCode ?? null,
           body: emittedFrames.length ? Buffer.concat(emittedFrames) : "",
@@ -309,7 +442,7 @@ async function handleMessages(req, res, body) {
     // PRE_STREAM envelope; only valid while the client response is still unwritten
     if (res.headersSent || clientGone) return finalize(note);
     loggedResponse = true;
-    logResponse({ id, started, status: mapped.status, body: JSON.stringify(mapped.envelope), note, diagnostics });
+    logResponse({ id, sessionFile, started, status: mapped.status, body: JSON.stringify(mapped.envelope), note, diagnostics });
     send(res, mapped.status, mapped.envelope, mapped.headers);
     finalize(note);
   };
@@ -407,9 +540,17 @@ async function handleMessages(req, res, body) {
 
   /* ---- request translation ---- */
 
+  // The advisor child (wantsNoAdvisor) reasons at high effort by default — the official advisor
+  // default — rather than the medium that adaptive thinking maps to. CORTI_ADVISOR_EFFORT
+  // overrides (e.g. "medium" to keep consults cheap). Read at call time so a change takes effect
+  // on the next consult without a gateway restart.
+  const noAdvisor = wantsNoAdvisor(req);
+  const advisorEffort = noAdvisor
+    ? (process.env.CORTI_ADVISOR_EFFORT || "high")
+    : undefined;
   let translated;
   try {
-    const out = await translateRequest(anthropicBody);
+    const out = await translateRequest(anthropicBody, { skipAdvisor: noAdvisor, mode: "openai", advisorEffort, parentSessionId });
     translated = out.request;
     diagnostics.push(...out.dropped.map((d) => `dropped: ${d}`));
   } catch (err) {
@@ -421,19 +562,190 @@ async function handleMessages(req, res, body) {
   const ctx = {
     msgId: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
     requestedModel: anthropicBody.model,
-    stopSequencesSent: translated.stop ?? [],
     reasoningMode: REASONING_MODE,
     estimatedInput: est,
     onDiagnostic: (m) => diagnostics.push(m),
   };
 
+  // Hold-and-continue advisor: when the turn ends on a consult_advisor tool_use, the translator
+  // fires this hook instead of terminating. We emit a synthetic server_tool_use + advisor_tool_result
+  // inline (the shape the harness renders as "Advising…"), run the advisor, then make a second
+  // upstream call with the consult_advisor tool_use + a real client tool_result appended so the
+  // model reads the advice and actually answers the user. The gateway owns the terminal events.
+  let advisorHandled = false;
+  ctx.onAdvisorToolUse = async ({ id }) => {
+    if (advisorHandled || finalized || clientGone) return;
+    advisorHandled = true;
+    // Serialize the executor's full request (system + tools + transcript + budget line) for the
+    // advisor. The tool input is empty — the executor signals timing only; the harness forwards
+    // context automatically, per the official advisor tool design.
+    const { text: advisorInput, elidedCount } = serializeAdvisorInput(anthropicBody, {
+      maxTokens: Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2048,
+    });
+    const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
+    diagnostics.push(`advisor hold-and-continue: id=${id} transcript=${advisorInput.length} chars${elidedStr}`);
+
+    // 1. Emit the synthetic server-tool advisor blocks inline (rendered by the harness, not
+    //    round-tripped to Corti — the continuation call below carries the client-tool shape).
+    const srvIdx = translator ? translator.nextBlockIndex : 0;
+    const resIdx = srvIdx + 1;
+    writeEvent("content_block_start", {
+      type: "content_block_start", index: srvIdx,
+      content_block: { type: "server_tool_use", id, name: "advisor", input: {} },
+    });
+    writeEvent("content_block_stop", { type: "content_block_stop", index: srvIdx });
+
+    // 2. Run the advisor on the serialized transcript. Non-blocking UI: "Advising" shows while this runs.
+    // runAdvisor returns {ok:true,text} or {ok:false,code} (official advisor_tool_result_error
+    // error_code: execution_time_exceeded | unavailable | overloaded | too_many_requests |
+    // prompt_too_long | model_not_found). On failure the harness renders "Advisor declined to
+    // advise" and the executor continues without advice — never a fake success string.
+    let advisorResult;
+    try {
+      const out = await runAdvisor(advisorInput, { parentSessionId });
+      // Bare string = injected test stub; treat as success for backward compat.
+      advisorResult = typeof out === "string" ? { ok: true, text: out } : out;
+      if (!advisorResult) advisorResult = { ok: false, code: "unavailable" };
+    } catch (err) {
+      diagnostics.push(`advisor spawn failed: ${err?.message ?? err}`);
+      advisorResult = { ok: false, code: "unavailable" };
+    }
+
+    if (finalized || clientGone) return;
+    // The result block the client sees: success (advisor_result) or error (advisor_tool_result_error).
+    // The error variant lets the harness render the expected "Advisor declined to advise on this
+    // request" line instead of a success with an empty/no-response string. The success text is the
+    // RAW advisor output (the official advisor_result carries the advisor's text verbatim, no prefix).
+    const resultContent = advisorResult.ok
+      ? { type: "advisor_result", text: advisorResult.text, stop_reason: "end_turn" }
+      : { type: "advisor_tool_result_error", error_code: advisorResult.code };
+    writeEvent("content_block_start", {
+      type: "content_block_start", index: resIdx,
+      content_block: { type: "advisor_tool_result", tool_use_id: id, content: resultContent },
+    });
+    writeEvent("content_block_stop", { type: "content_block_stop", index: resIdx });
+    diagnostics.push(
+      advisorResult.ok
+        ? `advisor ok: ${advisorResult.text.length} chars`
+        : `advisor failed: ${advisorResult.code}${advisorResult.detail ? ` — ${advisorResult.detail}` : ""}`,
+    );
+
+    // 3. Continuation: a second, non-streaming upstream call. The history gains the model's
+    //    consult_advisor tool_use + a client tool_result holding the advice (or the failure note),
+    //    so the model reads the result and answers. We translate that response and stream it back
+    //    as content blocks under the SAME message (the harness sees one continuous turn).
+    //    On failure the tool_result carries an unavailable note so the executor knows advice was
+    //    unavailable and proceeds without it (the official "continues without further advice").
+    //    Model-facing text wraps the advice in <advisor_guidance> — a distinct channel the
+    //    executor treats as first-class advice, not ordinary tool output (reconstruction §3.3).
+    const continuationText = advisorResult.ok
+      ? `<advisor_guidance>\n${advisorResult.text}\n</advisor_guidance>`
+      : `<advisor_guidance>\nadvisor unavailable (${advisorResult.code})\n</advisor_guidance>`;
+    // The advisor child is done; the continuation is a normal upstream request that can stall
+    // and must be guarded. Release the handoff so the stream-idle watchdog re-arms, and reset
+    // the silence clock so the watchdog measures from the continuation's start, not from the
+    // advisor run (which may have taken minutes and would instantly trip STREAM_IDLE_MS).
+    translator?.releaseAdvisor?.();
+    lastActivity = Date.now();
+    try {
+      await continueAfterAdvisor(id, continuationText);
+    } catch (err) {
+      diagnostics.push(`advisor continuation failed: ${err?.message ?? err}`);
+      if (!finalized && !res.writableEnded) {
+        writeEvent("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage: { input_tokens: est, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        });
+        writeEvent("message_stop", { type: "message_stop" });
+        res.end();
+        finalize("advisor-continuation-failed");
+      }
+    }
+  };
+
+  // The second upstream call: appends the consult_advisor tool_use + tool_result to the original
+  // request and asks the model to continue. Non-streaming for simplicity (the first turn already
+  // streamed; this is the advisor-aware continuation).
+  const continueAfterAdvisor = (toolUseId, advisorText) => {
+    return new Promise((resolve, reject) => {
+      // Build the continuation body: original messages + a new user turn carrying the tool_result.
+      const contMessages = [...(anthropicBody.messages || [])];
+      contMessages.push({
+        role: "assistant",
+        content: [{ type: "tool_use", id: toolUseId, name: "consult_advisor", input: {} }],
+      });
+      contMessages.push({
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: toolUseId, content: advisorText, is_error: false }],
+      });
+      const contAnthropic = { ...anthropicBody, messages: contMessages, stream: false };
+      // skipAdvisor: the continuation already carries the consult_advisor tool_use +
+      // tool_result we synthesized; re-running interceptConsultAdvisor would match that
+      // tool_result and spawn runAdvisor a second time. The continuation is ours, not a
+      // fresh client request, so the advisor intercept must not touch it.
+      translateRequest(contAnthropic, { skipAdvisor: true })
+        .then((out) => {
+          const contTranslated = out.request;
+          diagnostics.push(...out.dropped.map((d) => `continuation dropped: ${d}`));
+          const body = Buffer.from(JSON.stringify(contTranslated));
+          const req = https.request(url, {
+            agent, method: "POST",
+            headers: { "content-type": "application/json", authorization: `Bearer ${BEARER}`, "content-length": body.length },
+          }, (up) => {
+            const chunks = [];
+            up.on("data", (c) => chunks.push(c));
+            up.on("end", () => {
+              if (finalized || clientGone) return resolve();
+              try {
+                const msg = translateCompletion(JSON.parse(Buffer.concat(chunks).toString()), ctx);
+                // Stream the continuation content as more content_block events under this message.
+                let idx = translator ? translator.nextBlockIndex : resIdx + 1;
+                for (const block of msg.content) {
+                  const skeleton =
+                    block.type === "tool_use" ? { ...block, input: {} } :
+                    block.type === "thinking" ? { type: "thinking", thinking: "", signature: "" } :
+                    { type: "text", text: "" };
+                  writeEvent("content_block_start", { type: "content_block_start", index: idx, content_block: skeleton });
+                  if (block.type === "text")
+                    writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: block.text } });
+                  else if (block.type === "thinking") {
+                    writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "thinking_delta", thinking: block.thinking } });
+                    writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "signature_delta", signature: block.signature } });
+                  } else if (block.type === "tool_use")
+                    writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } });
+                  writeEvent("content_block_stop", { type: "content_block_stop", index: idx });
+                  idx++;
+                }
+                writeEvent("message_delta", {
+                  type: "message_delta",
+                  delta: { stop_reason: msg.stop_reason ?? "end_turn", stop_sequence: msg.stop_sequence ?? null },
+                  usage: msg.usage,
+                });
+                writeEvent("message_stop", { type: "message_stop" });
+                res.end();
+                finalize("advisor-continuation");
+                resolve();
+              } catch (e) {
+                reject(e);
+              }
+            });
+            up.on("error", reject);
+          });
+          req.on("error", reject);
+          req.end(body);
+        })
+        .catch(reject);
+    });
+  };
+
   const upstreamBody = Buffer.from(JSON.stringify(translated));
-  logUpstreamRequest(id, url, upstreamBody);
+  logUpstreamRequest(id, sessionFile, url, upstreamBody);
 
   /* ---- response plumbing ---- */
 
   const collectEmitted = (buf) => {
-    if (!LOG_FILE) return;
+    if (!sessionFile) return;
     if (DEBUG_MAX_BODY > 0 && emittedSize + buf.length > DEBUG_MAX_BODY) {
       const room = DEBUG_MAX_BODY - emittedSize;
       if (room > 0) emittedFrames.push(buf.subarray(0, room));
@@ -467,12 +779,51 @@ async function handleMessages(req, res, body) {
 
   const writePing = () => {
     if (clientGone || res.writableEnded) return;
+    // While the translator handed the turn to the advisor hook, the stream is idle by
+    // design (runAdvisor is spawning). Pings here render as a thinking-spinner line that
+    // displaces the "Advising" indicator, so suppress them for the duration of the handoff.
+    if (translator?.advisorHandoff) return;
     const buf = Buffer.from(`event: ping\ndata: {"type":"ping"}\n\n`);
     collectEmitted(buf);
     res.write(buf);
   };
 
+  // Registered here, not with the other state: it closes over writeEvent, which is
+  // initialised just above — registering earlier would leave a TDZ window where a
+  // signal arriving mid-setup throws instead of shutting down cleanly.
+  shutdownCloser = () => {
+    if (finalized) return;
+    if (!headersSentToClient)
+      return fail(
+        {
+          status: 529,
+          envelope: { type: "error", error: { type: "overloaded_error", message: "gateway shutting down" } },
+        },
+        "shutdown",
+      );
+    writeEvent("error", {
+      type: "error",
+      error: { type: "api_error", message: "gateway shutting down" },
+    });
+    res.end();
+    finalize("shutdown");
+  };
+  inFlight.add(shutdownCloser);
+
   const deadlineCheck = () => {
+    // The advisor handoff owns the turn: runAdvisor is a headless `corti-claude -p` child that
+    // can legitimately run for minutes (see ADVISOR_TIMEOUT_MS). While it owns the turn the SSE
+    // stream is idle by design — pings are suppressed (writePing, below) so they don't displace
+    // the "Advising" indicator, and the stream-idle watchdog must stay its hand too. Without
+    // this guard a consult that exceeds STREAM_IDLE_MS (120s) would fire "upstream stalled"
+    // mid-advisor and kill the turn before the advisor finishes. The advisor's own timeout
+    // (ADVISOR_TIMEOUT_MS) is the real ceiling here.
+    if (translator?.advisorHandoff) return; // hook owns the turn; ADVISOR_TIMEOUT_MS is the ceiling
+    // An advisor child (wantsNoAdvisor) is its own handleMessages whose translator never sets
+    // advisorHandoff, so the guard above doesn't cover it. The same ADVISOR_TIMEOUT_MS ceiling
+    // applies — applied at the child's execFile layer. Exempt the child from this 120s watchdog
+    // too, or it kills a slow advisor generation mid-stream ("watchdog-timeout").
+    if (noAdvisor) return;
     const silence = Date.now() - lastActivity;
     const limit = headersSentToClient ? STREAM_IDLE_MS : HEADERS_TIMEOUT_MS;
     if (silence >= limit) {
@@ -545,7 +896,7 @@ async function handleMessages(req, res, body) {
             console.log(`POST /v1/messages ${status}${myAttempt > 1 ? ` (attempt ${myAttempt})` : ""}`);
             // The only place upstream headers reach the log: what fail() records is the
             // envelope sent to the client, which drops server/retry-after/x-request-id.
-            logUpstreamResponse(id, status, Buffer.from(text), upstreamRaw.headers);
+            logUpstreamResponse(id, sessionFile, status, Buffer.from(text), upstreamRaw.headers);
             if (isRetryableStatus(status) && canRetry())
               return scheduleRetry(
                 myAttempt,
@@ -585,12 +936,13 @@ async function handleMessages(req, res, body) {
           });
           upstreamRes.on("end", () => {
             const raw = Buffer.concat(chunks);
-            logUpstreamResponse(id, upstreamStatus, cap(raw)[0]);
+            logUpstreamResponse(id, sessionFile, upstreamStatus, cap(raw)[0]);
             try {
               const msg = translateCompletion(JSON.parse(raw.toString()), ctx);
               loggedResponse = true;
               logResponse({
                 id,
+                sessionFile,
                 started,
                 status: 200,
                 body: JSON.stringify(msg),
@@ -654,7 +1006,7 @@ async function handleMessages(req, res, body) {
               "x-accel-buffering": "no",
             });
             res.flushHeaders();
-            logUpstreamResponse(id, upstreamStatus, cap(raw)[0]);
+            logUpstreamResponse(id, sessionFile, upstreamStatus, cap(raw)[0]);
             writeEvent("message_start", {
               type: "message_start",
               message: {
@@ -663,6 +1015,9 @@ async function handleMessages(req, res, body) {
                 stop_reason: null,
                 stop_sequence: null,
                 usage: {
+                  // The live per-agent counter reads this off the streamed event; the estimate is
+                  // its only growth signal. anthropicUsage floors input_tokens at 1 so the
+                  // statusline merge overwrites this with the real value (no cached-prefix double-count).
                   input_tokens: est,
                   output_tokens: 1,
                   cache_creation_input_tokens: 0,
@@ -727,6 +1082,9 @@ async function handleMessages(req, res, body) {
           if (payload.trim() === "[DONE]") {
             sawDone = true;
             translator.done();
+            // When the translator handed the turn to the advisor hook, the hook owns the rest
+            // of the stream (async: it runs the advisor + continuation). Do not finalize here.
+            if (translator.advisorHandoff) return;
             res.end();
             finalize("completed");
             return;
@@ -757,7 +1115,7 @@ async function handleMessages(req, res, body) {
 
         upstreamRes.on("data", (chunk) => {
           lastActivity = Date.now();
-          if (LOG_FILE && (DEBUG_MAX_BODY <= 0 || upstreamSize < DEBUG_MAX_BODY)) {
+          if (sessionFile && (DEBUG_MAX_BODY <= 0 || upstreamSize < DEBUG_MAX_BODY)) {
             upstreamChunks.push(chunk);
             upstreamSize += chunk.length;
           }
@@ -777,6 +1135,7 @@ async function handleMessages(req, res, body) {
           if (!sawDone) {
             translator.done();
             diagnostics.push("upstream ended without [DONE]");
+            if (translator.advisorHandoff) return; // hook owns the rest (async)
             res.end();
             finalize(terminalNote());
           }
@@ -845,6 +1204,16 @@ function send(res, status, data, extraHeaders) {
   res.end(JSON.stringify(data));
 }
 
+// Both handlers are async. An unhandled rejection terminates the process on Node 22, so an
+// error in one mode would take down every in-flight session in the other.
+function proxyFailure(res) {
+  return (err) => {
+    console.error(err);
+    if (!res.headersSent)
+      send(res, 500, { type: "error", error: { type: "api_error", message: "proxy failure" } });
+  };
+}
+
 function cors(res) {
   res.writeHead(204, {
     "access-control-allow-origin": "*",
@@ -860,32 +1229,45 @@ function isTruthy(value) {
   return value != null && !["", "0", "false", "no", "off"].includes(value.toLowerCase());
 }
 
-function openDebugLog() {
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  for (const dir of [debugDir(), path.join(os.tmpdir(), "corti-claude-proxy")]) {
-    const file = path.join(dir, `gateway-${stamp}.log`);
+function writeBanner(file) {
+  fs.appendFileSync(
+    file,
+    [
+      `=== corti-claude-proxy debug log ===`,
+      `started:  ${new Date().toISOString()}`,
+      `pid:      ${process.pid}`,
+      `upstream (openai):    ${UPSTREAM_OPENAI}`,
+      `upstream (anthropic): ${UPSTREAM_ANTHROPIC}`,
+      `body cap: ${DEBUG_MAX_BODY > 0 ? `${DEBUG_MAX_BODY} bytes` : "unlimited"}`,
+      "",
+      "",
+    ].join("\n"),
+    { mode: 0o600 },
+  );
+}
+
+// Resolves the per-session log file for a request. Advisor children carry
+// x-corti-advisor-for (their parent's id) and file under the parent; everything else
+// keys on its own x-claude-code-session-id; requests with neither share one untracked file.
+// Must be called once per request, synchronously, where req is in scope — the returned path
+// is threaded into async closures (finalize/teeResponse) that fire after the handler returns.
+function sessionLogFile(req) {
+  const advisorFor = req.headers["x-corti-advisor-for"];
+  const sessionId = advisorFor || req.headers["x-claude-code-session-id"];
+  const key = sessionId || "__untracked__";
+  let file = sessionFiles.get(key);
+  if (!file) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const shortId = sessionId ? sessionId.slice(0, 12) : "untracked";
+    file = path.join(LOG_DIR, `gateway-session-${shortId}-${stamp}.log`);
+    sessionFiles.set(key, file);
     try {
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      fs.appendFileSync(
-        file,
-        [
-          `=== corti-claude-proxy debug log ===`,
-          `started:  ${new Date().toISOString()}`,
-          `pid:      ${process.pid}`,
-          `mode:     ${MODE}`,
-          `upstream: ${UPSTREAM}`,
-          `body cap: ${DEBUG_MAX_BODY > 0 ? `${DEBUG_MAX_BODY} bytes` : "unlimited"}`,
-          "",
-          "",
-        ].join("\n"),
-        { mode: 0o600 },
-      );
-      return file;
+      writeBanner(file);
     } catch (err) {
-      console.error(`corti-proxy: cannot write debug log to ${dir}: ${err.message}`);
+      console.error(`corti-proxy: cannot write debug log to ${file}: ${err.message}`);
     }
   }
-  return null;
+  return file;
 }
 
 function debugDir() {
@@ -897,37 +1279,45 @@ function debugDir() {
 }
 
 // One entry per write: concurrent requests would otherwise interleave mid-entry.
-function writeEntry(lines) {
-  if (!LOG_FILE) return;
+function writeEntry(sessionFile, lines) {
+  if (!sessionFile) return;
   try {
-    fs.appendFileSync(LOG_FILE, `${lines.join("\n")}\n\n`, { mode: 0o600 });
+    fs.appendFileSync(sessionFile, `${lines.join("\n")}\n\n`, { mode: 0o600 });
   } catch (err) {
     console.error(`corti-proxy: debug log write failed: ${err.message}`);
   }
 }
 
-function logRequest(id, req, target, body) {
-  if (!LOG_FILE) return;
-  writeEntry([
-    `=== #${id} REQUEST ${new Date().toISOString()} ===`,
+function logRequest(id, sessionFile, req, target, body) {
+  if (!sessionFile) return;
+  const advisorFor = req.headers["x-corti-advisor-for"];
+  // Fallback tag when the advisor's parent-id header didn't round-trip (CLI below 2.1.227):
+  // still recognizable as an advisor turn, filed under the child's own session.
+  const tag = advisorFor
+    ? ` [advisor for ${advisorFor.slice(0, 12)}]`
+    : wantsNoAdvisor(req)
+      ? " [advisor]"
+      : "";
+  writeEntry(sessionFile, [
+    `=== #${id} REQUEST${tag} ${new Date().toISOString()} ===`,
     `${req.method} ${req.url}${target ? ` -> ${target}` : " (handled locally)"}`,
     `headers: ${JSON.stringify(redact(req.headers))}`,
     ...formatBody(...cap(body)),
   ]);
 }
 
-function logUpstreamRequest(id, url, body) {
-  if (!LOG_FILE) return;
-  writeEntry([
+function logUpstreamRequest(id, sessionFile, url, body) {
+  if (!sessionFile) return;
+  writeEntry(sessionFile, [
     `=== #${id} UPSTREAM-REQUEST ${new Date().toISOString()} ===`,
     `POST ${url}`,
     ...formatBody(...cap(body)),
   ]);
 }
 
-function logUpstreamResponse(id, status, body, headers) {
-  if (!LOG_FILE) return;
-  writeEntry([
+function logUpstreamResponse(id, sessionFile, status, body, headers) {
+  if (!sessionFile) return;
+  writeEntry(sessionFile, [
     `=== #${id} UPSTREAM-RESPONSE ${new Date().toISOString()} ===`,
     `status: ${status ?? "none"}`,
     ...(headers ? [`headers: ${JSON.stringify(redact(headers))}`] : []),
@@ -935,9 +1325,9 @@ function logUpstreamResponse(id, status, body, headers) {
   ]);
 }
 
-function logResponse({ id, started, status, headers, body, note, diagnostics, truncated }) {
-  if (!LOG_FILE) return;
-  writeEntry([
+function logResponse({ id, sessionFile, started, status, headers, body, note, diagnostics, truncated }) {
+  if (!sessionFile) return;
+  writeEntry(sessionFile, [
     `=== #${id} RESPONSE ${new Date().toISOString()} (${Date.now() - started}ms) ===`,
     `status: ${status ?? "none"}${note ? ` — ${note}` : ""}`,
     ...(headers ? [`headers: ${JSON.stringify(redact(headers))}`] : []),
@@ -946,7 +1336,7 @@ function logResponse({ id, started, status, headers, body, note, diagnostics, tr
   ]);
 }
 
-function teeResponse(id, started, upstream, res) {
+function teeResponse(id, sessionFile, started, upstream, res) {
   const chunks = [];
   let size = 0;
   let truncated = false;
@@ -972,6 +1362,7 @@ function teeResponse(id, started, upstream, res) {
     logged = true;
     logResponse({
       id,
+      sessionFile,
       started,
       status: upstream.statusCode,
       headers: upstream.headers,
