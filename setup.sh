@@ -1,5 +1,5 @@
 #!/bin/sh
-# corti-claude-proxy setup — installs the corti-claude wrapper.
+# corti-claude setup — installs the corti-claude wrapper.
 # Run from the repo root: ./setup.sh   (./setup.sh --help for options)
 #
 # Ordering rule: every check runs before anything is written.
@@ -27,7 +27,7 @@ CC_UNINSTALL=0
 
 usage() {
   cat <<EOF
-corti-claude-proxy setup
+corti-claude setup
 
 Usage: ./setup.sh [options]
 
