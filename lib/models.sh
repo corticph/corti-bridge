@@ -13,8 +13,8 @@ models_env_get() {
 models_summary() {
   _md_ctx="$(models_env_get "$1" CLAUDE_CODE_MAX_CONTEXT_TOKENS || true)"
   _md_fable="$(models_env_get "$1" ANTHROPIC_DEFAULT_FABLE_MODEL || true)"
-  [ -n "$_md_fable" ] && _md_summary_row fable "$_md_fable" "$1" "(beta-tier)"
-  _md_summary_row opus "$(models_env_get "$1" ANTHROPIC_DEFAULT_OPUS_MODEL || true)" "$1" "(your heaviest model, $_md_ctx ctx)"
+  [ -n "$_md_fable" ] && _md_summary_row fable "$_md_fable" "$1" "(your heaviest, beta-tier)"
+  _md_summary_row opus "$(models_env_get "$1" ANTHROPIC_DEFAULT_OPUS_MODEL || true)" "$1" "(your heavy model, $_md_ctx ctx)"
   _md_summary_row sonnet "$(models_env_get "$1" ANTHROPIC_DEFAULT_SONNET_MODEL || true)" "$1" ""
   _md_summary_row haiku "$(models_env_get "$1" ANTHROPIC_DEFAULT_HAIKU_MODEL || true)" "$1" "(your fastest)"
   ui_pair "context" "$_md_ctx"

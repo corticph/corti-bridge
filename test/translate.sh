@@ -352,6 +352,15 @@ process.env.CORTI_ADVISOR = "off";
 check("gate: off + anthropic → OFF", injected(await runGate({ mode: "anthropic" })), false);
 delete process.env.CORTI_ADVISOR;
 
+// Case-insensitive and whitespace-tolerant: OFF (uppercase) and padded ON parse as off/on,
+// not as unrecognized values that silently fall back to the mode default.
+process.env.CORTI_ADVISOR = "OFF";
+check("gate: OFF (uppercase) + openai → OFF", injected(await runGate({ mode: "openai" })), false);
+delete process.env.CORTI_ADVISOR;
+process.env.CORTI_ADVISOR = " ON ";
+check("gate: padded ON + anthropic → ON", injected(await runGate({ mode: "anthropic" })), true);
+delete process.env.CORTI_ADVISOR;
+
 // skipAdvisor:true → OFF in both modes (wins over on, and over the openai default-on).
 process.env.CORTI_ADVISOR = "on";
 check("gate: skipAdvisor wins over on (openai)", injected(await runGate({ skipAdvisor: true, mode: "openai" })), false);

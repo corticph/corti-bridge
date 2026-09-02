@@ -156,17 +156,19 @@ Separately, silence *before* upstream sends response headers now has its own dea
 
 ## Debug logging
 
-Set `CORTI_DEBUG` and the gateway writes every request and response to a timestamped file, one per gateway start:
+Set `CORTI_DEBUG` and the gateway writes every request and response to a **per-session** log file — one file per Claude Code session (keyed on `x-claude-code-session-id`), not one per gateway start:
 
 ```bash
 CORTI_DEBUG=1 corti-claude
 ```
 
-The wrapper prints the log path on startup, and `/health` reports it too:
+Each session's traffic lands in its own file under the debug directory, named `gateway-session-<shortId>-<timestamp>.log`. Advisor consults file under their parent session's id (via `x-corti-advisor-for`), so an advisor turn appears in the same file as the executor request that spawned it; requests carrying no session id share one `__untracked__` file.
+
+The wrapper prints the log directory on startup, and `/health` reports it too — note `debug` is the log **directory**, not a file path (or `false` when `CORTI_DEBUG` is unset):
 
 ```bash
 curl -s http://127.0.0.1:4192/health
-# {"status":"healthy","gatewayVersion":2,"mode":"openai","upstream":"https://ai.eu.corti.app/v1","debug":"/Users/you/Library/Logs/corti-claude-proxy/gateway-2026-01-01T00-00-00-000Z.log"}
+# {"status":"healthy","gatewayVersion":2,"mode":"openai","upstream":"https://ai.eu.corti.app/v1","debug":"/Users/you/Library/Logs/corti-claude-proxy"}
 #
 # `mode` is not a process-wide setting — it reports what a request carrying no path prefix
 # resolves to, which is what the wrapper compares when deciding whether to restart.
