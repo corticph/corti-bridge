@@ -1,74 +1,75 @@
 <p align="center">
-  <img src="corti-clawd.png" width="180" alt="corti-claude-proxy logo"/>
+  <img src="https://raw.githubusercontent.com/corticph/corti-claude/main/corti-clawd.png" width="180" alt="corti-claude logo"/>
 </p>
 
-# corti-claude-proxy
+# corti-claude
 
-Local gateway that lets Claude Code talk to Corti's OpenAI-compatible API while speaking Anthropic Messages to the client. Claude Code sends Anthropic Messages to localhost; the proxy translates them to OpenAI Chat Completions against `CORTI_BASE_URL`, swaps in the real auth header, and translates responses back — including streaming. No dependencies, no build step.
+Run Claude Code on [Corti Models](https://docs.corti.ai/models/welcome.md) — a local gateway that translates Anthropic Messages to OpenAI Chat Completions and back, including streaming. No dependencies, no build step.
+
+&nbsp;
 
 ## What it does
 
 - **Bidirectional translation** — Anthropic Messages ⇄ OpenAI Chat Completions both ways: system prompts, tools, model names, tool_use/tool_result pairing, thinking config, and images
 - **Streaming** — SSE; parallel tool calls round-trip by index
-- **Pass-through mode** — `--anthropic` skips translation and forwards to Corti's `/anthropic` endpoint (auth swap only); `openai` translation is the default. One gateway serves both routes at once, so switching costs no restart and leaves other sessions alone
 - **Auth swap** — discards the client's token, sends `CORTI_BEARER` upstream; writes nothing to any `settings.json`, so a plain `claude` session stays on Anthropic models
-- **Model tiers** — maps fable/opus/sonnet/haiku to Corti models by model-ID shape, so a new generation needs no code change
+- **Model tiers** — maps fable/opus/sonnet/haiku to Corti S1 models by model-ID shape, so a new generation needs no code change
 - **WebSearch** — converted to a function tool, results intercepted via Tavily with a keyless DuckDuckGo fallback
-- **Upstream retries** — bounded, pre-stream retry with back-off absorbs the empty-bodied `5xx` bursts Corti's edge emits, which are otherwise too fast for Claude Code's own retry ladder to outlast
-- **Persistent gateway** — keeps running between sessions and auto-restarts when stale (moved base URL, old build)
-
-&nbsp;
-
-## Prerequisites
-
-- A Corti account and Corti-issued credentials — there is no other upstream
-- `CORTI_BEARER` and `CORTI_BASE_URL` set in your shell environment (normally exported by Corti's CLI after `npx @corti/cli models init`)
-- Node.js 20 or newer
-
-Both `setup.sh` and `bin/corti-claude` are POSIX `sh`, so they run under bash, zsh, or dash regardless of your login shell (fish included — it execs scripts via their shebang).
+- **Resilient gateway** — keeps running between sessions, auto-restarts when stale, and retries transient upstream `5xx` bursts before the client ever sees them
+- **Diagnostics & model picker** — `corti-claude doctor` checks the install, gateway, and state; `corti-claude models` picks which Corti S1 model backs each tier
 
 &nbsp;
 
 ## Quick start
 
-```bash
-git clone https://github.com/corticph/corti-claude-proxy ~/projects/corti-claude-proxy
-cd ~/projects/corti-claude-proxy
-./setup.sh        # checks deps + creds, installs the wrapper, picks models
-corti-claude      # starts the gateway if needed, then launches claude
-```
-
-Clone wherever you like — `setup.sh` records the clone's real path in the installed wrapper. Re-running `./setup.sh` is safe; `--yes` accepts every prompt for an unattended install.
-
-The wrapper starts the gateway on `127.0.0.1:4192` if it isn't running (and restarts it if it's stale), points Claude Code at it, then launches `claude`.
+Requires a Corti account (`CORTI_BEARER`/`CORTI_BASE_URL` from `npx @corti/cli models init` — see the [Corti Models docs](https://docs.corti.ai/models/welcome.md)) and Node.js 20+. POSIX `sh`, so it runs under any shell.
 
 ```bash
-corti-claude --stop       # stop the gateway and exit
-corti-claude --restart    # stop then start it (needs CORTI_BEARER/CORTI_BASE_URL)
-corti-claude --anthropic  # thin pass-through to Corti's /anthropic endpoint
-corti-claude --help       # full flag reference
+git clone https://github.com/corticph/corti-claude
+cd corti-claude
+./setup.sh     # checks deps + creds, installs the wrapper, picks models
+corti-claude   # starts the gateway if needed, then launches claude
 ```
+
+Re-running `./setup.sh` is safe; `--yes` skips the prompts for an unattended install.
+
+&nbsp;
+
+## Usage
+
+```bash
+corti-claude                 # start the gateway if needed, then launch claude
+corti-claude models          # pick which Corti model backs each tier
+corti-claude doctor          # diagnose the install, gateway, and state
+corti-claude theme           # print the lime-mascot TUI theme + install steps
+corti-claude restart         # stop then start (needs CORTI_BEARER/CORTI_BASE_URL)
+corti-claude --stop          # stop the gateway
+corti-claude help            # full reference
+corti-claude --anthropic     # pass-through mode (escape hatch; some features unavailable)
+```
+
+The gateway runs on `127.0.0.1:4192` and outlives any single session; the wrapper auto-restarts it when stale (moved base URL, old build).
 
 &nbsp;
 
 ## How it works
 
-Claude Code sends Anthropic Messages requests to localhost; the proxy translates them to OpenAI Chat Completions against `CORTI_BASE_URL`, swaps in the real auth header, and translates responses back. The default `openai` mode is a translating gateway; `--anthropic` is a thin pass-through with no translation. Use `openai` unless you have a reason not to — `anthropic` mode currently drops input-token accounting on streaming, so context and cost readouts stop working. See [GUIDE.md](GUIDE.md) for the full mechanics, trade-offs, and known degradations.
+The default `openai` mode is a translating gateway: Anthropic Messages in, OpenAI Chat Completions to `CORTI_BASE_URL`, responses translated back. `--anthropic` is a thin pass-through with no translation — an escape hatch only, since streaming drops input-token accounting (context and cost readouts stop working). See [GUIDE.md](GUIDE.md) for the full mechanics, trade-offs, and known degradations.
 
-Model mapping lives in `~/.corti-claude/models.env`, written by `setup.sh` from Corti's catalog. Only the wrapper reads it — it exports the aliases as process-scoped environment variables, so Corti model IDs never leak into a plain `claude` session. Run one outside the wrapper and it still talks to Anthropic with Anthropic's models.
+Model mapping lives in `~/.corti-claude/models.env`, written by `setup.sh` from Corti's catalog. The wrapper exports it as process-scoped env, so Corti model IDs never leak into a plain `claude` session.
 
 &nbsp;
 
 ## Files
 
 ```
-corti-claude-proxy/
+corti-claude/
 ├── gateway.mjs         # The server: routing, phases, upstream client, logging
 ├── translate.mjs       # All wire-format logic: request/response/SSE translation, errors
 ├── bin/corti-claude    # Wrapper: starts the proxy, launches claude
 ├── setup.sh            # Installer
 ├── lib/                # Shell + JS helpers sourced by setup.sh and the wrapper
-└── test/               # smoke.sh (install + idempotency), translate.sh (pure-function)
+└── test/               # smoke, translate, retry, dispatch, models — each a self-contained suite
 ```
 
 After install, the runtime layout is:
@@ -94,15 +95,6 @@ Read directly from the shell — no local secrets file.
 | `CORTI_ADVISOR` | no | `auto` (default) — the `consult_advisor` advisor tool is on in `openai` mode, off in `anthropic` mode; `on`/`off` force both modes. Spawns a headless Opus-tier consult on the request path. See [GUIDE.md](GUIDE.md) for the advisor mechanism, the experimental `anthropic`-mode caveat, and `CORTI_ADVISOR_*` tuning. |
 
 `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, and `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` are exported by the wrapper itself — plumbing this tool owns, not something you configure. The full variable reference (search backends, reasoning mode, debug caps, state directories) is in [GUIDE.md](GUIDE.md).
-
-&nbsp;
-
-## Tests
-
-```bash
-sh test/smoke.sh       # sandboxed install + idempotency; runs against a scratch HOME
-sh test/translate.sh   # pure-function tests for translate.mjs; offline, no credentials
-```
 
 &nbsp;
 

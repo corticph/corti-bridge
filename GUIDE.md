@@ -1,4 +1,4 @@
-# corti-claude-proxy — Guide
+# corti-claude — Guide
 
 The README sells. This document explains — the translation surface, the model-ranking program, the installer, and every known trade-off and degradation. Read it when something isn't behaving the way you expected, or before you change how the gateway works.
 
@@ -107,6 +107,16 @@ Edit `models.env` directly — hand edits stick until the next `--fresh` overwri
 
 The default flow never touches an existing `models.env`; `--fresh` is the only thing that overwrites it.
 
+For per-tier overrides without a full re-fetch, use the interactive picker:
+
+```bash
+corti-claude models                   # pick a model for each tier; a non-default choice pins it
+corti-claude models --experimental    # include beta models in the candidate lists
+corti-claude models --reset           # clear all pins and re-rank from scratch
+```
+
+The picker fetches the catalog on the spot and writes `models.env` with a `_PIN=1` line for any tier you changed; pressing Enter keeps the auto-rank pick and unpins. Its candidate lists come from the same `lib/models.mjs` as the ranker, so the menu and the auto-rank can't drift.
+
 ### Pinning the fable tier
 
 You can pin the fable tier by hand: add `ANTHROPIC_DEFAULT_FABLE_MODEL_PIN="1"` to `models.env` beside the `ANTHROPIC_DEFAULT_FABLE_MODEL` you want (`_NAME` and `_SUPPORTED_CAPABILITIES` ride along if present). A pinned model is carried through verbatim — it survives `--fresh`, bypasses the duplicate check, and doesn't need to be in the catalog at all. It's the one hand-added line a refresh preserves.
@@ -125,16 +135,16 @@ Note that `~/.corti-claude` (the proxy's state directory, `CC_PROXY_CONFIG_DIR`)
 
 ## The gateway
 
-`corti-claude` starts a local gateway on `127.0.0.1:4192` (set `CORTI_PORT` to move it) the first time you run it, and it **outlives any single session** — it keeps running after `corti-claude` exits, so the next session starts fast. That also means there's no first-class way to stop it just by quitting Claude Code. Two flags manage it:
+`corti-claude` starts a local gateway on `127.0.0.1:4192` (set `CORTI_PORT` to move it) the first time you run it, and it **outlives any single session** — it keeps running after `corti-claude` exits, so the next session starts fast. That also means there's no first-class way to stop it just by quitting Claude Code. The gateway is managed with `--stop` and `restart`:
 
 ```bash
 corti-claude --stop       # stop the gateway and exit
-corti-claude --restart    # stop then start it (needs CORTI_BEARER/CORTI_BASE_URL)
+corti-claude restart      # stop then start it (needs CORTI_BEARER/CORTI_BASE_URL)
 ```
 
-`--stop` needs nothing — not even credentials — so it works when something's wrong. `--restart` checks credentials *before* stopping, so a typo'd `CORTI_BEARER` won't take down a working gateway. Stopping a gateway that's already stopped is not an error.
+`--stop` is a flag, not a bare command: `claude`'s own `stop|kill <id>` subcommand passes through the wrapper to stop a background session, and a bare `stop` would intercept it and silently kill the gateway instead. `restart` is safe as a bare command because `claude` uses `respawn`, not `restart`, for background sessions — no collision. The other subcommands (`doctor`, `models`, `theme`) shadow `claude`-verb equivalents that are low-value when proxied (`doctor` checks the Claude Code install, which the wrapper leaves healthy) or that don't exist (`models`, `theme`), so the proxy's command is the useful one. `--stop` needs nothing — not even credentials — so it works when something's wrong. `restart` checks credentials *before* stopping, so a typo'd `CORTI_BEARER` won't take down a working gateway. Stopping a gateway that's already stopped is not an error.
 
-Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require restarting the gateway: the gateway doesn't read `models.env` (the wrapper does, at launch), so a new mapping takes effect the next time you run `corti-claude`. You only need `--restart` if you've changed `CORTI_BASE_URL` — and even then, a normal `corti-claude` run detects the staleness and restarts it for you. Switching `--anthropic` never needs one: both modes are always being served.
+Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require restarting the gateway: the gateway doesn't read `models.env` (the wrapper does, at launch), so a new mapping takes effect the next time you run `corti-claude`. You only need `restart` if you've changed `CORTI_BASE_URL` — and even then, a normal `corti-claude` run detects the staleness and restarts it for you. Switching `--anthropic` never needs one: both modes are always being served.
 
 ## Upstream failures and retries
 
@@ -156,15 +166,17 @@ Separately, silence *before* upstream sends response headers now has its own dea
 
 ## Debug logging
 
-Set `CORTI_DEBUG` and the gateway writes every request and response to a **per-session** log file — one file per Claude Code session (keyed on `x-claude-code-session-id`), not one per gateway start:
+For a first pass when something's off, run `corti-claude doctor` — it checks the install, gateway health, and state files passively (add `--deep` to also probe Corti's `/models` endpoint). If a specific request looks wrong, reach for the debug log below.
+
+Set `CORTI_DEBUG` and the gateway writes every request and response to a log file, one per Claude Code session:
 
 ```bash
 CORTI_DEBUG=1 corti-claude
 ```
 
-Each session's traffic lands in its own file under the debug directory, named `gateway-session-<shortId>-<timestamp>.log`. Advisor consults file under their parent session's id (via `x-corti-advisor-for`), so an advisor turn appears in the same file as the executor request that spawned it; requests carrying no session id share one `__untracked__` file.
+Each session's traffic lands in its own file — `gateway-session-<sessionId>-<timestamp>.log` — keyed by the session id Claude Code sends (`x-claude-code-session-id`). Advisor children file under the parent's session instead (`x-corti-advisor-for`), so an advisor consult stays in the parent's log. Untracked requests (no session id) share a single `gateway-session-untracked-*.log`.
 
-The wrapper prints the log directory on startup, and `/health` reports it too — note `debug` is the log **directory**, not a file path (or `false` when `CORTI_DEBUG` is unset):
+The wrapper prints the log directory on startup, and `/health` reports it as `debug` (the directory, or `false` when logging is off):
 
 ```bash
 curl -s http://127.0.0.1:4192/health

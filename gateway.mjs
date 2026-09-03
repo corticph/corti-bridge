@@ -699,8 +699,9 @@ async function handleMessages(req, res, body) {
               if (finalized || clientGone) return resolve();
               try {
                 const msg = translateCompletion(JSON.parse(Buffer.concat(chunks).toString()), ctx);
-                // Stream the continuation content as more content_block events under this message.
-                let idx = translator ? translator.nextBlockIndex : resIdx + 1;
+                // Continuation content blocks resume after the synthetic advisor blocks (srvIdx, resIdx).
+                // writeEvent bypasses the translator, so nextBlockIndex isn't advanced past them.
+                let idx = resIdx + 1;
                 for (const block of msg.content) {
                   const skeleton =
                     block.type === "tool_use" ? { ...block, input: {} } :

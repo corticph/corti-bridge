@@ -40,9 +40,10 @@ Two files carry almost everything; the split is deliberate and worth preserving:
 
 Supporting pieces:
 
-- **`bin/corti-claude`** — POSIX sh wrapper installed to `~/.local/bin`. Owns gateway lifecycle (per-port pid file, `/health` payload check, stale-gateway auto-restart), reads `~/.corti-claude/models.env`, and exports model aliases + `ANTHROPIC_BASE_URL` as process-scoped env before launching `claude`. The gateway never reads `models.env` — only the wrapper does, at launch. Nothing is ever written to any `settings.json`.
-- **`setup.sh` + `lib/*.sh`** — installer (dep/cred preflight, PATH block, model catalog fetch). Re-runnable; `--yes` for unattended, `--fresh` to re-fetch the catalog.
-- **`lib/models.mjs`** — ranks Corti's catalog into fable/opus/sonnet/haiku tiers by model-ID *shape* (size/speed/channel suffixes), not hardcoded names, so a new model generation needs no code change. Emits `models.env`.
+- **`bin/corti-claude`** — POSIX sh wrapper installed to `~/.local/bin`. Owns gateway lifecycle (per-port pid file, `/health` payload check, stale-gateway auto-restart), reads `~/.corti-claude/models.env`, and exports model aliases + `ANTHROPIC_BASE_URL` as process-scoped env before launching `claude`. Also dispatches subcommands: `doctor` (diagnostics), `models` (interactive tier picker), `theme` (prints the lime-mascot TUI theme + install steps — no writes). The gateway never reads `models.env` — only the wrapper does, at launch. Nothing is ever written to any `settings.json`.
+- **`setup.sh` + `lib/*.sh`** — installer. Preflight checks deps then creds before writing anything; a partial install exits 1 rather than leaving a half-configured state. Offers a profile menu (which Claude Code config dir Corti sessions use) and fetches the model catalog. Re-runnable; `--yes` for unattended, `--fresh` to re-fetch the catalog.
+- **`lib/models.mjs`** — ranks Corti's catalog into fable/opus/sonnet/haiku tiers by model-ID *shape* (size/speed/channel suffixes), not hardcoded names, so a new model generation needs no code change. Emits `models.env`; also serves the picker's candidate lists (`--candidates`/`--emit`) so the menu and the ranker can't drift.
+- **`lib/doctor.sh`** — `corti-claude doctor`: ~18 passive checks on the install, gateway, and state, plus an active `/models` probe under `--deep`. Doctor output goes to stdout (a report) — a deliberate exception to the `ui_*`→stderr invariant, so `doctor | grep FAIL` and `doctor > file` work.
 - **`lib/retry.mjs`** — the upstream retry policy as pure functions/constants, tested in isolation.
 
 ### Mode dispatch
@@ -69,7 +70,7 @@ One gateway process serves both modes simultaneously, chosen per request by URL 
 **Other known sharp edges:**
 
 - `estimateTokens` (chars/4) undercounts real `prompt_tokens` by up to ~65% on long sessions. The overflow guard uses it, so it won't trip near the real 262k ceiling — with auto-compact off, sessions can die suddenly at the wall. Known, deliberately left; fix would be tracking real prompt_tokens.
-- Deploying wrapper (`bin/corti-claude`) changes requires `./setup.sh` (it copies the wrapper to `~/.local/bin`); gateway/translate changes require `corti-claude --restart`. Avoid `--restart` while an advisor consult is in flight — it kills the continuation.
+- Deploying wrapper (`bin/corti-claude`) changes requires `./setup.sh` (it copies the wrapper to `~/.local/bin`); gateway/translate changes require `corti-claude restart`. Avoid `restart` while an advisor consult is in flight — it kills the continuation.
 - Advisor sessions: children are marked via a `-noadvisor-` token placed *before* the mode marker (matched with `includes("-noadvisor-")`, not `endsWith`); they skip the 120s stream-idle watchdog and the advisor intercept (recursion guard). Debug logs are per-session (`x-claude-code-session-id`); advisor children log into the parent's file via `x-corti-advisor-for` through `ANTHROPIC_CUSTOM_HEADERS`.
 - Three context readouts legitimately disagree: `/context` shows the harness's own estimate of the raw Anthropic body; the statusline shows the model's real usage from the *last successful* turn; the proxy's `count_tokens` is a local char/4 estimate. Divergence alone is not a bug.
 - `test/models.sh` covers `lib/models.mjs` tier/caps logic against captured fixtures; it should stay green.
