@@ -189,6 +189,21 @@ models_pick() {
     case "$_mp_arg" in
       --experimental) _mp_exp=1 ;;
       --reset) _mp_reset=1 ;;
+      --help|-h)
+        cat <<EOF
+corti-claude models - pick which Corti model backs each Claude Code tier.
+
+Usage: corti-claude models [--experimental] [--reset]
+
+  (default)        Interactively pick a model for each tier (needs CORTI_BEARER/CORTI_BASE_URL)
+  --experimental   Include beta models in the candidate lists
+  --reset          Clear all pins and re-rank from scratch, no prompts
+
+A chosen model is pinned in models.env; pressing Enter keeps the auto-rank pick
+and unpins. Changes take effect on your next corti-claude session.
+EOF
+        return 0
+        ;;
       *) ;;
     esac
   done
@@ -227,8 +242,8 @@ models_pick() {
   for _mp_tier in fable opus sonnet haiku; do
     _mp_role=""
     case "$_mp_tier" in
-      fable) _mp_role="(your heaviest model)" ;;
-      opus) _mp_role="" ;;
+      fable) _mp_role="(beta-tier, above opus)" ;;
+      opus) _mp_role="(your heaviest model)" ;;
       sonnet) _mp_role="" ;;
       haiku) _mp_role="(your fastest)" ;;
     esac

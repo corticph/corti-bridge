@@ -144,6 +144,49 @@ case "${1:-}" in
         models_pick "$@"
         exit $?
         ;;
+    theme)
+        # Prints the lime-mascot TUI theme + the steps to install it by hand. Writes
+        # nothing itself: enabling a theme means editing settings.json, which the
+        # wrapper never does (CLAUDE.md invariant). This just fills in the real config
+        # dir so the user can copy-paste.
+        _cc_profile="$CORTI_DIR"
+        if [ -f "$CORTI_DIR/profile.env" ]; then
+            . "$CORTI_DIR/profile.env"
+            _cc_profile="${CLAUDE_CONFIG_DIR:-$CORTI_DIR}"
+        fi
+        cat <<EOF
+corti-claude theme — the lime-mascot TUI theme, and how to install it.
+
+A cosmetic theme for the Claude Code TUI: recolors the Claude/mascot wordmark
+lime green. This command writes nothing — enabling a theme means editing
+settings.json, which this tool never does. Two steps to install by hand:
+
+1. Create the themes dir and save this as lime-mascot.json:
+
+   mkdir -p "$_cc_profile/themes"
+
+   {
+     "name": "lime-mascot",
+     "base": "dark",
+     "overrides": {
+       "claude": "rgb(184,248,22)",
+       "clawd_body": "rgb(184,248,22)",
+       "briefLabelClaude": "rgb(184,248,22)",
+       "claudeShimmer": "rgb(220,255,120)"
+     }
+   }
+
+2. Add this key to settings.json (create the file if it doesn't exist):
+
+   "$_cc_profile/settings.json"
+
+     "theme": "custom:lime-mascot"
+
+Start a new corti-claude session to see it. Remove the "theme" key to revert.
+EOF
+        unset _cc_profile
+        exit 0
+        ;;
     --help|-h)
         cat >&2 <<EOF
 corti-claude — Claude Code on Corti models.
@@ -153,6 +196,7 @@ Usage: corti-claude [--anthropic] [args passed to claude]
        corti-claude --restart
        corti-claude doctor [--deep]
        corti-claude models [--experimental] [--reset]
+       corti-claude theme
 
   (default)    Start the gateway if needed, then launch claude
   --anthropic  Use Corti's /anthropic pass-through mode (default: openai translator)
@@ -163,6 +207,7 @@ Usage: corti-claude [--anthropic] [args passed to claude]
   models       Interactively pick which Corti model backs each tier (needs creds)
   models --reset     Clear all pins and re-rank from scratch, no prompts
   models --experimental  Include beta models in the lists
+  theme        Print the lime-mascot TUI theme and install instructions (no writes)
   --help       Show this
 EOF
         exit 0

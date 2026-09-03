@@ -1,4 +1,4 @@
-# corti-claude-proxy — Guide
+# corti-claude — Guide
 
 The README sells. This document explains — the translation surface, the model-ranking program, the installer, and every known trade-off and degradation. Read it when something isn't behaving the way you expected, or before you change how the gateway works.
 
@@ -107,6 +107,16 @@ Edit `models.env` directly — hand edits stick until the next `--fresh` overwri
 
 The default flow never touches an existing `models.env`; `--fresh` is the only thing that overwrites it.
 
+For per-tier overrides without a full re-fetch, use the interactive picker:
+
+```bash
+corti-claude models                   # pick a model for each tier; a non-default choice pins it
+corti-claude models --experimental    # include beta models in the candidate lists
+corti-claude models --reset           # clear all pins and re-rank from scratch
+```
+
+The picker fetches the catalog on the spot and writes `models.env` with a `_PIN=1` line for any tier you changed; pressing Enter keeps the auto-rank pick and unpins. Its candidate lists come from the same `lib/models.mjs` as the ranker, so the menu and the auto-rank can't drift.
+
 ### Pinning the fable tier
 
 You can pin the fable tier by hand: add `ANTHROPIC_DEFAULT_FABLE_MODEL_PIN="1"` to `models.env` beside the `ANTHROPIC_DEFAULT_FABLE_MODEL` you want (`_NAME` and `_SUPPORTED_CAPABILITIES` ride along if present). A pinned model is carried through verbatim — it survives `--fresh`, bypasses the duplicate check, and doesn't need to be in the catalog at all. It's the one hand-added line a refresh preserves.
@@ -156,17 +166,21 @@ Separately, silence *before* upstream sends response headers now has its own dea
 
 ## Debug logging
 
-Set `CORTI_DEBUG` and the gateway writes every request and response to a timestamped file, one per gateway start:
+For a first pass when something's off, run `corti-claude doctor` — it checks the install, gateway health, and state files passively (add `--deep` to also probe Corti's `/models` endpoint). If a specific request looks wrong, reach for the debug log below.
+
+Set `CORTI_DEBUG` and the gateway writes every request and response to a log file, one per Claude Code session:
 
 ```bash
 CORTI_DEBUG=1 corti-claude
 ```
 
-The wrapper prints the log path on startup, and `/health` reports it too:
+Each session's traffic lands in its own file — `gateway-session-<sessionId>-<timestamp>.log` — keyed by the session id Claude Code sends (`x-claude-code-session-id`). Advisor children file under the parent's session instead (`x-corti-advisor-for`), so an advisor consult stays in the parent's log. Untracked requests (no session id) share a single `gateway-session-untracked-*.log`.
+
+The wrapper prints the log directory on startup, and `/health` reports it as `debug` (the directory, or `false` when logging is off):
 
 ```bash
 curl -s http://127.0.0.1:4192/health
-# {"status":"healthy","gatewayVersion":2,"mode":"openai","upstream":"https://ai.eu.corti.app/v1","debug":"/Users/you/Library/Logs/corti-claude-proxy/gateway-2026-01-01T00-00-00-000Z.log"}
+# {"status":"healthy","gatewayVersion":2,"mode":"openai","upstream":"https://ai.eu.corti.app/v1","debug":"/Users/you/Library/Logs/corti-claude-proxy"}
 #
 # `mode` is not a process-wide setting — it reports what a request carrying no path prefix
 # resolves to, which is what the wrapper compares when deciding whether to restart.

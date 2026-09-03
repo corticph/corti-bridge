@@ -40,9 +40,10 @@ Two files carry almost everything; the split is deliberate and worth preserving:
 
 Supporting pieces:
 
-- **`bin/corti-claude`** — POSIX sh wrapper installed to `~/.local/bin`. Owns gateway lifecycle (per-port pid file, `/health` payload check, stale-gateway auto-restart), reads `~/.corti-claude/models.env`, and exports model aliases + `ANTHROPIC_BASE_URL` as process-scoped env before launching `claude`. The gateway never reads `models.env` — only the wrapper does, at launch. Nothing is ever written to any `settings.json`.
-- **`setup.sh` + `lib/*.sh`** — installer (dep/cred preflight, PATH block, model catalog fetch). Re-runnable; `--yes` for unattended, `--fresh` to re-fetch the catalog.
-- **`lib/models.mjs`** — ranks Corti's catalog into fable/opus/sonnet/haiku tiers by model-ID *shape* (size/speed/channel suffixes), not hardcoded names, so a new model generation needs no code change. Emits `models.env`.
+- **`bin/corti-claude`** — POSIX sh wrapper installed to `~/.local/bin`. Owns gateway lifecycle (per-port pid file, `/health` payload check, stale-gateway auto-restart), reads `~/.corti-claude/models.env`, and exports model aliases + `ANTHROPIC_BASE_URL` as process-scoped env before launching `claude`. Also dispatches subcommands: `doctor` (diagnostics), `models` (interactive tier picker), `theme` (prints the lime-mascot TUI theme + install steps — no writes). The gateway never reads `models.env` — only the wrapper does, at launch. Nothing is ever written to any `settings.json`.
+- **`setup.sh` + `lib/*.sh`** — installer. Preflight checks deps then creds before writing anything; a partial install exits 1 rather than leaving a half-configured state. Offers a profile menu (which Claude Code config dir Corti sessions use) and fetches the model catalog. Re-runnable; `--yes` for unattended, `--fresh` to re-fetch the catalog.
+- **`lib/models.mjs`** — ranks Corti's catalog into fable/opus/sonnet/haiku tiers by model-ID *shape* (size/speed/channel suffixes), not hardcoded names, so a new model generation needs no code change. Emits `models.env`; also serves the picker's candidate lists (`--candidates`/`--emit`) so the menu and the ranker can't drift.
+- **`lib/doctor.sh`** — `corti-claude doctor`: ~18 passive checks on the install, gateway, and state, plus an active `/models` probe under `--deep`. Doctor output goes to stdout (a report) — a deliberate exception to the `ui_*`→stderr invariant, so `doctor | grep FAIL` and `doctor > file` work.
 - **`lib/retry.mjs`** — the upstream retry policy as pure functions/constants, tested in isolation.
 
 ### Mode dispatch

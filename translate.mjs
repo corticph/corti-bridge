@@ -468,12 +468,6 @@ async function interceptWebSearch(body, { toolUseMap }) {
   return diagnostics;
 }
 
-// Local truthiness check so translate.mjs stays zero-dependency (the gateway's isTruthy lives
-// in gateway.mjs). Mirrors its semantics.
-function isTruthyEnv(v) {
-  return v != null && !["", "0", "false", "no", "off"].includes(String(v).toLowerCase());
-}
-
 let warnedAdvisorVar = false;
 
 // One knob, mode-aware default. skipAdvisor (the -noadvisor- recursion guard) is
@@ -485,14 +479,17 @@ let warnedAdvisorVar = false;
 // An unrecognized value (not auto/on/off/unset) warns once and falls to auto.
 function advisorWanted(mode, skipAdvisor) {
   if (skipAdvisor) return false;
-  const v = process.env.CORTI_ADVISOR;
+  // Normalize so CORTI_ADVISOR=OFF / " on " etc. behave as written, not as a silent
+  // fall to auto. The raw value is preserved for the unrecognized-value warning.
+  const raw = process.env.CORTI_ADVISOR;
+  const v = raw != null ? raw.trim().toLowerCase() : raw;
   if (v === "off") return false;
   if (v === "on") return true;
   if (v != null && v !== "" && v !== "auto") {
     // Unrecognized value — warn once per process, then fall to auto (mode default).
     if (!warnedAdvisorVar) {
       warnedAdvisorVar = true;
-      console.error(`corti-proxy: unrecognized CORTI_ADVISOR=${JSON.stringify(v)}, using auto (expected auto|on|off)`);
+      console.error(`corti-proxy: unrecognized CORTI_ADVISOR=${JSON.stringify(raw)}, using auto (expected auto|on|off)`);
     }
   }
   // "auto" (unset, or unrecognized) → mode default: openai on, anthropic (and undefined) off.
