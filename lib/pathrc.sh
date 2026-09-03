@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=sh
 # Shell startup-file handling. Every mutation is append-only, backed up first, and
 # marked so it can be removed again. A subprocess cannot change its parent's PATH.
 
