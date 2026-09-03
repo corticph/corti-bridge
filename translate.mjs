@@ -293,7 +293,11 @@ const ADVISOR_TOOL_DEF = {
 // so tests that return plain advice strings stay unchanged.
 export function runAdvisor(text, opts = {}) {
   return new Promise((resolve) => {
-    const args = [
+    // Test seam: CORTI_ADVISOR_STUB is a script that reads the transcript on stdin and writes a
+    // result (JSON {ok,text}|{ok:false,code} or a bare advice string) to stdout. Unset in production.
+    const stub = process.env.CORTI_ADVISOR_STUB;
+    const cmd = stub || "corti-claude";
+    const args = stub ? [] : [
       "-p",
       "--model", ADVISOR_MODEL,
       "--output-format", "json",
@@ -334,7 +338,7 @@ export function runAdvisor(text, opts = {}) {
     // the real advice is small (the successful consult returned 624 chars), but the event
     // stream surrounding it is not. The `detail` capture surfaces a maxBuffer failure with its
     // err.code if this is ever too small again.
-    const child = execFile("corti-claude", args, {
+    const child = execFile(cmd, args, {
       env,
       timeout: ADVISOR_TIMEOUT_MS,
       maxBuffer: 32 * 1024 * 1024,
@@ -357,6 +361,15 @@ export function runAdvisor(text, opts = {}) {
         // --output-format json emits a JSON array of event objects; the result text is on the
         // element with type === "result". Fall back to result.text, then raw stdout.
         const out = stdout.toString().trim();
+        // Stub seam: a direct result object ({ok,text} or {ok:false,code}) or a bare advice string.
+        if (stub) {
+          try {
+            const parsed = JSON.parse(out);
+            if (parsed && typeof parsed === "object" && "ok" in parsed) return resolve(parsed);
+            if (typeof parsed === "string") return resolve({ ok: true, text: parsed });
+          } catch { /* not JSON — treat as bare advice */ }
+          return resolve(out ? { ok: true, text: out } : { ok: false, code: "unavailable" });
+        }
         const arr = JSON.parse(out);
         const items = Array.isArray(arr) ? arr : [arr];
         const result = items.find((o) => o && o.type === "result");
