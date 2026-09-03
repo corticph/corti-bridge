@@ -596,6 +596,26 @@ async function handleMessages(req, res, body) {
     });
     writeEvent("content_block_stop", { type: "content_block_stop", index: srvIdx });
 
+    /** Advisor succeeded but the continuation (proxy's own 2nd call) failed: a proxy-internal
+     *  event, not an advisor failure. A text note ends the turn so the model uses the advice in
+     *  history next turn rather than re-consulting — no second advisor_tool_result (spec: one per call). */
+    const endContinuationFailure = (note, tag) => {
+      if (finalized || res.writableEnded) return;
+      diagnostics.push(`advisor continuation failed: ${note}`);
+      const idx = resIdx + 1;
+      writeEvent("content_block_start", { type: "content_block_start", index: idx, content_block: { type: "text", text: "" } });
+      writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: note } });
+      writeEvent("content_block_stop", { type: "content_block_stop", index: idx });
+      writeEvent("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { input_tokens: est, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      });
+      writeEvent("message_stop", { type: "message_stop" });
+      res.end();
+      finalize(tag);
+    };
+
     // 2. Run the advisor on the serialized transcript. Non-blocking UI: "Advising" shows while this runs.
     // runAdvisor returns {ok:true,text} or {ok:false,code} (official advisor_tool_result_error
     // error_code: execution_time_exceeded | unavailable | overloaded | too_many_requests |
@@ -651,17 +671,10 @@ async function handleMessages(req, res, body) {
     try {
       await continueAfterAdvisor(id, continuationText);
     } catch (err) {
-      diagnostics.push(`advisor continuation failed: ${err?.message ?? err}`);
-      if (!finalized && !res.writableEnded) {
-        writeEvent("message_delta", {
-          type: "message_delta",
-          delta: { stop_reason: "end_turn", stop_sequence: null },
-          usage: { input_tokens: est, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-        });
-        writeEvent("message_stop", { type: "message_stop" });
-        res.end();
-        finalize("advisor-continuation-failed");
-      }
+      endContinuationFailure(
+        `[advisor consulted; the follow-up response failed (${err?.message ?? err}) — proceed using the advice above]`,
+        "advisor-continuation-failed",
+      );
     }
   };
 
@@ -699,24 +712,13 @@ async function handleMessages(req, res, body) {
             up.on("end", () => {
               if (finalized || clientGone) return resolve();
               // The continuation can't retry (advice SSE already written, invariant #3); a non-2xx
-              // must surface as advisor_tool_result_error, never parsed (a blank block ends the turn).
+              // must not be parsed as a completion (a blank block silently ends the turn).
               const errCode = advisorContinuationErrorCode(up.statusCode);
               if (errCode) {
-                diagnostics.push(`advisor continuation non-2xx: ${up.statusCode} -> ${errCode}`);
-                const errIdx = resIdx + 1;
-                writeEvent("content_block_start", {
-                  type: "content_block_start", index: errIdx,
-                  content_block: { type: "advisor_tool_result", tool_use_id: id, content: { type: "advisor_tool_result_error", error_code: errCode } },
-                });
-                writeEvent("content_block_stop", { type: "content_block_stop", index: errIdx });
-                writeEvent("message_delta", {
-                  type: "message_delta",
-                  delta: { stop_reason: "end_turn", stop_sequence: null },
-                  usage: { input_tokens: est, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-                });
-                writeEvent("message_stop", { type: "message_stop" });
-                res.end();
-                finalize("advisor-continuation-upstream-error");
+                endContinuationFailure(
+                  `[advisor consulted; the follow-up response failed (upstream ${up.statusCode}: ${errCode}) — proceed using the advice above]`,
+                  "advisor-continuation-upstream-error",
+                );
                 return resolve();
               }
               try {

@@ -19,6 +19,8 @@ GW_PORT=4298
 cleanup() {
   [ -n "$GW_PID" ] && { kill "$GW_PID" 2>/dev/null || :; wait "$GW_PID" 2>/dev/null || :; }
   [ -n "$STUB_PID" ] && { kill "$STUB_PID" 2>/dev/null || :; wait "$STUB_PID" 2>/dev/null || :; }
+  [ -n "${C1_GW_PID:-}" ] && { kill "$C1_GW_PID" 2>/dev/null || :; wait "$C1_GW_PID" 2>/dev/null || :; }
+  [ -n "${C1STUB_PID:-}" ] && { kill "$C1STUB_PID" 2>/dev/null || :; wait "$C1STUB_PID" 2>/dev/null || :; }
   rm -rf "$SCRATCH"
 }
 trap cleanup EXIT
@@ -136,6 +138,82 @@ check "HEAD /api/hello answered locally, bare" \
   "$(curl -s -m 10 -I -o /dev/null -w '%{http_code}' "$G/api/hello")" "200"
 check "HEAD /api/hello answered locally, prefixed" \
   "$(curl -s -m 10 -I -o /dev/null -w '%{http_code}' "$G/anthropic/api/hello")" "200"
+
+# --- C1 e2e: a continuation non-2xx ends the turn with a text note, not a second
+# advisor_tool_result_error and not a blank block. A separate upstream stub returns a
+# consult_advisor tool_call on the first (streaming) request — triggering hold-and-continue —
+# then 500 on the continuation (the 2nd request, which carries the synthesized tool_result). The
+# advisor child is stubbed via CORTI_ADVISOR_STUB so no live headless session is spawned.
+cat > advisor-stub.sh <<'ADVSTUB'
+#!/bin/sh
+cat >/dev/null  # discard the transcript
+printf '{"ok":true,"text":"stub advisor advice"}'
+ADVSTUB
+chmod +x advisor-stub.sh
+
+cat > c1stub.mjs <<'C1STUB'
+import fs from "node:fs";
+import https from "node:https";
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      // The continuation carries the synthesized tool_result for consult_advisor.
+      const isContinuation = body.includes('"tool_result"') && body.includes('consult_advisor');
+      if (isContinuation) {
+        // The continuation call after the advisor succeeded: fail with 500.
+        res.writeHead(500, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "upstream overloaded" } }));
+      }
+      // First (streaming) request: end on a consult_advisor tool_call via SSE so the streaming
+      // translator's finish() detects it and fires onAdvisorToolUse (hold-and-continue).
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_c1","type":"function","function":{"name":"consult_advisor","arguments":""}}]}}]}\n\n');
+      res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`C1PORT=${s.address().port}`));
+C1STUB
+
+node c1stub.mjs > c1stub.out 2>&1 &
+C1STUB_PID=$!
+C1UP=""
+while [ -z "$C1UP" ]; do C1UP=$(sed -n 's/^C1PORT=//p' c1stub.out); done
+
+C1_GW_PORT=4299
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > c1gateway.mjs
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$C1UP/v1" \
+CORTI_PORT="$C1_GW_PORT" \
+CORTI_ADVISOR_STUB="$SCRATCH/advisor-stub.sh" \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node c1gateway.mjs > c1gw.out 2>&1 &
+C1_GW_PID=$!
+while ! grep -q "corti-proxy on" c1gw.out 2>/dev/null; do :; done
+
+C1G="http://127.0.0.1:$C1_GW_PORT"
+C1BODY='{"model":"corti-s1","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"advise me"}]}'
+C1RESP=$(curl -s -m 15 -N -H 'content-type: application/json' -d "$C1BODY" "$C1G/v1/messages" 2>&1)
+
+check "C1: continuation 500 ends with the text note" \
+  "$(printf '%s' "$C1RESP" | grep -c 'proceed using the advice above')" "1"
+check "C1: no second advisor_tool_result_error after success" \
+  "$(printf '%s' "$C1RESP" | grep -c 'advisor_tool_result_error')" "0"
+check "C1: advisor advice was streamed (advisor_result)" \
+  "$(printf '%s' "$C1RESP" | grep -c 'stub advisor advice')" "1"
+# The terminal message_delta carries end_turn; the advisor_result block also carries stop_reason
+# end_turn, so assert on the message_delta event specifically (exactly one terminal delta).
+C1_ENDTURN=$(printf '%s' "$C1RESP" | grep -A1 'event: message_delta' | grep -c '"stop_reason":"end_turn"')
+check "C1: turn ends with end_turn (terminal message_delta)" "$C1_ENDTURN" "1"
+
+kill "$C1_GW_PID" "$C1STUB_PID" 2>/dev/null || :
+wait "$C1_GW_PID" "$C1STUB_PID" 2>/dev/null || :
 
 if [ "$FAILED" -gt 0 ]; then
   printf '\n%s check(s) failed\n' "$FAILED"
