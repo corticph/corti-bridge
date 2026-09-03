@@ -8,7 +8,7 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
-import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator } from "'"$REPO"'/translate.mjs";
+import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 
 let failed = 0;
@@ -222,6 +222,58 @@ await applyIntercepts(skipBody, { runAdvisor: countingStub, skipAdvisor: true, m
 check("advisor continuation: no re-spawn WITH skipAdvisor", stubCalls, 0);
 check("advisor continuation: result preserved with skipAdvisor", skipBody.messages[2].content[0].content, "<advisor_guidance>\nalready synthesized\n</advisor_guidance>");
 check("advisor continuation: no tool injected with skipAdvisor", Boolean(skipBody.tools?.some((t) => t?.name === "consult_advisor")), false);
+
+// Block G2 — C1: the advisor continuation upstream status maps to an advisor_tool_result_error
+// code, never parsed as a completion. The continuation cannot retry (advice SSE already written,
+// invariant #3), so a non-2xx must surface as an error result; the harness renders the decline
+// line and the executor continues without advice. A live incident saw 5xx on the continuation
+// swallowed as a blank text block, silently ending the turn.
+check("C1: 2xx is success (null)", advisorContinuationErrorCode(200), null);
+check("C1: 429 too_many_requests", advisorContinuationErrorCode(429), "too_many_requests");
+check("C1: 503 overloaded", advisorContinuationErrorCode(503), "overloaded");
+check("C1: 529 overloaded", advisorContinuationErrorCode(529), "overloaded");
+check("C1: 500 unavailable", advisorContinuationErrorCode(500), "unavailable");
+check("C1: 502 unavailable", advisorContinuationErrorCode(502), "unavailable");
+check("C1: 504 unavailable", advisorContinuationErrorCode(504), "unavailable");
+check("C1: 400 unavailable", advisorContinuationErrorCode(400), "unavailable");
+
+// Block G3 — A1: a consult_advisor tool_result the harness re-sends on a later turn must NOT
+// re-spawn the advisor. The bug is cross-turn: the harness re-sends the raw "Unknown tool" error
+// each turn, and a request-scoped set cannot remember across requests, so the dedup cache is
+// per-session (advisorProcessed), shared across the two calls below. Two-call form is required:
+// a single call legitimately processes all N prior consults (N spawns), so stubCalls<=1 is wrong.
+_resetAdvisorProcessed();
+let a1Calls = 0;
+const a1Stub = async () => { a1Calls++; return `advice ${a1Calls}`; };
+const a1Body = {
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [
+    { role: "user", content: "go" },
+    { role: "assistant", content: [{ type: "tool_use", id: "a1_1", name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "a1_1", content: "Unknown tool: consult_advisor", is_error: true }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "a1_2", name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "a1_2", content: "Unknown tool: consult_advisor", is_error: true }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "a1_3", name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "a1_3", content: "Unknown tool: consult_advisor", is_error: true }] },
+  ],
+};
+const a1Cache = new Map();
+a1Calls = 0;
+await applyIntercepts(JSON.parse(JSON.stringify(a1Body)), { runAdvisor: a1Stub, advisorProcessed: a1Cache, mode: "openai" });
+check("A1: first turn spawns once per prior consult (3)", a1Calls, 3);
+check("A1: first turn caches all 3 ids", a1Cache.size, 3);
+a1Calls = 0;
+const a1Body2 = JSON.parse(JSON.stringify(a1Body));
+await applyIntercepts(a1Body2, { runAdvisor: a1Stub, advisorProcessed: a1Cache, mode: "openai" });
+check("A1: second turn re-spawns 0 (cross-turn dedup)", a1Calls, 0);
+check("A1: second turn rewrites from cache (guidance present)", a1Body2.messages[2].content[0].content.startsWith("<advisor_guidance>"), true);
+check("A1: second turn clears is_error", a1Body2.messages[2].content[0].is_error, false);
+// Isolation: a different session (no shared cache) re-runs for ids it has not seen. The module
+// map keys by parentSessionId; an unseen session gets a fresh map and spawns normally.
+_resetAdvisorProcessed();
+a1Calls = 0;
+await applyIntercepts(JSON.parse(JSON.stringify(a1Body)), { runAdvisor: a1Stub, parentSessionId: "sess-other", mode: "openai" });
+check("A1: a different session is not blocked by another", a1Calls, 3);
 
 // Block H — C6: prior-turn advisor advice round-trips into history instead of being dropped.
 // advisor_tool_result is NOT in SERVER_BLOCK_TYPES (only server_tool_use is); before the fix it
@@ -477,6 +529,22 @@ a2btx.done();
 const a2bdelta = a2bevents.find((e) => e.ev === "message_delta");
 check("A2b: fully-cached turn input_tokens floored at 1 (not 0)", a2bdelta?.data?.usage?.input_tokens, 1);
 check("A2b: fully-cached turn cache_read preserved", a2bdelta?.data?.usage?.cache_read_input_tokens, 50000);
+
+// --- D1: translateCompletion generates a fallback tool_use id when upstream omits it. The
+// streaming path already does (translate.mjs:1301); the non-streaming path used call.id directly,
+// so a missing id left id:undefined and the harness could not pair the tool_result -> broken loop.
+const d1ctx = { msgId: "msg_d1", requestedModel: "corti-s1", reasoningMode: "drop" };
+const d1msg = translateCompletion({
+  choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: [{ index: 0, function: { name: "run_bash", arguments: "{}" } }] }, finish_reason: "tool_calls" }],
+  usage: { prompt_tokens: 1, completion_tokens: 1 },
+}, d1ctx);
+check("D1: missing tool_call id gets a fallback", typeof d1msg.content[0].id === "string" && d1msg.content[0].id.startsWith("chatcmpl-tool-local-"), true);
+// A present id is preserved verbatim (no fallback clobber).
+const d1pres = translateCompletion({
+  choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: [{ id: "call_abc", function: { name: "run_bash", arguments: "{}" } }] }, finish_reason: "tool_calls" }],
+  usage: { prompt_tokens: 1, completion_tokens: 1 },
+}, d1ctx);
+check("D1: present tool_call id preserved", d1pres.content[0].id, "call_abc");
 
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }
