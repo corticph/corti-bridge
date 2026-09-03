@@ -243,6 +243,25 @@ const advisorMaxTokens = () => Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2
 
 const ADVISOR_TOOL_NAME = "consult_advisor";
 const ADVISOR_TOOL_NAMES = new Set([ADVISOR_TOOL_NAME]);
+
+// Per-session cache: processed consult_advisor id -> guidance text. A historical "Unknown tool"
+// result re-sent on a later turn is rewritten from cache WITHOUT re-spawning. Keyed on sessionId.
+const ADVISOR_PROCESSED_CAP = 64;
+const advisorProcessedBySession = new Map();
+
+function advisorProcessedMap(sessionId) {
+  const key = sessionId || "__untracked__";
+  let map = advisorProcessedBySession.get(key);
+  if (!map) {
+    if (advisorProcessedBySession.size >= ADVISOR_PROCESSED_CAP)
+      advisorProcessedBySession.delete(advisorProcessedBySession.keys().next().value);
+    map = new Map();
+    advisorProcessedBySession.set(key, map);
+  }
+  return map;
+}
+
+export function _resetAdvisorProcessed() { advisorProcessedBySession.clear(); }
 // Empty input_schema: the executor signals *timing only*. Letting it write a query loses
 // exactly the detail the advisor is there to catch — the harness forwards the full transcript
 // automatically (see serializeAdvisorInput). `additionalProperties: false` matters: models
@@ -423,6 +442,15 @@ function advisorGuidanceText(advice) {
   return `<advisor_guidance>\n${advice}\n</advisor_guidance>`;
 }
 
+// Continuation upstream status → advisor_tool_result_error code. Can't retry (advice SSE already
+// written, invariant #3), so non-2xx must surface as an error; never parse it as a completion.
+export function advisorContinuationErrorCode(status) {
+  if (status >= 200 && status < 300) return null;
+  if (status === 429) return "too_many_requests";
+  if (status === 503 || status === 529) return "overloaded";
+  return "unavailable";
+}
+
 /* ------------------------------------------------------------------ */
 /* intercept registry — shared by both gateway modes                   */
 /* ------------------------------------------------------------------ */
@@ -501,7 +529,7 @@ function advisorWanted(mode, skipAdvisor) {
 // off), on/off force both modes. skipAdvisor (the -noadvisor- recursion guard) is authoritative
 // and checked first inside advisorWanted so no env var can override it. The runAdvisor
 // dependency is injectable via ctx so tests stay hermetic (no child_process spawn).
-async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor, mode, parentSessionId } = {}) {
+async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor, mode, parentSessionId, advisorProcessed } = {}) {
   if (!advisorWanted(mode, skipAdvisor)) return [];
   const diagnostics = [];
 
@@ -524,25 +552,39 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
   // messages + budget line), not the executor's focus string — this is the official "server
   // supplies context" behaviour. The tool_use input is now empty, so there is no focus to read.
   const call = runAdvisor || defaultRunAdvisor;
+  // advisorProcessed (opts) lets a caller share the per-session cache across calls (tests); in
+  // production the gateway threads parentSessionId so advisorProcessedMap keys by session.
+  const processed = advisorProcessed ?? advisorProcessedMap(parentSessionId);
   for (const msg of body.messages ?? []) {
     if (msg?.role !== "user" || !Array.isArray(msg.content)) continue;
     for (const b of msg.content) {
       if (b?.type !== "tool_result") continue;
       const toolUse = toolUseMap.get(b.tool_use_id);
       if (!toolUse || !ADVISOR_TOOL_NAMES.has(toolUse.name)) continue;
+      // Already processed this consult on a prior turn: rewrite from cache, do NOT re-spawn. The
+      // harness re-sends the raw "Unknown tool" error each turn, so the content still needs fixing.
+      const cached = processed.get(b.tool_use_id);
+      if (cached !== undefined) {
+        b.content = cached;
+        b.is_error = false;
+        diagnostics.push(`advisor cached: id=${b.tool_use_id} (no re-spawn)`);
+        continue;
+      }
       const { text, elidedCount } = serializeAdvisorInput(body, { maxTokens: advisorMaxTokens() });
       const out = await call(text, { parentSessionId });
       // A bare string is a test stub (backward compat) — treat as success.
       const res = typeof out === "string" ? { ok: true, text: out } : out;
+      let guidance;
       if (res?.ok) {
-        b.content = advisorGuidanceText(res.text);
-        b.is_error = false;
+        guidance = advisorGuidanceText(res.text);
       } else {
         // The advisor failed (timeout / unavailable / etc). The executor sees the failure and
         // continues without advice; the request itself does not fail (official §"Error results").
-        b.content = advisorGuidanceText(`advisor unavailable (${res?.code || "unavailable"})`);
-        b.is_error = false;
+        guidance = advisorGuidanceText(`advisor unavailable (${res?.code || "unavailable"})`);
       }
+      b.content = guidance;
+      b.is_error = false;
+      processed.set(b.tool_use_id, guidance);
       const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
       const resStr = res?.ok ? `advisor=${res.text.length} chars` : `advisor_error=${res?.code || "unavailable"}`;
       diagnostics.push(`advisor intercepted: transcript=${text.length} chars${elidedStr} ${resStr}`);
@@ -1140,7 +1182,7 @@ export function translateCompletion(completion, ctx) {
     } catch {
       ctx.onDiagnostic?.(`tool args JSON.parse failed for ${call.function?.name}: using {}`);
     }
-    content.push({ type: "tool_use", id: call.id, name: call.function?.name, input });
+    content.push({ type: "tool_use", id: call.id || `chatcmpl-tool-local-${Math.random().toString(16).slice(2, 10)}`, name: call.function?.name, input });
   }
 
   if (!content.length) content.push({ type: "text", text: "" });

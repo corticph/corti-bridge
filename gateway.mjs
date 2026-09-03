@@ -9,6 +9,7 @@ import crypto from "node:crypto";
 import zlib from "node:zlib";
 import {
   TranslateRejection,
+  advisorContinuationErrorCode,
   applyIntercepts,
   createStreamTranslator,
   estimateTokens,
@@ -697,6 +698,27 @@ async function handleMessages(req, res, body) {
             up.on("data", (c) => chunks.push(c));
             up.on("end", () => {
               if (finalized || clientGone) return resolve();
+              // The continuation can't retry (advice SSE already written, invariant #3); a non-2xx
+              // must surface as advisor_tool_result_error, never parsed (a blank block ends the turn).
+              const errCode = advisorContinuationErrorCode(up.statusCode);
+              if (errCode) {
+                diagnostics.push(`advisor continuation non-2xx: ${up.statusCode} -> ${errCode}`);
+                const errIdx = resIdx + 1;
+                writeEvent("content_block_start", {
+                  type: "content_block_start", index: errIdx,
+                  content_block: { type: "advisor_tool_result", tool_use_id: id, content: { type: "advisor_tool_result_error", error_code: errCode } },
+                });
+                writeEvent("content_block_stop", { type: "content_block_stop", index: errIdx });
+                writeEvent("message_delta", {
+                  type: "message_delta",
+                  delta: { stop_reason: "end_turn", stop_sequence: null },
+                  usage: { input_tokens: est, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+                });
+                writeEvent("message_stop", { type: "message_stop" });
+                res.end();
+                finalize("advisor-continuation-upstream-error");
+                return resolve();
+              }
               try {
                 const msg = translateCompletion(JSON.parse(Buffer.concat(chunks).toString()), ctx);
                 // Continuation content blocks resume after the synthetic advisor blocks (srvIdx, resIdx).
