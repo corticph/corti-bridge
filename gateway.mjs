@@ -1360,6 +1360,10 @@ function logResponse({ id, sessionFile, started, status, headers, body, note, di
 }
 
 function teeResponse(id, sessionFile, started, upstream, res) {
+  // With debug off, sessionFile is null and logResponse early-returns — so buffering every chunk
+  // and running Buffer.concat is pure waste on every passthrough response. Skip it entirely.
+  if (!sessionFile) return;
+
   const chunks = [];
   let size = 0;
   let truncated = false;

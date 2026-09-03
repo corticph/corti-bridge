@@ -383,8 +383,8 @@ export function runAdvisor(text, opts = {}) {
   });
 }
 
-// Default backing used when no runAdvisor is injected via ctx (production). Aliased rather than
-// re-declared to avoid a TDZ reference before runAdvisor is initialised.
+// Unshadowed reference to the module's runAdvisor: interceptConsultAdvisor destructures a
+// `runAdvisor` param that shadows the export, so this alias is how the fallback reaches it.
 const defaultRunAdvisor = runAdvisor;
 
 // The executor-side timing + advice-weight block, read once from disk and cached. Prepended to
