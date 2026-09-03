@@ -135,16 +135,16 @@ Note that `~/.corti-claude` (the proxy's state directory, `CC_PROXY_CONFIG_DIR`)
 
 ## The gateway
 
-`corti-claude` starts a local gateway on `127.0.0.1:4192` (set `CORTI_PORT` to move it) the first time you run it, and it **outlives any single session** — it keeps running after `corti-claude` exits, so the next session starts fast. That also means there's no first-class way to stop it just by quitting Claude Code. Two flags manage it:
+`corti-claude` starts a local gateway on `127.0.0.1:4192` (set `CORTI_PORT` to move it) the first time you run it, and it **outlives any single session** — it keeps running after `corti-claude` exits, so the next session starts fast. That also means there's no first-class way to stop it just by quitting Claude Code. The gateway is managed with `--stop` and `restart`:
 
 ```bash
 corti-claude --stop       # stop the gateway and exit
-corti-claude --restart    # stop then start it (needs CORTI_BEARER/CORTI_BASE_URL)
+corti-claude restart      # stop then start it (needs CORTI_BEARER/CORTI_BASE_URL)
 ```
 
-`--stop` needs nothing — not even credentials — so it works when something's wrong. `--restart` checks credentials *before* stopping, so a typo'd `CORTI_BEARER` won't take down a working gateway. Stopping a gateway that's already stopped is not an error.
+`--stop` is a flag, not a bare command: `claude`'s own `stop|kill <id>` subcommand passes through the wrapper to stop a background session, and a bare `stop` would intercept it and silently kill the gateway instead. `restart` is safe as a bare command because `claude` uses `respawn`, not `restart`, for background sessions — no collision. The other subcommands (`doctor`, `models`, `theme`) shadow `claude`-verb equivalents that are low-value when proxied (`doctor` checks the Claude Code install, which the wrapper leaves healthy) or that don't exist (`models`, `theme`), so the proxy's command is the useful one. `--stop` needs nothing — not even credentials — so it works when something's wrong. `restart` checks credentials *before* stopping, so a typo'd `CORTI_BEARER` won't take down a working gateway. Stopping a gateway that's already stopped is not an error.
 
-Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require restarting the gateway: the gateway doesn't read `models.env` (the wrapper does, at launch), so a new mapping takes effect the next time you run `corti-claude`. You only need `--restart` if you've changed `CORTI_BASE_URL` — and even then, a normal `corti-claude` run detects the staleness and restarts it for you. Switching `--anthropic` never needs one: both modes are always being served.
+Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require restarting the gateway: the gateway doesn't read `models.env` (the wrapper does, at launch), so a new mapping takes effect the next time you run `corti-claude`. You only need `restart` if you've changed `CORTI_BASE_URL` — and even then, a normal `corti-claude` run detects the staleness and restarts it for you. Switching `--anthropic` never needs one: both modes are always being served.
 
 ## Upstream failures and retries
 

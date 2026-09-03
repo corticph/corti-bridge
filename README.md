@@ -42,9 +42,9 @@ corti-claude                 # start the gateway if needed, then launch claude
 corti-claude models          # pick which Corti model backs each tier
 corti-claude doctor          # diagnose the install, gateway, and state
 corti-claude theme           # print the lime-mascot TUI theme + install steps
+corti-claude restart         # stop then start (needs CORTI_BEARER/CORTI_BASE_URL)
 corti-claude --stop          # stop the gateway
-corti-claude --restart       # stop then start (needs CORTI_BEARER/CORTI_BASE_URL)
-corti-claude --help          # full reference
+corti-claude help            # full reference
 corti-claude --anthropic     # pass-through mode (escape hatch; some features unavailable)
 ```
 

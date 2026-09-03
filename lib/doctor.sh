@@ -384,7 +384,7 @@ _d_check_dual_clone() {
             _d_report OK dual-clone "wrapper and running gateway agree on $(_d_tilde "$_d_baked")" ""
         else
             _d_report WARN dual-clone "wrapper points at $(_d_tilde "$_d_baked") but a running gateway is from $(_d_tilde "$_d_run_clone")" \
-                "corti-claude --stop/--restart will target the wrapper's clone, not the running one. To run two clones safely: set CC_PROXY_CONFIG_DIR per clone (splits models.env/profile.env/pid/log) AND use distinct CORTI_PORT values."
+                "corti-claude --stop/restart will target the wrapper's clone, not the running one. To run two clones safely: set CC_PROXY_CONFIG_DIR per clone (splits models.env/profile.env/pid/log) AND use distinct CORTI_PORT values."
         fi
     fi
 }

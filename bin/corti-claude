@@ -84,7 +84,7 @@ case "${1:-}" in
         echo "corti-claude: the gateway on $GATEWAY didn't stop — stop it manually (pkill -f gateway.mjs)" >&2
         exit 1
         ;;
-    --restart)
+    --restart|restart)
         mkdir -p "$CORTI_DIR"
         # Creds before kill: don't drop a working gateway for a missing token.
         if [ -z "${CORTI_BEARER:-}" ] || [ -z "${CORTI_BASE_URL:-}" ]; then
@@ -187,28 +187,29 @@ EOF
         unset _cc_profile
         exit 0
         ;;
-    --help|-h)
-        cat >&2 <<EOF
+    --help|-h|help)
+        cat <<EOF
 corti-claude — Claude Code on Corti models.
 
 Usage: corti-claude [--anthropic] [args passed to claude]
        corti-claude --stop
-       corti-claude --restart
+       corti-claude restart
        corti-claude doctor [--deep]
        corti-claude models [--experimental] [--reset]
        corti-claude theme
+       corti-claude help
 
   (default)    Start the gateway if needed, then launch claude
   --anthropic  Use Corti's /anthropic pass-through mode (default: openai translator)
   --stop       Stop the gateway and exit
-  --restart    Stop then start the gateway and exit (needs CORTI_BEARER/CORTI_BASE_URL)
+  restart      Stop then start the gateway and exit (needs CORTI_BEARER/CORTI_BASE_URL)
   doctor       Run diagnostics on the install, gateway, and state (no creds needed)
   doctor --deep  Also probe Corti's /models endpoint (active; needs CORTI_BEARER)
   models       Interactively pick which Corti model backs each tier (needs creds)
   models --reset     Clear all pins and re-rank from scratch, no prompts
   models --experimental  Include beta models in the lists
   theme        Print the lime-mascot TUI theme and install instructions (no writes)
-  --help       Show this
+  help         Show this
 EOF
         exit 0
         ;;
