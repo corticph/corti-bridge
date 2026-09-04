@@ -669,7 +669,7 @@ async function handleMessages(req, res, body) {
     translator?.releaseAdvisor?.();
     lastActivity = Date.now();
     try {
-      await continueAfterAdvisor(id, continuationText);
+      await continueAfterAdvisor(id, continuationText, resIdx, endContinuationFailure);
     } catch (err) {
       endContinuationFailure(
         `[advisor consulted; the follow-up response failed (${err?.message ?? err}) — proceed using the advice above]`,
@@ -681,7 +681,9 @@ async function handleMessages(req, res, body) {
   // The second upstream call: appends the consult_advisor tool_use + tool_result to the original
   // request and asks the model to continue. Non-streaming for simplicity (the first turn already
   // streamed; this is the advisor-aware continuation).
-  const continueAfterAdvisor = (toolUseId, advisorText) => {
+  // Passed in from onAdvisorToolUse: resIdx + endContinuationFailure live in that closure
+  // (resIdx is computed there); this sibling needs both for its success and non-2xx paths.
+  const continueAfterAdvisor = (toolUseId, advisorText, resIdx, endContinuationFailure) => {
     return new Promise((resolve, reject) => {
       // Build the continuation body: original messages + a new user turn carrying the tool_result.
       const contMessages = [...(anthropicBody.messages || [])];

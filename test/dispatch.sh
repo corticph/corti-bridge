@@ -21,6 +21,8 @@ cleanup() {
   [ -n "$STUB_PID" ] && { kill "$STUB_PID" 2>/dev/null || :; wait "$STUB_PID" 2>/dev/null || :; }
   [ -n "${C1_GW_PID:-}" ] && { kill "$C1_GW_PID" 2>/dev/null || :; wait "$C1_GW_PID" 2>/dev/null || :; }
   [ -n "${C1STUB_PID:-}" ] && { kill "$C1STUB_PID" 2>/dev/null || :; wait "$C1STUB_PID" 2>/dev/null || :; }
+  [ -n "${C1_OK_GW_PID:-}" ] && { kill "$C1_OK_GW_PID" 2>/dev/null || :; wait "$C1_OK_GW_PID" 2>/dev/null || :; }
+  [ -n "${C1OKSTUB_PID:-}" ] && { kill "$C1OKSTUB_PID" 2>/dev/null || :; wait "$C1OKSTUB_PID" 2>/dev/null || :; }
   rm -rf "$SCRATCH"
 }
 trap cleanup EXIT
@@ -32,6 +34,17 @@ check() {
     printf 'FAIL %s (expected %s, got %s)\n' "$1" "$3" "$2"
     FAILED=$((FAILED + 1))
   fi
+}
+
+# Bounded wait for a gateway's startup banner in its log. A crash at boot never prints the
+# banner; without a bound the wait would spin forever and mask the failure as a hang.
+wait_banner() {
+  _wb_log="$1"; _wb_i=0
+  while [ "$_wb_i" -lt 100 ]; do
+    grep -q "corti-proxy on" "$_wb_log" 2>/dev/null && return 0
+    _wb_i=$((_wb_i + 1)); sleep 0.1
+  done
+  return 1
 }
 
 if ! command -v openssl >/dev/null 2>&1; then
@@ -161,8 +174,10 @@ const s = https.createServer(
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const body = Buffer.concat(chunks).toString();
-      // The continuation carries the synthesized tool_result for consult_advisor.
-      const isContinuation = body.includes('"tool_result"') && body.includes('consult_advisor');
+      // After translateRequest, the continuation's consult_advisor tool_result becomes an OpenAI
+      // tool-role message (role:"tool" + tool_call_id); the literal Anthropic "tool_result" is
+      // gone from the translated body. Detect by that shape, not by the Anthropic block name.
+      const isContinuation = body.includes('"role":"tool"') && body.includes('"tool_call_id"');
       if (isContinuation) {
         // The continuation call after the advisor succeeded: fail with 500.
         res.writeHead(500, { "content-type": "application/json" });
@@ -195,14 +210,23 @@ CORTI_ADVISOR_STUB="$SCRATCH/advisor-stub.sh" \
 NODE_TLS_REJECT_UNAUTHORIZED=0 \
 node c1gateway.mjs > c1gw.out 2>&1 &
 C1_GW_PID=$!
-while ! grep -q "corti-proxy on" c1gw.out 2>/dev/null; do :; done
+wait_banner c1gw.out || { echo "FAIL C1 gateway did not start" >&2; FAILED=$((FAILED + 1)); }
 
 C1G="http://127.0.0.1:$C1_GW_PORT"
 C1BODY='{"model":"corti-s1","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"advise me"}]}'
-C1RESP=$(curl -s -m 15 -N -H 'content-type: application/json' -d "$C1BODY" "$C1G/v1/messages" 2>&1)
+# `|| true` so a gateway that crashes mid-stream (curl exits non-zero, e.g. 18 partial) yields a
+# partial/empty C1RESP and clean FAIL lines, instead of set -e aborting before the checks run.
+C1RESP=$(curl -s -m 15 -N -H 'content-type: application/json' -d "$C1BODY" "$C1G/v1/messages" 2>&1 || true)
 
+# set +e: a crashed gateway yields partial/empty C1RESP; the grep -c calls below then exit 1 on
+# zero matches, which set -e would turn into a silent abort. We want clean FAIL lines instead.
+set +e
 check "C1: continuation 500 ends with the text note" \
   "$(printf '%s' "$C1RESP" | grep -c 'proceed using the advice above')" "1"
+# The non-2xx note names the upstream status; the thrown/catch path names an error message
+# instead. Asserting this proves the stub's 500 path was actually taken, not a parse-error catch.
+check "C1: note names upstream 500 (non-2xx path taken)" \
+  "$(printf '%s' "$C1RESP" | grep -c 'upstream 500')" "1"
 check "C1: no second advisor_tool_result_error after success" \
   "$(printf '%s' "$C1RESP" | grep -c 'advisor_tool_result_error')" "0"
 check "C1: advisor advice was streamed (advisor_result)" \
@@ -211,9 +235,78 @@ check "C1: advisor advice was streamed (advisor_result)" \
 # end_turn, so assert on the message_delta event specifically (exactly one terminal delta).
 C1_ENDTURN=$(printf '%s' "$C1RESP" | grep -A1 'event: message_delta' | grep -c '"stop_reason":"end_turn"')
 check "C1: turn ends with end_turn (terminal message_delta)" "$C1_ENDTURN" "1"
+set -e
 
 kill "$C1_GW_PID" "$C1STUB_PID" 2>/dev/null || :
 wait "$C1_GW_PID" "$C1STUB_PID" 2>/dev/null || :
+
+# --- C1 success path: a 200 continuation must stream the model's answer through, not
+# swallow it. The continuation (continueAfterAdvisor) references resIdx, which lives in the
+# onAdvisorToolUse closure; if that capture breaks the success path loses the answer. A 200
+# stub proves the answer round-trips.
+cat > c1okstub.mjs <<'OKSTUB'
+import fs from "node:fs";
+import https from "node:https";
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      const isContinuation = body.includes('"role":"tool"') && body.includes('"tool_call_id"');
+      if (isContinuation) {
+        const payload = { id: "c", choices: [{ index: 0,
+          message: { role: "assistant", content: "THE MODEL ANSWER" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 } };
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify(payload));
+      }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_c1","type":"function","function":{"name":"consult_advisor","arguments":""}}]}}]}\n\n');
+      res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`C1OKPORT=${s.address().port}`));
+OKSTUB
+
+node c1okstub.mjs > c1okstub.out 2>&1 &
+C1OKSTUB_PID=$!
+C1OKUP=""
+while [ -z "$C1OKUP" ]; do C1OKUP=$(sed -n 's/^C1OKPORT=//p' c1okstub.out); done
+
+C1_OK_PORT=4300
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > c1okgateway.mjs
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$C1OKUP/v1" \
+CORTI_PORT="$C1_OK_PORT" \
+CORTI_ADVISOR_STUB="$SCRATCH/advisor-stub.sh" \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node c1okgateway.mjs > c1okgw.out 2>&1 &
+C1_OK_GW_PID=$!
+wait_banner c1okgw.out || { echo "FAIL C1-OK gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+
+C1OKG="http://127.0.0.1:$C1_OK_PORT"
+C1OKRESP=$(curl -s -m 15 -N -H 'content-type: application/json' -d "$C1BODY" "$C1OKG/v1/messages" 2>&1 || true)
+
+# set +e: same as the non-2xx block — a crashed gateway yields zero-match grep -c (exit 1), which
+# set -e would abort on; we want clean FAIL lines.
+set +e
+# The model's answer must come through on a 200 continuation — guards against the continuation
+# losing the answer when its block-index capture goes out of scope.
+check "C1: 200 continuation streams the model answer through" \
+  "$(printf '%s' "$C1OKRESP" | grep -c 'THE MODEL ANSWER')" "1"
+check "C1: 200 continuation streams advisor advice" \
+  "$(printf '%s' "$C1OKRESP" | grep -c 'stub advisor advice')" "1"
+check "C1: 200 continuation emits no failure note" \
+  "$(printf '%s' "$C1OKRESP" | grep -c 'proceed using the advice above')" "0"
+set -e
+
+kill "$C1_OK_GW_PID" "$C1OKSTUB_PID" 2>/dev/null || :
+wait "$C1_OK_GW_PID" "$C1OKSTUB_PID" 2>/dev/null || :
 
 if [ "$FAILED" -gt 0 ]; then
   printf '\n%s check(s) failed\n' "$FAILED"
