@@ -710,8 +710,7 @@ async function handleMessages(req, res, body) {
             headers: { "content-type": "application/json", authorization: `Bearer ${BEARER}`, "content-length": body.length },
           }, (up) => {
             const chunks = [];
-            // Non-streaming, but bytes still arrive incrementally — feed the stream-idle watchdog
-            // so it doesn't false-fire at STREAM_IDLE_MS on a slow response (sendUpstream does too).
+            // Feed the watchdog: a slow non-streaming response still arrives byte-by-byte.
             up.on("data", (c) => { chunks.push(c); lastActivity = Date.now(); });
             up.on("end", () => {
               if (finalized || clientGone) return resolve();

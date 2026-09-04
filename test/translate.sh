@@ -274,6 +274,15 @@ _resetAdvisorProcessed();
 a1Calls = 0;
 await applyIntercepts(JSON.parse(JSON.stringify(a1Body)), { runAdvisor: a1Stub, parentSessionId: "sess-other", mode: "openai" });
 check("A1: a different session is not blocked by another", a1Calls, 3);
+// No session id: dedup must be OFF — a missing x-claude-code-session-id has no safe cross-request
+// key, so each call gets a throwaway map and re-spawns (no shared "__untracked__" bucket).
+_resetAdvisorProcessed();
+a1Calls = 0;
+await applyIntercepts(JSON.parse(JSON.stringify(a1Body)), { runAdvisor: a1Stub, mode: "openai" });
+check("A1: no session id still spawns (3)", a1Calls, 3);
+a1Calls = 0;
+await applyIntercepts(JSON.parse(JSON.stringify(a1Body)), { runAdvisor: a1Stub, mode: "openai" });
+check("A1: no session id re-spawns on replay (no cross-request cache)", a1Calls, 3);
 
 // Block H — C6: prior-turn advisor advice round-trips into history instead of being dropped.
 // advisor_tool_result is NOT in SERVER_BLOCK_TYPES (only server_tool_use is); before the fix it

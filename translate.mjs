@@ -244,19 +244,20 @@ const advisorMaxTokens = () => Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2
 const ADVISOR_TOOL_NAME = "consult_advisor";
 const ADVISOR_TOOL_NAMES = new Set([ADVISOR_TOOL_NAME]);
 
-// Per-session cache: processed consult_advisor id -> guidance text. A historical "Unknown tool"
-// result re-sent on a later turn is rewritten from cache WITHOUT re-spawning. Keyed on sessionId.
+/** Per-session cache: consult_advisor id -> guidance text, so a re-sent "Unknown tool" result
+ *  rewrites from cache without re-spawning. No session id → throwaway map (no cross-request leak). */
 const ADVISOR_PROCESSED_CAP = 64;
+const ADVISOR_PROCESSED_PER_SESSION = 128;
 const advisorProcessedBySession = new Map();
 
 function advisorProcessedMap(sessionId) {
-  const key = sessionId || "__untracked__";
-  let map = advisorProcessedBySession.get(key);
+  if (!sessionId) return new Map();
+  let map = advisorProcessedBySession.get(sessionId);
   if (!map) {
     if (advisorProcessedBySession.size >= ADVISOR_PROCESSED_CAP)
       advisorProcessedBySession.delete(advisorProcessedBySession.keys().next().value);
     map = new Map();
-    advisorProcessedBySession.set(key, map);
+    advisorProcessedBySession.set(sessionId, map);
   }
   return map;
 }
@@ -603,6 +604,8 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
       }
       b.content = guidance;
       b.is_error = false;
+      if (processed.size >= ADVISOR_PROCESSED_PER_SESSION)
+        processed.delete(processed.keys().next().value);
       processed.set(b.tool_use_id, guidance);
       const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
       const resStr = res?.ok ? `advisor=${res.text.length} chars` : `advisor_error=${res?.code || "unavailable"}`;
