@@ -115,6 +115,13 @@ install_wrapper() {
     chmod +x "$CC_BIN_DIR/corti-bridge"
     ui_wrote "$_cc_verb $(ui_tilde "$CC_BIN_DIR/corti-bridge")"
   fi
+
+  # Remove a pre-rename wrapper so a user typing the old name out of habit
+  # doesn't run a stale launcher pointing at the old state dir.
+  if [ -f "$CC_BIN_DIR/corti-claude" ]; then
+    rm -f "$CC_BIN_DIR/corti-claude"
+    ui_wrote "removed legacy $(ui_tilde "$CC_BIN_DIR/corti-claude")"
+  fi
 }
 
 # Falls back to the fresh profile rather than re-prompting.
@@ -202,6 +209,10 @@ uninstall() {
     ui_wrote "removed $(ui_tilde "$CC_BIN_DIR/corti-bridge")"
   else
     ui_detail "no wrapper at $(ui_tilde "$CC_BIN_DIR/corti-bridge")"
+  fi
+  if [ -f "$CC_BIN_DIR/corti-claude" ]; then
+    rm -f "$CC_BIN_DIR/corti-claude"
+    ui_wrote "removed legacy $(ui_tilde "$CC_BIN_DIR/corti-claude")"
   fi
   pathrc_remove
   ui_blank

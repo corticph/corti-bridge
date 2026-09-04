@@ -189,6 +189,34 @@ case "$guard_out" in
   *) fail "wrapper: missing gateway.mjs (got '$guard_out')" ;;
 esac
 
+# State-dir migration: a pre-rename ~/.corti-claude is copied to ~/.corti-bridge
+# when no CORTI_PROXY_CONFIG_DIR is set. --restart resolves CORTI_DIR (running
+# _resolve_state_dir) before the gateway.mjs check, so the migration happens.
+_mig="$SCRATCH/migrate"
+mkdir -p "$_mig/home/.corti-claude" "$_mig/home/.corti-bridge"
+printf 'OPUS=corti-s1\n' > "$_mig/home/.corti-claude/models.env"
+printf 'CLAUDE_CONFIG_DIR=/x\n' > "$_mig/home/.corti-claude/profile.env"
+HOME="$_mig/home" CORTI_PORT=45918 CORTI_PROXY_DIR="$SCRATCH/nowhere" \
+  CORTI_BEARER=dummy CORTI_BASE_URL=https://ai.eu.corti.app/v1 \
+  sh "$REPO/bin/corti-bridge" --restart >/dev/null 2>&1 || true
+if [ -f "$_mig/home/.corti-bridge/models.env" ] && [ -f "$_mig/home/.corti-bridge/profile.env" ]; then
+  pass "migrate: ~/.corti-claude config copied to ~/.corti-bridge"
+else
+  fail "migrate: ~/.corti-bridge missing copied config"
+fi
+
+# Idempotent: a second run must not re-copy (and must not clobber). models.env
+# content survives unchanged.
+printf 'OPUS=overwritten\n' > "$_mig/home/.corti-claude/models.env"
+HOME="$_mig/home" CORTI_PORT=45919 CORTI_PROXY_DIR="$SCRATCH/nowhere" \
+  CORTI_BEARER=dummy CORTI_BASE_URL=https://ai.eu.corti.app/v1 \
+  sh "$REPO/bin/corti-bridge" --restart >/dev/null 2>&1 || true
+if [ "$(cat "$_mig/home/.corti-bridge/models.env")" = "OPUS=corti-s1" ]; then
+  pass "migrate: idempotent — existing ~/.corti-bridge not clobbered"
+else
+  fail "migrate: re-copied over existing config (not idempotent)"
+fi
+
 . "$REPO/lib/ui.sh"
 . "$REPO/lib/models.sh"
 . "$REPO/lib/profile.sh"

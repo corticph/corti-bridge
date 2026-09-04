@@ -328,10 +328,13 @@ export function runAdvisor(text, opts = {}) {
         // carries the child's own error text when it exited non-zero — the most useful signal.
         const detail = `code=${err.code || "?"} msg=${String(err.message || "").slice(0, 200)}` +
           (stderr ? ` stderr=${String(stderr).trim().slice(0, 200)}` : "");
+        const hint = err.code === "ENOENT"
+          ? " (the corti-bridge wrapper isn't on PATH — run ./setup.sh to install it)"
+          : "";
         return resolve({
           ok: false,
           code: err.code === "ETIMEDOUT" ? "execution_time_exceeded" : "unavailable",
-          detail,
+          detail: detail + hint,
         });
       }
       try {
@@ -540,7 +543,10 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
       } else {
         // The advisor failed (timeout / unavailable / etc). The executor sees the failure and
         // continues without advice; the request itself does not fail (official §"Error results").
-        b.content = advisorGuidanceText(`advisor unavailable (${res?.code || "unavailable"})`);
+        const enoentHint = typeof res?.detail === "string" && res.detail.includes("isn't on PATH")
+          ? " — run ./setup.sh to install the renamed wrapper"
+          : "";
+        b.content = advisorGuidanceText(`advisor unavailable (${res?.code || "unavailable"})${enoentHint}`);
         b.is_error = false;
       }
       const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";

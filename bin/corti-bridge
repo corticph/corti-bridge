@@ -3,11 +3,8 @@
 # Installed by corti-bridge setup. Safe to replace — your config lives in ~/.corti-bridge/.
 set -eu
 
-# Resolve the state dir: explicit env var wins (CORTI_PROXY_CONFIG_DIR, then the
-# legacy CC_PROXY_CONFIG_DIR for installs that still set it); otherwise the
-# default ~/.corti-bridge, migrating from the old ~/.corti-bridge if present.
-# Migrate is a one-time copy of the two real config files — runtime pid/log are
-# ephemeral and recreated, so we don't move them.
+# Resolve state dir: new env var, then legacy CC_PROXY_CONFIG_DIR, else default
+# ~/.corti-bridge (one-time copy of models.env/profile.env from ~/.corti-claude).
 _resolve_state_dir() {
   case "${CORTI_PROXY_CONFIG_DIR:-${CC_PROXY_CONFIG_DIR:-}}" in
     '') ;;
@@ -25,10 +22,9 @@ _resolve_state_dir() {
 CORTI_DIR="$(_resolve_state_dir)"
 unset -f _resolve_state_dir 2>/dev/null || true
 unset _rsd_new 2>/dev/null || true
-# PROXY_DIR is kept simple (no legacy-var nesting): setup.sh bakes the clone
-# path via a sed that matches this exact line, and doctor.sh:87 extracts it
-# with a `[^}]*` regex that an inner `}` would break. The legacy CC_PROXY_DIR
-# fallback lives in the state-dir resolver above, not here.
+# Fold legacy CC_PROXY_DIR into the new name before the baked line. PROXY_DIR
+# stays single-var: setup.sh's sed and doctor.sh's `[^}]*` regex match that form.
+: "${CORTI_PROXY_DIR:=${CC_PROXY_DIR:-}}"
 PROXY_DIR="${CORTI_PROXY_DIR:-/path/to/corti-bridge}"  # setup.sh rewrites this to the real clone path at install time
 PORT="${CORTI_PORT:-4192}"
 GATEWAY="http://${CORTI_HOST:-127.0.0.1}:$PORT"
