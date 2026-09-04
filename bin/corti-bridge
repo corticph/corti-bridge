@@ -1,10 +1,35 @@
 #!/bin/sh
 # Claude Code on Corti models. Starts the proxy if needed, then launches claude.
-# Installed by corti-claude-proxy setup. Safe to replace — your config lives in ~/.corti-claude/.
+# Installed by corti-bridge setup. Safe to replace — your config lives in ~/.corti-bridge/.
 set -eu
 
-CORTI_DIR="${CC_PROXY_CONFIG_DIR:-$HOME/.corti-claude}"
-PROXY_DIR="${CC_PROXY_DIR:-/path/to/corti-claude-proxy}"  # setup.sh rewrites this to the real clone path at install time
+# Resolve the state dir: explicit env var wins (CORTI_PROXY_CONFIG_DIR, then the
+# legacy CC_PROXY_CONFIG_DIR for installs that still set it); otherwise the
+# default ~/.corti-bridge, migrating from the old ~/.corti-bridge if present.
+# Migrate is a one-time copy of the two real config files — runtime pid/log are
+# ephemeral and recreated, so we don't move them.
+_resolve_state_dir() {
+  case "${CORTI_PROXY_CONFIG_DIR:-${CC_PROXY_CONFIG_DIR:-}}" in
+    '') ;;
+    *) printf '%s' "${CORTI_PROXY_CONFIG_DIR:-${CC_PROXY_CONFIG_DIR}}"; return ;;
+  esac
+  _rsd_new="$HOME/.corti-bridge"
+  if [ ! -f "$_rsd_new/models.env" ] && [ -f "$HOME/.corti-claude/models.env" ]; then
+    mkdir -p "$_rsd_new"
+    cp -p "$HOME/.corti-claude/models.env" "$_rsd_new/" 2>/dev/null || true
+    [ -f "$HOME/.corti-claude/profile.env" ] && cp -p "$HOME/.corti-claude/profile.env" "$_rsd_new/" 2>/dev/null || true
+    echo "corti-bridge: migrated config from ~/.corti-claude — safe to delete that folder now" >&2
+  fi
+  printf '%s' "$_rsd_new"
+}
+CORTI_DIR="$(_resolve_state_dir)"
+unset -f _resolve_state_dir 2>/dev/null || true
+unset _rsd_new 2>/dev/null || true
+# PROXY_DIR is kept simple (no legacy-var nesting): setup.sh bakes the clone
+# path via a sed that matches this exact line, and doctor.sh:87 extracts it
+# with a `[^}]*` regex that an inner `}` would break. The legacy CC_PROXY_DIR
+# fallback lives in the state-dir resolver above, not here.
+PROXY_DIR="${CORTI_PROXY_DIR:-/path/to/corti-bridge}"  # setup.sh rewrites this to the real clone path at install time
 PORT="${CORTI_PORT:-4192}"
 GATEWAY="http://${CORTI_HOST:-127.0.0.1}:$PORT"
 # Per-port, so stopping one gateway cannot take down another started from the same clone.
@@ -56,8 +81,8 @@ gateway_stop() {
 gateway_start() {
     # An uninstalled wrapper still holds the placeholder path; say so instead of polling for 20s.
     if [ ! -f "$PROXY_DIR/gateway.mjs" ]; then
-        echo "corti-claude: no gateway.mjs at $PROXY_DIR" >&2
-        echo "corti-claude: run ./setup.sh from your clone to install the wrapper, or set CC_PROXY_DIR to the clone path" >&2
+        echo "corti-bridge: no gateway.mjs at $PROXY_DIR" >&2
+        echo "corti-bridge: run ./setup.sh from your clone to install the wrapper, or set CORTI_PROXY_DIR to the clone path" >&2
         exit 1
     fi
     nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 &
@@ -78,28 +103,28 @@ case "${1:-}" in
     --stop)
         mkdir -p "$CORTI_DIR"
         if gateway_stop; then
-            echo "corti-claude: gateway stopped" >&2
+            echo "corti-bridge: gateway stopped" >&2
             exit 0
         fi
-        echo "corti-claude: the gateway on $GATEWAY didn't stop — stop it manually (pkill -f gateway.mjs)" >&2
+        echo "corti-bridge: the gateway on $GATEWAY didn't stop — stop it manually (pkill -f gateway.mjs)" >&2
         exit 1
         ;;
     --restart|restart)
         mkdir -p "$CORTI_DIR"
         # Creds before kill: don't drop a working gateway for a missing token.
         if [ -z "${CORTI_BEARER:-}" ] || [ -z "${CORTI_BASE_URL:-}" ]; then
-            echo "corti-claude: CORTI_BEARER and CORTI_BASE_URL must be set to restart the gateway" >&2
+            echo "corti-bridge: CORTI_BEARER and CORTI_BASE_URL must be set to restart the gateway" >&2
             exit 1
         fi
         if ! gateway_stop; then
-            echo "corti-claude: the gateway on $GATEWAY didn't stop — stop it manually (pkill -f gateway.mjs)" >&2
+            echo "corti-bridge: the gateway on $GATEWAY didn't stop — stop it manually (pkill -f gateway.mjs)" >&2
             exit 1
         fi
         if ! gateway_start; then
-            echo "corti-claude: gateway failed to start — see $CORTI_DIR/gateway.log" >&2
+            echo "corti-bridge: gateway failed to start — see $CORTI_DIR/gateway.log" >&2
             exit 1
         fi
-        echo "corti-claude: gateway restarted" >&2
+        echo "corti-bridge: gateway restarted" >&2
         exit 0
         ;;
     doctor)
@@ -116,7 +141,7 @@ case "${1:-}" in
             _cc_lib_ok=1
         fi
         if [ "$_cc_lib_ok" != 1 ]; then
-            echo "corti-claude: doctor needs the full lib (run ./setup.sh from your clone first, or set CC_PROXY_DIR)" >&2
+            echo "corti-bridge: doctor needs the full lib (run ./setup.sh from your clone first, or set CORTI_PROXY_DIR)" >&2
             exit 1
         fi
         unset _cc_lib_ok
@@ -128,12 +153,12 @@ case "${1:-}" in
         # The interactive model picker. Needs creds (like --restart) but not claude or a gateway
         # — it only talks to Corti's /models and writes models.env.
         if [ -z "${CORTI_BEARER:-}" ] || [ -z "${CORTI_BASE_URL:-}" ]; then
-            echo "corti-claude: CORTI_BEARER and CORTI_BASE_URL must be set to pick models" >&2
-            echo "corti-claude: run 'npx @corti/cli models init', then open a new terminal" >&2
+            echo "corti-bridge: CORTI_BEARER and CORTI_BASE_URL must be set to pick models" >&2
+            echo "corti-bridge: run 'npx @corti/cli models init', then open a new terminal" >&2
             exit 1
         fi
         if [ ! -f "$PROXY_DIR/lib/models.sh" ]; then
-            echo "corti-claude: models needs the full lib (run ./setup.sh from your clone first, or set CC_PROXY_DIR)" >&2
+            echo "corti-bridge: models needs the full lib (run ./setup.sh from your clone first, or set CORTI_PROXY_DIR)" >&2
             exit 1
         fi
         CC_REPO_DIR="$PROXY_DIR"
@@ -155,7 +180,7 @@ case "${1:-}" in
             _cc_profile="${CLAUDE_CONFIG_DIR:-$CORTI_DIR}"
         fi
         cat <<EOF
-corti-claude theme — the lime-mascot TUI theme, and how to install it.
+corti-bridge theme — the lime-mascot TUI theme, and how to install it.
 
 A cosmetic theme for the Claude Code TUI: recolors the Claude/mascot wordmark
 lime green. This command writes nothing — enabling a theme means editing
@@ -182,22 +207,22 @@ settings.json, which this tool never does. Two steps to install by hand:
 
      "theme": "custom:lime-mascot"
 
-Start a new corti-claude session to see it. Remove the "theme" key to revert.
+Start a new corti-bridge session to see it. Remove the "theme" key to revert.
 EOF
         unset _cc_profile
         exit 0
         ;;
     --help|-h|help)
         cat <<EOF
-corti-claude — Claude Code on Corti models.
+corti-bridge — Claude Code on Corti models.
 
-Usage: corti-claude [--anthropic] [args passed to claude]
-       corti-claude --stop
-       corti-claude restart
-       corti-claude doctor [--deep]
-       corti-claude models [--experimental] [--reset]
-       corti-claude theme
-       corti-claude help
+Usage: corti-bridge [--anthropic] [args passed to claude]
+       corti-bridge --stop
+       corti-bridge restart
+       corti-bridge doctor [--deep]
+       corti-bridge models [--experimental] [--reset]
+       corti-bridge theme
+       corti-bridge help
 
   (default)    Start the gateway if needed, then launch claude
   --anthropic  Use Corti's /anthropic pass-through mode (default: openai translator)
@@ -216,8 +241,8 @@ EOF
 esac
 
 if [ -z "${CORTI_BEARER:-}" ] || [ -z "${CORTI_BASE_URL:-}" ]; then
-    echo "corti-claude: CORTI_BEARER and CORTI_BASE_URL must be set in your environment" >&2
-    echo "corti-claude: run 'npx @corti/cli models init', then open a new terminal" >&2
+    echo "corti-bridge: CORTI_BEARER and CORTI_BASE_URL must be set in your environment" >&2
+    echo "corti-bridge: run 'npx @corti/cli models init', then open a new terminal" >&2
     exit 1
 fi
 
@@ -226,13 +251,13 @@ fi
 case "$CORTI_BASE_URL" in
     https://ai.*.corti.app/v1) ;;
     *)
-        echo "corti-claude: CORTI_BASE_URL must look like https://ai.<env>.corti.app/v1 (got: $CORTI_BASE_URL)" >&2
+        echo "corti-bridge: CORTI_BASE_URL must look like https://ai.<env>.corti.app/v1 (got: $CORTI_BASE_URL)" >&2
         exit 1
         ;;
 esac
 
 if ! command -v claude >/dev/null 2>&1; then
-    echo "corti-claude: the 'claude' command isn't on your PATH - install Claude Code first" >&2
+    echo "corti-bridge: the 'claude' command isn't on your PATH - install Claude Code first" >&2
     exit 1
 fi
 
@@ -261,12 +286,12 @@ esac
 
 health="$(gateway_health)"
 if [ -n "$health" ] && ! gateway_is_ours "$health"; then
-    echo "corti-claude: something else is listening on $GATEWAY - set CORTI_PORT to a free port" >&2
+    echo "corti-bridge: something else is listening on $GATEWAY - set CORTI_PORT to a free port" >&2
     exit 1
 fi
 
 # CORTI_NO_MANAGE_GATEWAY: use the running gateway as-is, never stop/start it. The advisor
-# child (runAdvisor in translate.mjs) sets this: it spawns `corti-claude -p` as a one-shot
+# child (runAdvisor in translate.mjs) sets this: it spawns `corti-bridge -p` as a one-shot
 # print run through the SAME gateway the parent is serving on, and must not manage that
 # gateway's lifecycle. Without this guard a debug-mode mismatch (parent started with
 # CORTI_DEBUG=1, child with it stripped) would make the child's wrapper restart-kill its
@@ -302,17 +327,17 @@ if [ -n "$health" ]; then
             if [ -z "$restart_reason" ]; then restart_reason="CORTI_BASE_URL changed"; fi ;;
     esac
     if [ -n "$restart_reason" ]; then
-        echo "corti-claude: $restart_reason — restarting gateway..." >&2
+        echo "corti-bridge: $restart_reason — restarting gateway..." >&2
         if ! gateway_stop; then
-            echo "corti-claude: warning — the old gateway on $GATEWAY didn't stop; stop it manually and retry" >&2
+            echo "corti-bridge: warning — the old gateway on $GATEWAY didn't stop; stop it manually and retry" >&2
         fi
     fi
 fi
 
 if ! gateway_is_ours "$(gateway_health)"; then
-    echo "corti-claude: starting gateway..." >&2
+    echo "corti-bridge: starting gateway..." >&2
     if ! gateway_start; then
-        echo "corti-claude: gateway failed to start — see $CORTI_DIR/gateway.log" >&2
+        echo "corti-bridge: gateway failed to start — see $CORTI_DIR/gateway.log" >&2
         exit 1
     fi
 fi
@@ -322,9 +347,9 @@ fi  # CORTI_NO_MANAGE_GATEWAY
 if [ "$want_debug" = 1 ]; then
     log_path="$(gateway_health | sed -n 's/.*"debug":"\([^"]*\)".*/\1/p')"
     if [ -n "$log_path" ]; then
-        echo "corti-claude: debug log -> $log_path" >&2
+        echo "corti-bridge: debug log -> $log_path" >&2
     else
-        echo "corti-claude: warning — gateway isn't debug-logging; stop it manually and retry" >&2
+        echo "corti-bridge: warning — gateway isn't debug-logging; stop it manually and retry" >&2
     fi
 fi
 

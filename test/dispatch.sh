@@ -3,7 +3,7 @@
 # by URL path prefix. Zero dependencies beyond node + openssl (skipped without the latter).
 #
 # The gateway only accepts a real Corti URL, so this runs against a copy with that check
-# relaxed to localhost. Never point CC_PROXY_DIR at a live clone when running lifecycle
+# relaxed to localhost. Never point CORTI_PROXY_DIR at a live clone when running lifecycle
 # tests — the pattern-kill fallback matches by clone path.
 #
 # Run: sh test/dispatch.sh

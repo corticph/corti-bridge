@@ -217,17 +217,17 @@ function formatSearchResults(query, results) {
 }
 
 /* ------------------------------------------------------------------ */
-/* advisor: headless corti-claude backing (consult_advisor intercept)  */
+/* advisor: headless corti-bridge backing (consult_advisor intercept)  */
 /* ------------------------------------------------------------------ */
 
-// The advisor runs as a headless `corti-claude -p` session through this same gateway, so it
+// The advisor runs as a headless `corti-bridge -p` session through this same gateway, so it
 // inherits the Corti model mapping. The recursion guard has two layers: the env var below
 // gates injection on the gateway, and the advisor child is spawned WITHOUT it (so its own
 // requests don't re-inject) and with `--tools ""` (so it can't emit a tool_use at all).
 const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const ADVISOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-prompt.txt");
 const ADVISOR_EXECUTOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-executor-prompt.txt");
-// The advisor is a headless Opus-tier `corti-claude -p` reasoning over a large serialized
+// The advisor is a headless Opus-tier `corti-bridge -p` reasoning over a large serialized
 // transcript — a single consult can legitimately take minutes, not seconds. 60s was
 // observed timing out in real sessions. 8 minutes is the floor; raise CORTI_ADVISOR_TIMEOUT_MS
 // to extend further. The gateway's stream-idle watchdog is suppressed for the advisor
@@ -235,7 +235,7 @@ const ADVISOR_EXECUTOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-execut
 const ADVISOR_TIMEOUT_MS = Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 8 * 60_000;
 const ADVISOR_MODEL = process.env.CORTI_ADVISOR_MODEL || "opus";
 // Soft per-call output cap, surfaced to the advisor via the serialized transcript's budget
-// line. The official advisor tool sets a hard `max_tokens` on the tool def; corti-claude -p
+// line. The official advisor tool sets a hard `max_tokens` on the tool def; corti-bridge -p
 // exposes no such flag, so this is a soft steer (the advisor shapes to fit) plus the hard
 // ADVISOR_TIMEOUT_MS / maxBuffer ceilings. 2048 is the official "recommended starting point."
 // Read at call time (not module load) so per-test env changes take effect.
@@ -256,7 +256,7 @@ const ADVISOR_TOOL_DEF = {
   input_schema: { type: "object", properties: {}, additionalProperties: false },
 };
 
-// Runs the advisor as a headless corti-claude session. Resolves to a discriminated result:
+// Runs the advisor as a headless corti-bridge session. Resolves to a discriminated result:
 //   { ok: true,  text }            — the advisor's guidance (plaintext)
 //   { ok: false, code }            — a failure, mapped to an official advisor_tool_result_error
 //                                    error_code (execution_time_exceeded | unavailable |
@@ -283,7 +283,7 @@ export function runAdvisor(text, opts = {}) {
       "--input-format", "text",
     ];
     const env = { ...process.env };
-    // The child must not inherit the gateway's debug logging: CORTI_DEBUG makes corti-claude
+    // The child must not inherit the gateway's debug logging: CORTI_DEBUG makes corti-bridge
     // tee verbose output to stdout/stderr (and write its own gateway-*.log), which inflated
     // the child's stdout past the 4MB maxBuffer and failed the consult with
     // ERR_CHILD_PROCESS_STDIO_MAXBUFFER. The advisor runs silently; the gateway logs its
@@ -296,7 +296,7 @@ export function runAdvisor(text, opts = {}) {
     // restart-kill its own parent gateway mid-consult ("Server error mid-response"). Tell the
     // wrapper to use the running gateway as-is — no stop, no start, no restart.
     env.CORTI_NO_MANAGE_GATEWAY = "1";
-    // Recursion guard: ask the corti-claude wrapper to stamp the -noadvisor marker on the
+    // Recursion guard: ask the corti-bridge wrapper to stamp the -noadvisor marker on the
     // child's auth token, which the gateway's wantsNoAdvisor() skips injection on. The
     // gateway process env has no ANTHROPIC_AUTH_TOKEN (the wrapper sets it after spawning
     // the gateway), so we can't stamp the suffix here — the wrapper must do it.
@@ -315,7 +315,7 @@ export function runAdvisor(text, opts = {}) {
     // the real advice is small (the successful consult returned 624 chars), but the event
     // stream surrounding it is not. The `detail` capture surfaces a maxBuffer failure with its
     // err.code if this is ever too small again.
-    const child = execFile("corti-claude", args, {
+    const child = execFile("corti-bridge", args, {
       env,
       timeout: ADVISOR_TIMEOUT_MS,
       maxBuffer: 32 * 1024 * 1024,
@@ -323,7 +323,7 @@ export function runAdvisor(text, opts = {}) {
       if (err) {
         // Capture the raw failure so the gateway diagnostic can show WHY, not just that, it
         // failed. execFile sets err.code === "ETIMEDOUT" when the timeout fires; other codes
-        // (ENOENT if corti-claude isn't on PATH, ERR_CHILD_PROCESS_STDIO_MAXBUFFER if stdout
+        // (ENOENT if corti-bridge isn't on PATH, ERR_CHILD_PROCESS_STDIO_MAXBUFFER if stdout
         // or stderr exceeded maxBuffer, a non-zero exit) are non-timeout failures. stderr
         // carries the child's own error text when it exited non-zero — the most useful signal.
         const detail = `code=${err.code || "?"} msg=${String(err.message || "").slice(0, 200)}` +
