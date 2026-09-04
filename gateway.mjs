@@ -710,7 +710,9 @@ async function handleMessages(req, res, body) {
             headers: { "content-type": "application/json", authorization: `Bearer ${BEARER}`, "content-length": body.length },
           }, (up) => {
             const chunks = [];
-            up.on("data", (c) => chunks.push(c));
+            // Non-streaming, but bytes still arrive incrementally — feed the stream-idle watchdog
+            // so it doesn't false-fire at STREAM_IDLE_MS on a slow response (sendUpstream does too).
+            up.on("data", (c) => { chunks.push(c); lastActivity = Date.now(); });
             up.on("end", () => {
               if (finalized || clientGone) return resolve();
               // The continuation can't retry (advice SSE already written, invariant #3); a non-2xx
