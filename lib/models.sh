@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=sh
 # Maps each Claude Code tier to the Corti model that backs it, recorded in models.env
 # (sourced by bin/corti-bridge).
 #

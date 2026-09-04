@@ -32,8 +32,6 @@ This is a reference, not a tutorial. For install and run, see the [README](READM
 - **errors** — upstream errors translated into Anthropic's envelope. Critically, context-overflow conditions become `400 prompt is too long`, which is what drives Claude Code's auto-compact
 - **`/v1/models`** — serves the translated catalog for gateway model discovery
 
-Reasoning effort rounding: effort is rounded up to `high` on `corti-s1-ultra` models.
-
 ## Model config
 
 `setup.sh` asks whether to fetch Corti's catalog and generates `~/.corti-bridge/models.env` — for example:
