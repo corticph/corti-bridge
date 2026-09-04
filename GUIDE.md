@@ -1,4 +1,4 @@
-# corti-claude — Guide
+# corti-bridge — Guide
 
 The README sells. This document explains — the translation surface, the model-ranking program, the installer, and every known trade-off and degradation. Read it when something isn't behaving the way you expected, or before you change how the gateway works.
 
@@ -36,7 +36,7 @@ Reasoning effort rounding: effort is rounded up to `high` on `corti-s1-ultra` mo
 
 ## Model config
 
-`setup.sh` asks whether to fetch Corti's catalog and generates `~/.corti-claude/models.env` — for example:
+`setup.sh` asks whether to fetch Corti's catalog and generates `~/.corti-bridge/models.env` — for example:
 
 ```sh
 # Written by setup.sh. Do not edit by hand - run ./setup.sh --fresh to refresh.
@@ -56,7 +56,7 @@ CLAUDE_CODE_MAX_CONTEXT_TOKENS="524288"
 
 `fable` is a fourth tier Claude Code recognises alongside opus, sonnet and haiku, sitting above opus — it's where a model stronger than the opus pick goes. It is optional: Claude Code only offers it when `ANTHROPIC_DEFAULT_FABLE_MODEL` is set, which is why it's the one tier the installer may leave out entirely.
 
-Only `bin/corti-claude` reads this file; it exports these as environment variables just before launching Claude Code. **Nothing is written to any `settings.json`, yours or otherwise** — which is what keeps Corti model IDs from leaking into a plain `claude` session.
+Only `bin/corti-bridge` reads this file; it exports these as environment variables just before launching Claude Code. **Nothing is written to any `settings.json`, yours or otherwise** — which is what keeps Corti model IDs from leaking into a plain `claude` session.
 
 ### How tiers are ranked
 
@@ -110,9 +110,9 @@ The default flow never touches an existing `models.env`; `--fresh` is the only t
 For per-tier overrides without a full re-fetch, use the interactive picker:
 
 ```bash
-corti-claude models                   # pick a model for each tier; a non-default choice pins it
-corti-claude models --experimental    # include beta models in the candidate lists
-corti-claude models --reset           # clear all pins and re-rank from scratch
+corti-bridge models                   # pick a model for each tier; a non-default choice pins it
+corti-bridge models --experimental    # include beta models in the candidate lists
+corti-bridge models --reset           # clear all pins and re-rank from scratch
 ```
 
 The picker fetches the catalog on the spot and writes `models.env` with a `_PIN=1` line for any tier you changed; pressing Enter keeps the auto-rank pick and unpins. Its candidate lists come from the same `lib/models.mjs` as the ranker, so the menu and the auto-rank can't drift.
@@ -123,28 +123,28 @@ You can pin the fable tier by hand: add `ANTHROPIC_DEFAULT_FABLE_MODEL_PIN="1"` 
 
 ## Claude Code profile
 
-Claude Code keeps conversation history, plugins, skills, MCP servers and per-project trust in a profile directory. `setup.sh` asks which one Corti sessions should use and records the answer in `~/.corti-claude/profile.env`:
+Claude Code keeps conversation history, plugins, skills, MCP servers and per-project trust in a profile directory. `setup.sh` asks which one Corti sessions should use and records the answer in `~/.corti-bridge/profile.env`:
 
 - **`~/.claude`** (default) — your normal profile, so your history, plugins, skills, and MCP servers carry over.
-- **`~/.corti-claude`** — a clean room. Starts empty: no history, no plugins, no skills, no MCP servers. Use this if you want Corti sessions kept separate from your usual ones.
+- **`~/.corti-bridge`** — a clean room. Starts empty: no history, no plugins, no skills, no MCP servers. Use this if you want Corti sessions kept separate from your usual ones.
 - **A path you choose** — any other config directory, for anyone already keeping profiles apart (a separate work profile, say). `~` is expanded; the path must be absolute, and it does not need to exist yet.
 
 Whichever you pick, your regular `claude` is unaffected, because the model aliases are process-scoped exports rather than persisted settings. `--fresh` re-asks the profile choice (alongside re-detecting models); a bare `./setup.sh` reuses whatever `profile.env` already records.
 
-Note that `~/.corti-claude` (the proxy's state directory, `CC_PROXY_CONFIG_DIR`) is *not* the same thing as Claude Code's profile directory.
+Note that `~/.corti-bridge` (the proxy's state directory, `CORTI_PROXY_CONFIG_DIR`) is *not* the same thing as Claude Code's profile directory.
 
 ## The gateway
 
-`corti-claude` starts a local gateway on `127.0.0.1:4192` (set `CORTI_PORT` to move it) the first time you run it, and it **outlives any single session** — it keeps running after `corti-claude` exits, so the next session starts fast. That also means there's no first-class way to stop it just by quitting Claude Code. The gateway is managed with `--stop` and `restart`:
+`corti-bridge` starts a local gateway on `127.0.0.1:4192` (set `CORTI_PORT` to move it) the first time you run it, and it **outlives any single session** — it keeps running after `corti-bridge` exits, so the next session starts fast. That also means there's no first-class way to stop it just by quitting Claude Code. The gateway is managed with `--stop` and `restart`:
 
 ```bash
-corti-claude --stop       # stop the gateway and exit
-corti-claude restart      # stop then start it (needs CORTI_BEARER/CORTI_BASE_URL)
+corti-bridge --stop       # stop the gateway and exit
+corti-bridge restart      # stop then start it (needs CORTI_BEARER/CORTI_BASE_URL)
 ```
 
 `--stop` is a flag, not a bare command: `claude`'s own `stop|kill <id>` subcommand passes through the wrapper to stop a background session, and a bare `stop` would intercept it and silently kill the gateway instead. `restart` is safe as a bare command because `claude` uses `respawn`, not `restart`, for background sessions — no collision. The other subcommands (`doctor`, `models`, `theme`) shadow `claude`-verb equivalents that are low-value when proxied (`doctor` checks the Claude Code install, which the wrapper leaves healthy) or that don't exist (`models`, `theme`), so the proxy's command is the useful one. `--stop` needs nothing — not even credentials — so it works when something's wrong. `restart` checks credentials *before* stopping, so a typo'd `CORTI_BEARER` won't take down a working gateway. Stopping a gateway that's already stopped is not an error.
 
-Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require restarting the gateway: the gateway doesn't read `models.env` (the wrapper does, at launch), so a new mapping takes effect the next time you run `corti-claude`. You only need `restart` if you've changed `CORTI_BASE_URL` — and even then, a normal `corti-claude` run detects the staleness and restarts it for you. Switching `--anthropic` never needs one: both modes are always being served.
+Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require restarting the gateway: the gateway doesn't read `models.env` (the wrapper does, at launch), so a new mapping takes effect the next time you run `corti-bridge`. You only need `restart` if you've changed `CORTI_BASE_URL` — and even then, a normal `corti-bridge` run detects the staleness and restarts it for you. Switching `--anthropic` never needs one: both modes are always being served.
 
 ## Upstream failures and retries
 
@@ -166,12 +166,12 @@ Separately, silence *before* upstream sends response headers now has its own dea
 
 ## Debug logging
 
-For a first pass when something's off, run `corti-claude doctor` — it checks the install, gateway health, and state files passively (add `--deep` to also probe Corti's `/models` endpoint). If a specific request looks wrong, reach for the debug log below.
+For a first pass when something's off, run `corti-bridge doctor` — it checks the install, gateway health, and state files passively (add `--deep` to also probe Corti's `/models` endpoint). If a specific request looks wrong, reach for the debug log below.
 
 Set `CORTI_DEBUG` and the gateway writes every request and response to a log file, one per Claude Code session:
 
 ```bash
-CORTI_DEBUG=1 corti-claude
+CORTI_DEBUG=1 corti-bridge
 ```
 
 Each session's traffic lands in its own file — `gateway-session-<sessionId>-<timestamp>.log` — keyed by the session id Claude Code sends (`x-claude-code-session-id`). Advisor children file under the parent's session instead (`x-corti-advisor-for`), so an advisor consult stays in the parent's log. Untracked requests (no session id) share a single `gateway-session-untracked-*.log`.
@@ -180,7 +180,7 @@ The wrapper prints the log directory on startup, and `/health` reports it as `de
 
 ```bash
 curl -s http://127.0.0.1:4192/health
-# {"status":"healthy","gatewayVersion":2,"mode":"openai","upstream":"https://ai.eu.corti.app/v1","debug":"/Users/you/Library/Logs/corti-claude-proxy"}
+# {"status":"healthy","gatewayVersion":2,"mode":"openai","upstream":"https://ai.eu.corti.app/v1","debug":"/Users/you/Library/Logs/corti-bridge"}
 #
 # `mode` is not a process-wide setting — it reports what a request carrying no path prefix
 # resolves to, which is what the wrapper compares when deciding whether to restart.
@@ -195,13 +195,13 @@ Where they go, in order of precedence:
 | | |
 |---|---|
 | `CORTI_DEBUG_DIR` | If set, used as-is |
-| macOS | `~/Library/Logs/corti-claude-proxy/` |
-| Linux/other | `$XDG_STATE_HOME/corti-claude-proxy/` (or `~/.local/state/...`) |
-| Fallback | `$TMPDIR/corti-claude-proxy/` if the above isn't writable |
+| macOS | `~/Library/Logs/corti-bridge/` |
+| Linux/other | `$XDG_STATE_HOME/corti-bridge/` (or `~/.local/state/...`) |
+| Fallback | `$TMPDIR/corti-bridge/` if the above isn't writable |
 
 Bodies are capped at 2 MB each by default so a long streaming response doesn't produce a giant file; raise it with `CORTI_DEBUG_MAX_BODY`, or set `0` for no cap. Truncated bodies are marked as such.
 
-The gateway is a background process that outlives any single `corti-claude` run, so toggling `CORTI_DEBUG` has to restart it — the wrapper handles that automatically, in both directions. If you started the gateway some other way, stop it yourself first.
+The gateway is a background process that outlives any single `corti-bridge` run, so toggling `CORTI_DEBUG` has to restart it — the wrapper handles that automatically, in both directions. If you started the gateway some other way, stop it yourself first.
 
 ## Environment reference
 
@@ -220,15 +220,15 @@ Read directly from the shell — no local secrets file.
 | `CORTI_DEBUG` | no | Any value except `0`/`false`/`no`/`off` turns on request/response logging |
 | `CORTI_DEBUG_DIR` | no | Where debug logs go; defaults per platform (see [Debug logging](#debug-logging)) |
 | `CORTI_DEBUG_MAX_BODY` | no | Per-body byte cap, default `2097152` (2 MB); `0` means unlimited |
-| `CORTI_ADVISOR` | no | `auto` (default) — the `consult_advisor` advisor tool is on in `openai` mode, off in `anthropic` mode. `on` — on in both modes. `off` — off in both modes. Unrecognized values warn once and use `auto`. The advisor spawns a headless `corti-claude -p` (Opus-tier by default, see `CORTI_ADVISOR_MODEL`) on the request path — a consult can take minutes; the child carries a recursion guard so it can't re-inject or recurse. |
+| `CORTI_ADVISOR` | no | `auto` (default) — the `consult_advisor` advisor tool is on in `openai` mode, off in `anthropic` mode. `on` — on in both modes. `off` — off in both modes. Unrecognized values warn once and use `auto`. The advisor spawns a headless `corti-bridge -p` (Opus-tier by default, see `CORTI_ADVISOR_MODEL`) on the request path — a consult can take minutes; the child carries a recursion guard so it can't re-inject or recurse. |
 | `CORTI_ADVISOR_MODEL` | no | Model alias for the advisor backing (default `opus`); resolved by the wrapper, so use a tier alias (`opus`, `sonnet`, `haiku`, `fable`), not a `claude-` name |
 | `CORTI_ADVISOR_TIMEOUT_MS` | no | Bound on the advisor spawn, default `480000` (8 min); on timeout the `tool_result` becomes `<advisor_guidance>advisor unavailable (execution_time_exceeded)</advisor_guidance>` rather than hanging the turn |
-| `CORTI_ADVISOR_MAX_TOKENS` | no | Soft per-call output cap, surfaced to the advisor via the serialized transcript's budget line; default `2048` (the official recommended starting point). No hard `max_tokens` cap exists through `corti-claude -p`; this is a soft steer plus the hard `CORTI_ADVISOR_TIMEOUT_MS` / maxBuffer ceilings. Lower it to bias toward brevity. |
+| `CORTI_ADVISOR_MAX_TOKENS` | no | Soft per-call output cap, surfaced to the advisor via the serialized transcript's budget line; default `2048` (the official recommended starting point). No hard `max_tokens` cap exists through `corti-bridge -p`; this is a soft steer plus the hard `CORTI_ADVISOR_TIMEOUT_MS` / maxBuffer ceilings. Lower it to bias toward brevity. |
 | `CORTI_ADVISOR_EFFORT` | no | Reasoning effort for the advisor child, default `high` (the official advisor default, not the `medium` that adaptive thinking maps to). The gateway applies this only to the advisor child (detected via the `-noadvisor-` token). Override with `medium` to keep consults cheaper, `low` is not recommended (it undermines the advisor's value). A model that rejects the level will 400 upstream. |
 
-`CC_PROXY_BIN_DIR` (defaults to `~/.local/bin`) controls where the wrapper is installed. `CC_PROXY_CONFIG_DIR` (defaults to `~/.corti-claude`) is the proxy's own state directory — model mapping, profile choice, gateway log. `CC_PROXY_DIR` tells the wrapper where `gateway.mjs` lives; `setup.sh` bakes your clone's real path into the installed wrapper, so you only need this if you move the clone afterwards.
+`CORTI_PROXY_BIN_DIR` (defaults to `~/.local/bin`) controls where the wrapper is installed. `CORTI_PROXY_CONFIG_DIR` (defaults to `~/.corti-bridge`) is the proxy's own state directory — model mapping, profile choice, gateway log. `CORTI_PROXY_DIR` tells the wrapper where `gateway.mjs` lives; `setup.sh` bakes your clone's real path into the installed wrapper, so you only need this if you move the clone afterwards. The legacy `CC_PROXY_BIN_DIR` / `CC_PROXY_CONFIG_DIR` / `CC_PROXY_DIR` names still work (read as a fallback), so existing scripts don't break on upgrade.
 
-`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, and `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` are exported by the `corti-claude` wrapper itself — that's plumbing this tool owns, not something you configure. (The attribution header is off because a per-request attribution line in the system prompt would defeat upstream prefix caching. The 1M context badge is disabled because it's misleading for proxied models — see degradations.)
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, and `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` are exported by the `corti-bridge` wrapper itself — that's plumbing this tool owns, not something you configure. (The attribution header is off because a per-request attribution line in the system prompt would defeat upstream prefix caching. The 1M context badge is disabled because it's misleading for proxied models — see degradations.)
 
 ## Known degradations (openai mode)
 
@@ -236,16 +236,16 @@ Compared to first-party Anthropic or `anthropic` mode, this setup cannot support
 
 - **WebSearch** — Anthropic's server-side search is stripped from requests, but the proxy converts it to a function tool and intercepts results via the Tavily API, falling back to a keyless DuckDuckGo scrape when `TAVILY_API_KEY` is unset or Tavily fails/rate-limits, so the model gets real search results. Other server-side tools (web_fetch etc.) are stripped with no replacement.
 - **PDF input** — base64 PDF document blocks are replaced with a visible `[PDF document omitted...]` placeholder.
-- **Misleading `[1M]` context badge** — newer Claude Code versions badge proxied models with a `[1M]` suffix via the server-side `context-1m` beta gate. `bin/corti-claude` neutralizes it by exporting `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`.
+- **Misleading `[1M]` context badge** — newer Claude Code versions badge proxied models with a `[1M]` suffix via the server-side `context-1m` beta gate. `bin/corti-bridge` neutralizes it by exporting `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`.
 - **A startup notice about the 200K limit is expected** — that export also makes Claude Code warn it can't enforce its 200K fallback. Auto-compaction already runs at the model's real window, so the notice is benign. Do not set `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to silence it — that value is a *cap* (`min(real_window, value)`), so it throws away context — and only values ≤ 200000 silence the notice at all; anything higher caps the window without silencing it.
 - **Image support depends on the resolved model** — not every Corti model is multimodal, and upstream rejects images for the ones that aren't with a clean `400 "not a multimodal model"`. If you use image workflows, point the tier you work in at a model that accepts them in `models.env`.
 - **Prompt-caching economics** — caching is upstream's automatic prefix cache; usage reports zeros for cache fields when caching isn't active.
-- **Reasoning signatures are synthetic** — thinking blocks emitted by the proxy carry a constant signature (`corti-proxy`, base64). Claude Code accepts and re-sends them; the proxy strips them from history on re-entry. If you ever take a session from `~/.corti-claude` and resume it against real Anthropic, those blocks will fail server-side signature validation — filter them out first.
+- **Reasoning signatures are synthetic** — thinking blocks emitted by the proxy carry a constant signature (`corti-proxy`, base64). Claude Code accepts and re-sends them; the proxy strips them from history on re-entry. If you ever take a session from `~/.corti-bridge` and resume it against real Anthropic, those blocks will fail server-side signature validation — filter them out first.
 - **Overflow is decided by tokens, not bytes** — upstream accepts multi-megabyte bodies, so the model's context window is what binds. Over-window turns become `prompt is too long` with a real token count, which is what drives compaction; only bodies over the gateway's own 8 MB byte cap get a local 413 instead.
 
 ### The advisor (openai mode)
 
-The `consult_advisor` advisor tool is **on by default in `openai` mode** (`CORTI_ADVISOR=auto`); set `CORTI_ADVISOR=off` to disable it. When the model calls the tool, the gateway **holds the turn**: it emits a synthetic `server_tool_use` + `advisor_tool_result` inline — the shape the harness renders as "Advising…" — runs the advisor (a headless `corti-claude -p`), then makes a second upstream call so the model answers in the same turn. That "Advising" via hold-and-continue is the openai experience.
+The `consult_advisor` advisor tool is **on by default in `openai` mode** (`CORTI_ADVISOR=auto`); set `CORTI_ADVISOR=off` to disable it. When the model calls the tool, the gateway **holds the turn**: it emits a synthetic `server_tool_use` + `advisor_tool_result` inline — the shape the harness renders as "Advising…" — runs the advisor (a headless `corti-bridge -p`), then makes a second upstream call so the model answers in the same turn. That "Advising" via hold-and-continue is the openai experience.
 
 Each consult spawns a headless session **on the request path**, so a turn that consults blocks for up to `CORTI_ADVISOR_TIMEOUT_MS` (8 min default) while the advisor reasons over the serialized transcript. The executor timing prompt (`lib/advisor-executor-prompt.txt`, ~2 KB / ~500-700 tokens) is prepended to every `openai` system prompt while the advisor is on, consulted or not — that is the per-request cost of default-on.
 
@@ -258,7 +258,7 @@ The advisor child reasons at **high effort by default** (`CORTI_ADVISOR_EFFORT`,
 ## `anthropic` mode
 
 ```bash
-corti-claude --anthropic
+corti-bridge --anthropic
 ```
 
 Points **this session** at the gateway's pass-through route instead of the translating one — no translation, every path forwarded, auth swap only. It changes nothing about the gateway: one process serves both routes at all times, so the flag costs no restart and does not disturb sessions running in the other mode. `count_tokens` is still answered locally by the estimator on both routes.
@@ -267,7 +267,7 @@ Mechanically, the wrapper exports `ANTHROPIC_BASE_URL=http://127.0.0.1:4192/anth
 
 `openai` mode is the default because pass-through loses something Claude Code relies on (see below), which the translation layer supplies. Use `openai` mode unless you have a reason not to.
 
-Use `anthropic` mode to escape-hatch a translation bug, or as a comparison harness: run `corti-claude` and `corti-claude --anthropic` **at the same time**. Both write to the same debug log, so the two modes interleave by timestamp in one file — compare by request id rather than diffing two logs from two gateway lifetimes.
+Use `anthropic` mode to escape-hatch a translation bug, or as a comparison harness: run `corti-bridge` and `corti-bridge --anthropic` **at the same time**. Both write to the same debug log, so the two modes interleave by timestamp in one file — compare by request id rather than diffing two logs from two gateway lifetimes.
 
 The cost is specific and worth knowing before you reach for it: Corti's `/anthropic` endpoint drops input-token accounting on streaming responses. `message_start` reports `usage: {"input_tokens": 0, "output_tokens": 0}` and `message_delta` carries only `output_tokens` — no input count, no cache fields. Claude Code always streams, so in this mode every transcript records zero input tokens and context/cost readouts stop working. Non-streaming requests to the same endpoint return full usage, so no request parameter fixes it. Tool use is unaffected.
 
@@ -279,7 +279,7 @@ This depends on the client synthesizing an `is_error` tool_result for the unknow
 
 ## PATH and uninstalling
 
-The wrapper installs to `~/.local/bin`, which is **not** on macOS's default `PATH` and is only sometimes on Linux's. When it's missing, `setup.sh` offers to add it to your shell config — `.zshrc` for zsh, `.bash_profile` and `.bashrc` for bash, `~/.config/fish/conf.d/corti-claude.fish` for fish. It backs the file up first, marks what it added, and can only ever add it once. Decline with `--no-modify-path` and it prints the line for you to add yourself.
+The wrapper installs to `~/.local/bin`, which is **not** on macOS's default `PATH` and is only sometimes on Linux's. When it's missing, `setup.sh` offers to add it to your shell config — `.zshrc` for zsh, `.bash_profile` and `.bashrc` for bash, `~/.config/fish/conf.d/corti-bridge.fish` for fish. It backs the file up first, marks what it added, and can only ever add it once. Decline with `--no-modify-path` and it prints the line for you to add yourself.
 
 Nothing it writes takes effect in the terminal you ran it from — a script can't change its parent shell. Open a new terminal, or `source` the file it names.
 
@@ -287,4 +287,4 @@ Nothing it writes takes effect in the terminal you ran it from — a script can'
 ./setup.sh --uninstall
 ```
 
-removes the wrapper and the PATH block. It leaves `~/.corti-claude` alone, since that's your model mapping and profile choice, and prints the path so you can delete it yourself.
+removes the wrapper and the PATH block. It leaves `~/.corti-bridge` alone, since that's your model mapping and profile choice, and prints the path so you can delete it yourself.

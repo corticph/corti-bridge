@@ -2,7 +2,10 @@
 # Shell startup-file handling. Every mutation is append-only, backed up first, and
 # marked so it can be removed again. A subprocess cannot change its parent's PATH.
 
-CC_PATH_MARKER='# corti-claude: added by setup.sh'
+CC_PATH_MARKER='# corti-bridge: added by setup.sh'
+# Legacy marker from pre-rename installs; removal/detection must match both so
+# an upgrade cleans up the old PATH block rather than orphaning it.
+CC_PATH_MARKER_LEGACY='# corti-claude: added by setup.sh'
 
 # $SHELL is the registered login shell, the best signal available since this runs under /bin/sh.
 pathrc_detect_shell() {
@@ -31,7 +34,7 @@ pathrc_target_files() {
       done
       [ "$_prc_found" = 1 ] || printf '%s\n' "$HOME/.bash_profile"
       ;;
-    fish) printf '%s\n' "$HOME/.config/fish/conf.d/corti-claude.fish" ;;
+    fish) printf '%s\n' "$HOME/.config/fish/conf.d/corti-bridge.fish" ;;
     *) : ;;
   esac
 }
@@ -62,7 +65,8 @@ pathrc_block() {
 # Grep the file, never $PATH: $PATH describes only this process, so an already-configured file
 # would look unconfigured.
 pathrc_already_configured() {
-  grep -qF "$CC_PATH_MARKER" "$1" 2>/dev/null
+  grep -qF "$CC_PATH_MARKER" "$1" 2>/dev/null && return 0
+  grep -qF "$CC_PATH_MARKER_LEGACY" "$1" 2>/dev/null
 }
 
 pathrc_on_path() {
@@ -109,7 +113,7 @@ pathrc_ensure() {
 
   if [ "${CC_NO_MODIFY_PATH:-0}" = 1 ]; then
     ui_detail "  --no-modify-path given, so nothing was edited"
-    ui_detail "  to use corti-claude now: export PATH=\"$(pathrc_portable_dir "$_prc_bin"):\$PATH\""
+    ui_detail "  to use corti-bridge now: export PATH=\"$(pathrc_portable_dir "$_prc_bin"):\$PATH\""
     return 3
   fi
 
@@ -126,8 +130,8 @@ pathrc_ensure() {
   for _prc_f in $_prc_targets; do
     mkdir -p "$(dirname "$_prc_f")"
     if [ -f "$_prc_f" ]; then
-      cp -p "$_prc_f" "$_prc_f.corti-claude.bak" 2>/dev/null || true
-      ui_wrote "appended to $(ui_tilde "$_prc_f") (backed up to $(ui_tilde "$_prc_f").corti-claude.bak)"
+      cp -p "$_prc_f" "$_prc_f.corti-bridge.bak" 2>/dev/null || true
+      ui_wrote "appended to $(ui_tilde "$_prc_f") (backed up to $(ui_tilde "$_prc_f").corti-bridge.bak)"
     else
       ui_wrote "created $(ui_tilde "$_prc_f")"
     fi
@@ -146,6 +150,15 @@ pathrc_remove() {
   _prc_shell="$(pathrc_detect_shell)"
   _prc_removed=0
 
+  # Fish uses a per-block file whose name changed in the rename, so the loop
+  # below (which iterates the new filename) can't see a legacy corti-claude.fish.
+  # Remove it explicitly.
+  if [ "$_prc_shell" = fish ] && [ -f "$HOME/.config/fish/conf.d/corti-claude.fish" ]; then
+    rm -f "$HOME/.config/fish/conf.d/corti-claude.fish"
+    ui_wrote "removed legacy $(ui_tilde "$HOME/.config/fish/conf.d/corti-claude.fish")"
+    _prc_removed=1
+  fi
+
   for _prc_f in $(pathrc_target_files "$_prc_shell"); do
     [ -f "$_prc_f" ] || continue
     pathrc_already_configured "$_prc_f" || continue
@@ -156,8 +169,11 @@ pathrc_remove() {
         ui_wrote "removed $(ui_tilde "$_prc_f")"
         ;;
       *)
-        cp -p "$_prc_f" "$_prc_f.corti-claude.bak" 2>/dev/null || true
-        sed "/^$CC_PATH_MARKER\$/,/^esac\$/d" "$_prc_f" >"$_prc_f.tmp" &&
+        cp -p "$_prc_f" "$_prc_f.corti-bridge.bak" 2>/dev/null || true
+        # Delete the block for BOTH markers: a legacy block has the old marker
+        # text but the same esac-terminated structure.
+        sed -e "/^$CC_PATH_MARKER\$/,/^esac\$/d" \
+            -e "/^$CC_PATH_MARKER_LEGACY\$/,/^esac\$/d" "$_prc_f" >"$_prc_f.tmp" &&
           mv "$_prc_f.tmp" "$_prc_f"
         ui_wrote "removed the PATH block from $(ui_tilde "$_prc_f")"
         ;;

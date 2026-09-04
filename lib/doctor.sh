@@ -1,5 +1,5 @@
 # shellcheck shell=sh
-# Diagnostics library for `corti-claude doctor`. Sourced by bin/corti-claude (and
+# Diagnostics library for `corti-bridge doctor`. Sourced by bin/corti-bridge (and
 # reusable by setup.sh). Defines the per-check functions (1-18), the runtime
 # entry point `doctor_run`, and the shared `doctor_proxy_dir` extractor.
 #
@@ -84,7 +84,7 @@ _d_report() {
 # $1 = wrapper file path
 doctor_proxy_dir() {
     [ -f "$1" ] || return 0
-    sed -n 's/^PROXY_DIR="${CC_PROXY_DIR:-\([^}]*\)}".*/\1/p' "$1" | head -1
+    sed -n 's/^PROXY_DIR="${CORTI_PROXY_DIR:-\([^}]*\)}".*/\1/p' "$1" | head -1
 }
 
 # Check 1 — node present + version >=20. The case guard before [ -ge ] is
@@ -169,7 +169,7 @@ _d_check_wrapper() {
 
 # Check 7 — wrapper's baked-in PROXY_DIR. Extract via the shared function,
 # confirm gateway.mjs exists; detect the uninstalled placeholder. Also reports
-# a runtime CC_PROXY_DIR override (the doctor reads the file, not the runtime).
+# a runtime CORTI_PROXY_DIR override (the doctor reads the file, not the runtime).
 _d_check_proxy_dir() {
     if [ ! -f "$_d_WRAPPER" ]; then
         return 0
@@ -180,7 +180,7 @@ _d_check_proxy_dir() {
         # detect it before the gateway.mjs existence check: a placeholder path
         # is FAIL "UNINSTALLED", not WARN "no gateway.mjs".
         case "$_d_baked" in
-            */path/to/corti-claude-proxy)
+            */path/to/corti-bridge)
                 _d_report FAIL proxy-dir "wrapper is UNINSTALLED (placeholder PROXY_DIR)" \
                     "Run ./setup.sh from your clone." ;;
             *)
@@ -194,15 +194,15 @@ _d_check_proxy_dir() {
         esac
     else
         case "$(sed -n 's/^PROXY_DIR=.*/&/p' "$_d_WRAPPER" | head -1)" in
-            *'/path/to/corti-claude-proxy'*)
+            *'/path/to/corti-bridge'*)
                 _d_report FAIL proxy-dir "wrapper is UNINSTALLED (placeholder PROXY_DIR)" \
                     "Run ./setup.sh from your clone." ;;
             *)
                 _d_report WARN proxy-dir "could not parse PROXY_DIR from wrapper" "" ;;
         esac
     fi
-    if [ -n "${CC_PROXY_DIR:-}" ]; then
-        _d_report WARN proxy-dir "runtime CC_PROXY_DIR=$CC_PROXY_DIR overrides the baked path" \
+    if [ -n "${CORTI_PROXY_DIR:-${CC_PROXY_DIR:-}}" ]; then
+        _d_report WARN proxy-dir "runtime CORTI_PROXY_DIR=${CORTI_PROXY_DIR:-${CC_PROXY_DIR:-}} overrides the baked path" \
             "The wrapper will use this when launched from a shell with it set."
     fi
 }
@@ -329,7 +329,7 @@ _d_check_pid_file() {
         fi
     else
         _d_report WARN pid-file "no pid file for port $_d_PORT" \
-            "If a gateway is running, it was started by hand (no wrapper). corti-claude --stop will use path-based kill."
+            "If a gateway is running, it was started by hand (no wrapper). corti-bridge --stop will use path-based kill."
     fi
 }
 
@@ -340,7 +340,7 @@ _d_check_gateway() {
     _d_health=$(gateway_health)
     if [ -z "$_d_health" ]; then
         _d_report WARN gateway "no responder on port $_d_PORT" \
-            "Run corti-claude to start one."
+            "Run corti-bridge to start one."
     elif ! gateway_is_ours "$_d_health"; then
         _d_report FAIL gateway "foreign process answering HTTP on port $_d_PORT (not our gateway)" \
             "Set CORTI_PORT to a free port, or stop the other process."
@@ -356,7 +356,7 @@ _d_check_gateway() {
         case "$_d_health" in
             *'"gatewayVersion":'*) ;;
             *)
-                _d_report WARN gateway "older build (no gatewayVersion) - a corti-claude launch will auto-restart to upgrade" "$_d_sub"
+                _d_report WARN gateway "older build (no gatewayVersion) - a corti-bridge launch will auto-restart to upgrade" "$_d_sub"
                 return 0
                 ;;
         esac
@@ -365,7 +365,7 @@ _d_check_gateway() {
                 *"\"upstream\":\"$CORTI_BASE_URL\""*) ;;
                 *)
                     _d_report WARN gateway "upstream mismatch: running gateway targets $_d_upstream, your shell has CORTI_BASE_URL=$CORTI_BASE_URL" \
-                        "A corti-claude launch will restart to switch upstreams."
+                        "A corti-bridge launch will restart to switch upstreams."
                     return 0
                     ;;
             esac
@@ -376,7 +376,7 @@ _d_check_gateway() {
 }
 
 # Check 15 — THE DUAL-CLONE CHECK: wrapper's baked PROXY_DIR vs running
-# gateway's clone. Mismatch = warn. Cannot catch CC_PROXY_DIR runtime overrides
+# gateway's clone. Mismatch = warn. Cannot catch CORTI_PROXY_DIR runtime overrides
 # or hand-started gateways (stated in the limits footer).
 _d_check_dual_clone() {
     if [ -n "$_d_baked" ] && [ -n "$_d_run_clone" ]; then
@@ -384,7 +384,7 @@ _d_check_dual_clone() {
             _d_report OK dual-clone "wrapper and running gateway agree on $(_d_tilde "$_d_baked")" ""
         else
             _d_report WARN dual-clone "wrapper points at $(_d_tilde "$_d_baked") but a running gateway is from $(_d_tilde "$_d_run_clone")" \
-                "corti-claude --stop/restart will target the wrapper's clone, not the running one. To run two clones safely: set CC_PROXY_CONFIG_DIR per clone (splits models.env/profile.env/pid/log) AND use distinct CORTI_PORT values."
+                "corti-bridge --stop/restart will target the wrapper's clone, not the running one. To run two clones safely: set CORTI_PROXY_CONFIG_DIR per clone (splits models.env/profile.env/pid/log) AND use distinct CORTI_PORT values."
         fi
     fi
 }
@@ -410,7 +410,7 @@ _d_check_processes() {
         _d_report OK processes "1 gateway process found" ""
     else
         _d_report WARN processes "$_d_gw_count gateway processes found (multiple clones?)" \
-            "The wrapper manages one clone; the others are unmanaged. Run corti-claude doctor to see the dual-clone check."
+            "The wrapper manages one clone; the others are unmanaged. Run corti-bridge doctor to see the dual-clone check."
     fi
     # Emit each found process as a detail line under the row.
     while read -r _d_gw_line; do
@@ -505,11 +505,11 @@ _d_limits_footer() {
         printf 'Not checked (even with --deep): model-id correctness/tiering (a tier\nswap parses fine), port of ps-found gateways, second clones on disk. Credential\nreachability was probed; 401 != definitively revoked.\n'
     else
         printf 'Not checked (passive run): credential validity against Corti, model-id\ncorrectness/tiering, port of ps-found gateways, second clones on disk.\n'
-        printf "Run 'corti-claude doctor --deep' to probe Corti's /models endpoint.\n"
+        printf "Run 'corti-bridge doctor --deep' to probe Corti's /models endpoint.\n"
     fi
 }
 
-# Full runtime entry point. Called by bin/corti-claude as `corti-claude doctor`.
+# Full runtime entry point. Called by bin/corti-bridge as `corti-bridge doctor`.
 # Parses --deep from argv; runs all 18 checks; prints summary + limits footer;
 # exits 0/1/2.
 doctor_run() {
@@ -519,9 +519,9 @@ doctor_run() {
             --deep) _d_deep=1 ;;
             --help|-h)
                 cat <<EOF
-corti-claude doctor - diagnostics for the corti-claude proxy.
+corti-bridge doctor - diagnostics for the corti-bridge proxy.
 
-Usage: corti-claude doctor [--deep]
+Usage: corti-bridge doctor [--deep]
 
   (default)  Run 18 passive checks (no network except localhost /health)
   --deep     Also probe Corti's /models endpoint (active; needs CORTI_BEARER)
@@ -536,12 +536,12 @@ EOF
     # Resolve doctor-local state from the same env the wrapper reads, and reset
     # mutable accumulators so repeated calls (sourced once, called multiple times)
     # don't carry stale counts or clone paths from a prior run.
-    _d_CORTI_DIR="${CC_PROXY_CONFIG_DIR:-$HOME/.corti-claude}"
+    _d_CORTI_DIR="${CORTI_PROXY_CONFIG_DIR:-${CC_PROXY_CONFIG_DIR:-$HOME/.corti-bridge}}"
     _d_PORT="${CORTI_PORT:-4192}"
     _d_GATEWAY="http://${CORTI_HOST:-127.0.0.1}:$_d_PORT"
     _d_PID_FILE="$_d_CORTI_DIR/gateway-$_d_PORT.pid"
-    _d_BIN_DIR="${CC_PROXY_BIN_DIR:-$HOME/.local/bin}"
-    _d_WRAPPER="$_d_BIN_DIR/corti-claude"
+    _d_BIN_DIR="${CORTI_PROXY_BIN_DIR:-${CC_PROXY_BIN_DIR:-$HOME/.local/bin}}"
+    _d_WRAPPER="$_d_BIN_DIR/corti-bridge"
     _d_n_ok=0
     _d_n_warn=0
     _d_n_fail=0
@@ -550,7 +550,7 @@ EOF
 
     _d_color_init
 
-    printf '\ncorti-claude doctor\n'
+    printf '\ncorti-bridge doctor\n'
 
     _d_check_node
     _d_check_curl

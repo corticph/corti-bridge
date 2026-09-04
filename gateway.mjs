@@ -812,7 +812,7 @@ async function handleMessages(req, res, body) {
   inFlight.add(shutdownCloser);
 
   const deadlineCheck = () => {
-    // The advisor handoff owns the turn: runAdvisor is a headless `corti-claude -p` child that
+    // The advisor handoff owns the turn: runAdvisor is a headless `corti-bridge -p` child that
     // can legitimately run for minutes (see ADVISOR_TIMEOUT_MS). While it owns the turn the SSE
     // stream is idle by design — pings are suppressed (writePing, below) so they don't displace
     // the "Advising" indicator, and the stream-idle watchdog must stay its hand too. Without
@@ -1234,7 +1234,7 @@ function writeBanner(file) {
   fs.appendFileSync(
     file,
     [
-      `=== corti-claude-proxy debug log ===`,
+      `=== corti-bridge debug log ===`,
       `started:  ${new Date().toISOString()}`,
       `pid:      ${process.pid}`,
       `upstream (openai):    ${UPSTREAM_OPENAI}`,
@@ -1274,9 +1274,9 @@ function sessionLogFile(req) {
 function debugDir() {
   if (process.env.CORTI_DEBUG_DIR) return process.env.CORTI_DEBUG_DIR;
   if (process.platform === "darwin")
-    return path.join(os.homedir(), "Library", "Logs", "corti-claude-proxy");
+    return path.join(os.homedir(), "Library", "Logs", "corti-bridge");
   const state = process.env.XDG_STATE_HOME ?? path.join(os.homedir(), ".local", "state");
-  return path.join(state, "corti-claude-proxy");
+  return path.join(state, "corti-bridge");
 }
 
 // One entry per write: concurrent requests would otherwise interleave mid-entry.

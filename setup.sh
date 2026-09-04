@@ -1,13 +1,13 @@
 #!/bin/sh
-# corti-claude setup — installs the corti-claude wrapper.
+# corti-bridge setup — installs the corti-bridge wrapper.
 # Run from the repo root: ./setup.sh   (./setup.sh --help for options)
 #
 # Ordering rule: every check runs before anything is written.
 set -eu
 
 CC_REPO_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-CC_BIN_DIR="${CC_PROXY_BIN_DIR:-$HOME/.local/bin}"
-CC_STATE_DIR="${CC_PROXY_CONFIG_DIR:-$HOME/.corti-claude}"
+CC_BIN_DIR="${CORTI_PROXY_BIN_DIR:-${CC_PROXY_BIN_DIR:-$HOME/.local/bin}}"
+CC_STATE_DIR="${CORTI_PROXY_CONFIG_DIR:-${CC_PROXY_CONFIG_DIR:-$HOME/.corti-bridge}}"
 
 # ui.sh first: everything else prints through it. The libs define functions and defaults only,
 # so nothing happens at source time.
@@ -27,11 +27,11 @@ CC_UNINSTALL=0
 
 usage() {
   cat <<EOF
-corti-claude setup
+corti-bridge setup
 
 Usage: ./setup.sh [options]
 
-Installs the corti-claude wrapper, checks it can reach Corti, and records which
+Installs the corti-bridge wrapper, checks it can reach Corti, and records which
 Corti models back Claude Code's Opus/Sonnet/Haiku tiers.
 
 Options:
@@ -45,8 +45,8 @@ Options:
 
 Environment:
   CORTI_BEARER, CORTI_BASE_URL   required at runtime (not managed by this script)
-  CC_PROXY_BIN_DIR               where the wrapper is installed (default ~/.local/bin)
-  CC_PROXY_CONFIG_DIR            proxy state dir (default ~/.corti-claude)
+  CORTI_PROXY_BIN_DIR               where the wrapper is installed (default ~/.local/bin)
+  CORTI_PROXY_CONFIG_DIR            proxy state dir (default ~/.corti-bridge)
 
 See README.md for details.
 EOF
@@ -93,27 +93,34 @@ problem_add() {
 
 install_wrapper() {
   mkdir -p "$CC_BIN_DIR"
-  _cc_tmp="$CC_BIN_DIR/corti-claude.tmp"
+  _cc_tmp="$CC_BIN_DIR/corti-bridge.tmp"
 
   # A byte-identical result means the substitution missed the PROXY_DIR pattern — treat as failure.
-  sed "s|\${CC_PROXY_DIR:-/path/to/corti-claude-proxy}|\${CC_PROXY_DIR:-$CC_REPO_DIR}|" \
-    "$CC_REPO_DIR/bin/corti-claude" >"$_cc_tmp"
-  if cmp -s "$CC_REPO_DIR/bin/corti-claude" "$_cc_tmp"; then
+  sed "s|\${CORTI_PROXY_DIR:-/path/to/corti-bridge}|\${CORTI_PROXY_DIR:-$CC_REPO_DIR}|" \
+    "$CC_REPO_DIR/bin/corti-bridge" >"$_cc_tmp"
+  if cmp -s "$CC_REPO_DIR/bin/corti-bridge" "$_cc_tmp"; then
     rm -f "$_cc_tmp"
     ui_fatal "path substitution failed; refusing to install a wrapper with the wrong PROXY_DIR" \
-      "This is a bug in setup.sh — bin/corti-claude's PROXY_DIR line no longer matches" \
+      "This is a bug in setup.sh — bin/corti-bridge's PROXY_DIR line no longer matches" \
       "the pattern setup.sh substitutes."
   fi
 
-  if [ -f "$CC_BIN_DIR/corti-claude" ] && cmp -s "$CC_BIN_DIR/corti-claude" "$_cc_tmp"; then
+  if [ -f "$CC_BIN_DIR/corti-bridge" ] && cmp -s "$CC_BIN_DIR/corti-bridge" "$_cc_tmp"; then
     rm -f "$_cc_tmp"
-    ui_detail "$(ui_tilde "$CC_BIN_DIR/corti-claude") is up to date"
+    ui_detail "$(ui_tilde "$CC_BIN_DIR/corti-bridge") is up to date"
   else
     _cc_verb=installed
-    if [ -f "$CC_BIN_DIR/corti-claude" ]; then _cc_verb=updated; fi
-    mv "$_cc_tmp" "$CC_BIN_DIR/corti-claude"
-    chmod +x "$CC_BIN_DIR/corti-claude"
-    ui_wrote "$_cc_verb $(ui_tilde "$CC_BIN_DIR/corti-claude")"
+    if [ -f "$CC_BIN_DIR/corti-bridge" ]; then _cc_verb=updated; fi
+    mv "$_cc_tmp" "$CC_BIN_DIR/corti-bridge"
+    chmod +x "$CC_BIN_DIR/corti-bridge"
+    ui_wrote "$_cc_verb $(ui_tilde "$CC_BIN_DIR/corti-bridge")"
+  fi
+
+  # Remove a pre-rename wrapper so a user typing the old name out of habit
+  # doesn't run a stale launcher pointing at the old state dir.
+  if [ -f "$CC_BIN_DIR/corti-claude" ]; then
+    rm -f "$CC_BIN_DIR/corti-claude"
+    ui_wrote "removed legacy $(ui_tilde "$CC_BIN_DIR/corti-claude")"
   fi
 }
 
@@ -196,16 +203,20 @@ configure_profile() {
 }
 
 uninstall() {
-  ui_step "Removing corti-claude"
+  ui_step "Removing corti-bridge"
+  if [ -f "$CC_BIN_DIR/corti-bridge" ]; then
+    rm -f "$CC_BIN_DIR/corti-bridge"
+    ui_wrote "removed $(ui_tilde "$CC_BIN_DIR/corti-bridge")"
+  else
+    ui_detail "no wrapper at $(ui_tilde "$CC_BIN_DIR/corti-bridge")"
+  fi
   if [ -f "$CC_BIN_DIR/corti-claude" ]; then
     rm -f "$CC_BIN_DIR/corti-claude"
-    ui_wrote "removed $(ui_tilde "$CC_BIN_DIR/corti-claude")"
-  else
-    ui_detail "no wrapper at $(ui_tilde "$CC_BIN_DIR/corti-claude")"
+    ui_wrote "removed legacy $(ui_tilde "$CC_BIN_DIR/corti-claude")"
   fi
   pathrc_remove
   ui_blank
-  printf 'corti-claude removed. Your settings are still in %s —\n' "$(ui_tilde "$CC_STATE_DIR")" >&2
+  printf 'corti-bridge removed. Your settings are still in %s —\n' "$(ui_tilde "$CC_STATE_DIR")" >&2
   printf 'delete that directory yourself if you want them gone too.\n' >&2
   exit 0
 }
@@ -216,17 +227,17 @@ uninstall() {
 verdict() {
   if [ "$CC_PROBLEM_COUNT" -eq 0 ]; then
     ui_step "Setup complete"
-    ui_pair "installed" "$(ui_tilde "$CC_BIN_DIR/corti-claude")"
+    ui_pair "installed" "$(ui_tilde "$CC_BIN_DIR/corti-bridge")"
     ui_pair "profile" "$(ui_tilde "${_cc_profile_dir:-$CC_STATE_DIR}")"
     ui_pair "models" "${_cc_models_line:-not detected}"
     ui_pair "context" "${_cc_context:-unknown}"
     ui_pair "state" "$(ui_tilde "$CC_STATE_DIR")"
     ui_blank
     if [ "$CC_NEEDS_RESTART" = 1 ] && [ -n "$CC_RC_FILE" ]; then
-      printf 'Ready - open a new terminal (or run: source %s), then run: corti-claude\n' \
+      printf 'Ready - open a new terminal (or run: source %s), then run: corti-bridge\n' \
         "$(ui_tilde "$CC_RC_FILE")" >&2
     else
-      printf 'Ready. Run: corti-claude\n' >&2
+      printf 'Ready. Run: corti-bridge\n' >&2
     fi
     exit 0
   fi
@@ -240,13 +251,13 @@ verdict() {
 # Banner names the command the user types next, with an optional git ref for bug reports.
 _cc_ref="$(git -C "$CC_REPO_DIR" rev-parse --short HEAD 2>/dev/null || true)"
 if [ -n "$_cc_ref" ]; then
-  ui_step "corti-claude setup (git $_cc_ref)"
+  ui_step "corti-bridge setup (git $_cc_ref)"
 else
-  ui_step "corti-claude setup"
+  ui_step "corti-bridge setup"
 fi
 unset _cc_ref
-ui_detail "Configures the corti-claude launcher. Claude Code will run on Corti's models,"
-ui_detail "through a small local gateway that ./bin/corti-claude starts for you."
+ui_detail "Configures the corti-bridge launcher. Claude Code will run on Corti's models,"
+ui_detail "through a small local gateway that ./bin/corti-bridge starts for you."
 
 if [ "$CC_UNINSTALL" = 1 ]; then uninstall; fi
 
@@ -254,7 +265,7 @@ if [ "$CC_UNINSTALL" = 1 ]; then uninstall; fi
 # runtime concern (the wrapper catches it), not an install blocker, so the early-stop downgrades
 # to a warn-and-continue. Only a first run (no wrapper) hard-stops on missing creds.
 _cc_is_update=0
-[ -f "$CC_BIN_DIR/corti-claude" ] && _cc_is_update=1
+[ -f "$CC_BIN_DIR/corti-bridge" ] && _cc_is_update=1
 
 ui_step "Checking dependencies"
 preflight_deps || true
@@ -273,7 +284,7 @@ else
     # anything and add the guided remediation. The wrapper is useless without them.
     ui_blank
     ui_explain \
-      "corti-claude talks to Corti through two environment variables that the Corti" \
+      "corti-bridge talks to Corti through two environment variables that the Corti" \
       "CLI exports into your shell. Set them up first, then re-run ./setup.sh:" \
       "" \
       "  npx @corti/cli models init" \
@@ -286,7 +297,7 @@ else
   fi
 fi
 
-ui_step "Installing corti-claude"
+ui_step "Installing corti-bridge"
 install_wrapper
 set +e
 pathrc_ensure "$CC_BIN_DIR"
@@ -300,10 +311,10 @@ case "$_cc_path_rc" in
     ;;
   2)
     problem_add "$(ui_tilde "$CC_BIN_DIR") is not on PATH. Add it yourself, re-run ./setup.sh, or run
-     corti-claude by its full path:
+     corti-bridge by its full path:
 
        export PATH=\"$CC_BIN_DIR:\$PATH\"
-       $(ui_tilde "$CC_BIN_DIR")/corti-claude"
+       $(ui_tilde "$CC_BIN_DIR")/corti-bridge"
     ;;
 esac
 

@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # Maps each Claude Code tier to the Corti model that backs it, recorded in models.env
-# (sourced by bin/corti-claude).
+# (sourced by bin/corti-bridge).
 #
 # Tiers are derived by decomposing model ids into size/speed/channel tokens rather than
 # matching exact names, so a future generation slots in without a code change.
@@ -191,16 +191,16 @@ models_pick() {
       --reset) _mp_reset=1 ;;
       --help|-h)
         cat <<EOF
-corti-claude models - pick which Corti model backs each Claude Code tier.
+corti-bridge models - pick which Corti model backs each Claude Code tier.
 
-Usage: corti-claude models [--experimental] [--reset]
+Usage: corti-bridge models [--experimental] [--reset]
 
   (default)        Interactively pick a model for each tier (needs CORTI_BEARER/CORTI_BASE_URL)
   --experimental   Include beta models in the candidate lists
   --reset          Clear all pins and re-rank from scratch, no prompts
 
 A chosen model is pinned in models.env; pressing Enter keeps the auto-rank pick
-and unpins. Changes take effect on your next corti-claude session.
+and unpins. Changes take effect on your next corti-bridge session.
 EOF
         return 0
         ;;
@@ -210,12 +210,12 @@ EOF
   unset _mp_arg
 
   if [ -z "${CORTI_BEARER:-}" ] || [ -z "${CORTI_BASE_URL:-}" ]; then
-    echo "corti-claude models: CORTI_BEARER and CORTI_BASE_URL must be set" >&2
-    echo "corti-claude models: run 'npx @corti/cli models init', then open a new terminal" >&2
+    echo "corti-bridge models: CORTI_BEARER and CORTI_BASE_URL must be set" >&2
+    echo "corti-bridge models: run 'npx @corti/cli models init', then open a new terminal" >&2
     return 1
   fi
 
-  _mp_dir="${CC_PROXY_CONFIG_DIR:-$HOME/.corti-claude}"
+  _mp_dir="${CORTI_PROXY_CONFIG_DIR:-${CC_PROXY_CONFIG_DIR:-$HOME/.corti-bridge}}"
   _mp_file="$_mp_dir/models.env"
   _mp_js="${CC_REPO_DIR:-${REPO:-.}}/lib/models.mjs"
 
@@ -226,7 +226,7 @@ EOF
     _mp_env="$(models_dedupe_fable "$_mp_auto")"
     mkdir -p "$_mp_dir"
     printf '%s\n' "$_mp_env" >"$_mp_file.tmp" && mv "$_mp_file.tmp" "$_mp_file"
-    ui_step "corti-claude models --reset"
+    ui_step "corti-bridge models --reset"
     models_summary "$_mp_file"
     ui_wrote "cleared pins -> $(ui_tilde "$_mp_file")"
     return 0
@@ -234,7 +234,7 @@ EOF
 
   _mp_cands="$(node "$_mp_js" --candidates "$_mp_catalog")" || return 1
 
-  ui_step "corti-claude models"
+  ui_step "corti-bridge models"
   ui_detail "Fetching Corti's model catalog..."
   ui_detail "Press Enter to keep default, or type a number to choose."
 
@@ -350,6 +350,6 @@ EOF
   ui_detail "==> Saving"
   models_summary "$_mp_file"
   ui_wrote "$(ui_tilde "$_mp_file")"
-  ui_detail "Changes take effect on your next corti-claude session."
+  ui_detail "Changes take effect on your next corti-bridge session."
   return 0
 }

@@ -7,7 +7,7 @@ CC_NODE_MIN=20
 preflight_deps() {
   if ! command -v node >/dev/null 2>&1; then
     ui_fatal "node is required but not found on PATH" \
-      "corti-claude-proxy needs Node.js ($CC_NODE_MIN or newer) to run the proxy gateway." \
+      "corti-bridge needs Node.js ($CC_NODE_MIN or newer) to run the proxy gateway." \
       "Install it, then re-run ./setup.sh:" \
       "" \
       "  https://nodejs.org/"
@@ -21,7 +21,7 @@ preflight_deps() {
     *)
       if [ "$_pf_major" -lt "$CC_NODE_MIN" ]; then
         ui_fatal "node $(node -v) found, but $CC_NODE_MIN or newer is required" \
-          "corti-claude-proxy needs Node.js ($CC_NODE_MIN or newer) to run the proxy gateway." \
+          "corti-bridge needs Node.js ($CC_NODE_MIN or newer) to run the proxy gateway." \
           "Upgrade it, then re-run ./setup.sh:" \
           "" \
           "  https://nodejs.org/"
@@ -31,7 +31,7 @@ preflight_deps() {
 
   if ! command -v curl >/dev/null 2>&1; then
     ui_fatal "curl is required but not found on PATH" \
-      "corti-claude-proxy uses curl to talk to Corti and to check on the proxy." \
+      "corti-bridge uses curl to talk to Corti and to check on the proxy." \
       "Install it, then re-run ./setup.sh."
   fi
 
@@ -50,7 +50,7 @@ preflight_deps() {
   fi
 
   if ! command -v pkill >/dev/null 2>&1; then
-    ui_warn "no 'pkill' - corti-claude can't auto-restart a stale proxy; stop it by hand"
+    ui_warn "no 'pkill' - corti-bridge can't auto-restart a stale proxy; stop it by hand"
   fi
 
   return 0

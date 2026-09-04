@@ -1,8 +1,8 @@
 #!/bin/sh
 # Sandboxed install test. Zero dependencies — no bats, no shunit2.
 #
-# Every path setup.sh writes to is derived from $HOME, $CC_PROXY_BIN_DIR or
-# $CC_PROXY_CONFIG_DIR, so redirecting those three into a scratch directory contains the whole
+# Every path setup.sh writes to is derived from $HOME, $CORTI_PROXY_BIN_DIR or
+# $CORTI_PROXY_CONFIG_DIR, so redirecting those three into a scratch directory contains the whole
 # thing. Nothing here touches the real home directory.
 #
 # Credentials stay unset so this stays hermetic and the model step exercises its skip path.
@@ -34,7 +34,7 @@ check() {
 # grep -c prints 0 *and* exits 1 when there are no matches, and prints nothing at all when the
 # file is missing, so neither the exit status nor the output alone is enough.
 count_markers() {
-  _n=$(grep -c 'corti-claude: added by setup.sh' "$1" 2>/dev/null) || :
+  _n=$(grep -c 'corti-bridge: added by setup.sh' "$1" 2>/dev/null) || :
   [ -n "$_n" ] || _n=0
   printf '%s' "$_n"
 }
@@ -60,16 +60,16 @@ run_shell_case() {
   for _i in 1 2; do
     (
       HOME="$_box/home"
-      CC_PROXY_BIN_DIR="$_box/bin"
-      CC_PROXY_CONFIG_DIR="$_box/state"
+      CORTI_PROXY_BIN_DIR="$_box/bin"
+      CORTI_PROXY_CONFIG_DIR="$_box/state"
       SHELL="$_shell"
       CORTI_BEARER=dummy CORTI_BASE_URL=https://ai.eu.corti.app/v1
-      export HOME CC_PROXY_BIN_DIR CC_PROXY_CONFIG_DIR SHELL CORTI_BEARER CORTI_BASE_URL
+      export HOME CORTI_PROXY_BIN_DIR CORTI_PROXY_CONFIG_DIR SHELL CORTI_BEARER CORTI_BASE_URL
       cd "$REPO" && sh ./setup.sh --yes
     ) >/dev/null 2>&1 || true
   done
 
-  if [ -x "$_box/bin/corti-claude" ]; then
+  if [ -x "$_box/bin/corti-bridge" ]; then
     pass "$_name: wrapper installed and executable"
   else
     fail "$_name: wrapper missing or not executable"
@@ -79,7 +79,7 @@ run_shell_case() {
   check "$_name: rc marker appears exactly once after two runs" "$_markers" "1"
 
   # The wrapper must point at this clone, not at the hardcoded in-repo default.
-  if grep -q "CC_PROXY_DIR:-$REPO" "$_box/bin/corti-claude" 2>/dev/null; then
+  if grep -q "CORTI_PROXY_DIR:-$REPO" "$_box/bin/corti-bridge" 2>/dev/null; then
     pass "$_name: wrapper PROXY_DIR points at this clone"
   else
     fail "$_name: wrapper PROXY_DIR was not substituted"
@@ -88,10 +88,10 @@ run_shell_case() {
   # Uninstall must leave the rc file clean and the state directory alone.
   (
     HOME="$_box/home"
-    CC_PROXY_BIN_DIR="$_box/bin"
-    CC_PROXY_CONFIG_DIR="$_box/state"
+    CORTI_PROXY_BIN_DIR="$_box/bin"
+    CORTI_PROXY_CONFIG_DIR="$_box/state"
     SHELL="$_shell"
-    export HOME CC_PROXY_BIN_DIR CC_PROXY_CONFIG_DIR SHELL
+    export HOME CORTI_PROXY_BIN_DIR CORTI_PROXY_CONFIG_DIR SHELL
     cd "$REPO" && sh ./setup.sh --uninstall
   ) >/dev/null 2>&1 || true
 
@@ -110,19 +110,19 @@ printf '# sandbox: %s\n\n' "$SCRATCH"
 run_shell_case zsh /bin/zsh .zshrc
 run_shell_case bash /bin/bash .bash_profile
 run_shell_case fish "$(command -v fish 2>/dev/null || echo /nonexistent)" \
-  .config/fish/conf.d/corti-claude.fish
+  .config/fish/conf.d/corti-bridge.fish
 
 # A no-creds FIRST run (no wrapper present) must stop early: exit 1, install nothing, edit no
-# rc file. This is the redesign's headline change — `./setup.sh && corti-claude` becomes safe.
+# rc file. This is the redesign's headline change — `./setup.sh && corti-bridge` becomes safe.
 box="$SCRATCH/noninteractive"
 mkdir -p "$box/home"
 set +e
 (
   HOME="$box/home"
-  CC_PROXY_BIN_DIR="$box/bin"
-  CC_PROXY_CONFIG_DIR="$box/state"
+  CORTI_PROXY_BIN_DIR="$box/bin"
+  CORTI_PROXY_CONFIG_DIR="$box/state"
   SHELL=/bin/zsh
-  export HOME CC_PROXY_BIN_DIR CC_PROXY_CONFIG_DIR SHELL
+  export HOME CORTI_PROXY_BIN_DIR CORTI_PROXY_CONFIG_DIR SHELL
   unset CORTI_BEARER CORTI_BASE_URL
   cd "$REPO" && sh ./setup.sh </dev/null
 ) >/dev/null 2>&1
@@ -131,7 +131,7 @@ set -e
 
 check "noninteractive: no-creds first run exits 1" "$_ni_rc" "1"
 
-if [ -x "$box/bin/corti-claude" ]; then
+if [ -x "$box/bin/corti-bridge" ]; then
   fail "noninteractive: wrapper installed despite no-creds early-stop"
 else
   pass "noninteractive: nothing installed on no-creds first run"
@@ -147,11 +147,11 @@ mkdir -p "$rebox/home"
 # First, install the wrapper with creds so the re-run sees it.
 (
   HOME="$rebox/home"
-  CC_PROXY_BIN_DIR="$rebox/bin"
-  CC_PROXY_CONFIG_DIR="$rebox/state"
+  CORTI_PROXY_BIN_DIR="$rebox/bin"
+  CORTI_PROXY_CONFIG_DIR="$rebox/state"
   SHELL=/bin/zsh
   CORTI_BEARER=dummy CORTI_BASE_URL=https://ai.eu.corti.app/v1
-  export HOME CC_PROXY_BIN_DIR CC_PROXY_CONFIG_DIR SHELL CORTI_BEARER CORTI_BASE_URL
+  export HOME CORTI_PROXY_BIN_DIR CORTI_PROXY_CONFIG_DIR SHELL CORTI_BEARER CORTI_BASE_URL
   cd "$REPO" && sh ./setup.sh --yes
 ) >/dev/null 2>&1 || true
 # Then re-run WITHOUT creds. It must NOT early-stop (missing creds on an existing install is a
@@ -161,10 +161,10 @@ mkdir -p "$rebox/home"
 set +e
 (
   HOME="$rebox/home"
-  CC_PROXY_BIN_DIR="$rebox/bin"
-  CC_PROXY_CONFIG_DIR="$rebox/state"
+  CORTI_PROXY_BIN_DIR="$rebox/bin"
+  CORTI_PROXY_CONFIG_DIR="$rebox/state"
   SHELL=/bin/zsh
-  export HOME CC_PROXY_BIN_DIR CC_PROXY_CONFIG_DIR SHELL
+  export HOME CORTI_PROXY_BIN_DIR CORTI_PROXY_CONFIG_DIR SHELL
   unset CORTI_BEARER CORTI_BASE_URL
   cd "$REPO" && sh ./setup.sh --yes
 ) >/dev/null 2>&1
@@ -174,7 +174,7 @@ set -e
 # The distinguishing signal is the early-stop message, not the exit code: State B (model step
 # skipped) also exits 1. A re-run that early-stopped would print "Nothing was installed" and
 # leave no wrapper; one that continued reaches the verdict with the wrapper intact.
-if [ -x "$rebox/bin/corti-claude" ]; then
+if [ -x "$rebox/bin/corti-bridge" ]; then
   pass "rerun: wrapper survives a no-creds re-run (no early-stop)"
 else
   fail "rerun: no-creds re-run early-stopped (wrapper gone)"
@@ -182,12 +182,40 @@ fi
 
 # An uninstalled wrapper still holds the placeholder PROXY_DIR; it must say so, not poll for 20s.
 # --restart reaches gateway_start without needing claude on PATH, which keeps this hermetic.
-guard_out=$(CORTI_PORT=45917 CC_PROXY_DIR="$SCRATCH/nowhere" CORTI_BEARER=dummy \
-  CORTI_BASE_URL=https://ai.eu.corti.app/v1 sh "$REPO/bin/corti-claude" --restart 2>&1 || true)
+guard_out=$(CORTI_PORT=45917 CORTI_PROXY_DIR="$SCRATCH/nowhere" CORTI_BEARER=dummy \
+  CORTI_BASE_URL=https://ai.eu.corti.app/v1 sh "$REPO/bin/corti-bridge" --restart 2>&1 || true)
 case "$guard_out" in
   *"no gateway.mjs at"*) pass "wrapper: missing gateway.mjs fails fast" ;;
   *) fail "wrapper: missing gateway.mjs (got '$guard_out')" ;;
 esac
+
+# State-dir migration: a pre-rename ~/.corti-claude is copied to ~/.corti-bridge
+# when no CORTI_PROXY_CONFIG_DIR is set. --restart resolves CORTI_DIR (running
+# _resolve_state_dir) before the gateway.mjs check, so the migration happens.
+_mig="$SCRATCH/migrate"
+mkdir -p "$_mig/home/.corti-claude" "$_mig/home/.corti-bridge"
+printf 'OPUS=corti-s1\n' > "$_mig/home/.corti-claude/models.env"
+printf 'CLAUDE_CONFIG_DIR=/x\n' > "$_mig/home/.corti-claude/profile.env"
+HOME="$_mig/home" CORTI_PORT=45918 CORTI_PROXY_DIR="$SCRATCH/nowhere" \
+  CORTI_BEARER=dummy CORTI_BASE_URL=https://ai.eu.corti.app/v1 \
+  sh "$REPO/bin/corti-bridge" --restart >/dev/null 2>&1 || true
+if [ -f "$_mig/home/.corti-bridge/models.env" ] && [ -f "$_mig/home/.corti-bridge/profile.env" ]; then
+  pass "migrate: ~/.corti-claude config copied to ~/.corti-bridge"
+else
+  fail "migrate: ~/.corti-bridge missing copied config"
+fi
+
+# Idempotent: a second run must not re-copy (and must not clobber). models.env
+# content survives unchanged.
+printf 'OPUS=overwritten\n' > "$_mig/home/.corti-claude/models.env"
+HOME="$_mig/home" CORTI_PORT=45919 CORTI_PROXY_DIR="$SCRATCH/nowhere" \
+  CORTI_BEARER=dummy CORTI_BASE_URL=https://ai.eu.corti.app/v1 \
+  sh "$REPO/bin/corti-bridge" --restart >/dev/null 2>&1 || true
+if [ "$(cat "$_mig/home/.corti-bridge/models.env")" = "OPUS=corti-s1" ]; then
+  pass "migrate: idempotent — existing ~/.corti-bridge not clobbered"
+else
+  fail "migrate: re-copied over existing config (not idempotent)"
+fi
 
 . "$REPO/lib/ui.sh"
 . "$REPO/lib/models.sh"

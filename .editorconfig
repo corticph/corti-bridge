@@ -1,6 +1,6 @@
 root = true
 
-# bin/corti-claude is deliberately absent: it is 4-space, and a broad glob would make editors
+# bin/corti-bridge is deliberately absent: it is 4-space, and a broad glob would make editors
 # reformat it on open, burying real changes in whitespace churn.
 [{setup.sh,lib/*.sh,test/*.sh}]
 indent_style = space
