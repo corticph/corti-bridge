@@ -1224,11 +1224,15 @@ export function translateCompletion(completion, ctx) {
 /* streaming state machine                                             */
 /* ------------------------------------------------------------------ */
 
-export function createStreamTranslator(ctx, emit) {
-  // emit(eventName, dataObject) -> called for each Anthropic SSE event to send.
-  let messageStarted = false;
+/**
+ * Streaming state machine. `emit(eventName, data)` is called per Anthropic SSE event.
+ * `startIndex` seeds nextBlockIndex for a continuation appended to an in-progress turn;
+ * `ctx.messageStarted` suppresses the message_start event for such a continuation.
+ */
+export function createStreamTranslator(ctx, emit, startIndex = 0) {
+  let messageStarted = !!ctx.messageStarted;
   let open = null; // { kind: "thinking"|"text"|"tool", index }
-  let nextBlockIndex = 0;
+  let nextBlockIndex = startIndex;
   const toolBlocks = new Map(); // upstream tool_calls index -> { blockIndex, closed, name, id, args }
   let pendingStop = null;
   let doneEmitted = false;

@@ -398,6 +398,10 @@ async function handleMessages(req, res, body) {
   let headersSentToClient = false;
   let lastActivity = Date.now();
   let translator = null;
+  // True while an advisor continuation (the 2nd upstream call after hold-and-continue) is in
+  // flight. Like the advisor phase itself it can legitimately run for minutes, so the 120s
+  // stream-idle watchdog must stay its hand — its own req.setTimeout is the ceiling.
+  let continuationActive = false;
   let interval = null;
   let absolute = null;
   let loggedResponse = false;
@@ -662,11 +666,14 @@ async function handleMessages(req, res, body) {
     const continuationText = advisorResult.ok
       ? `<advisor_guidance>\n${advisorResult.text}\n</advisor_guidance>`
       : `<advisor_guidance>\nadvisor unavailable (${advisorResult.code})\n</advisor_guidance>`;
-    // The advisor child is done; the continuation is a normal upstream request that can stall
-    // and must be guarded. Release the handoff so the stream-idle watchdog re-arms, and reset
-    // the silence clock so the watchdog measures from the continuation's start, not from the
-    // advisor run (which may have taken minutes and would instantly trip STREAM_IDLE_MS).
+    // The advisor child is done; the continuation is a normal upstream request. Release the
+    // handoff (the advisor phase is over) but assert continuationActive so the 120s stream-idle
+    // watchdog stays suppressed — the continuation can legitimately run for minutes (the model
+    // reads the advice and answers), and a 120s silence kill would drop a live generation. The
+    // continuation's own req.setTimeout is the real ceiling. Reset the silence clock so any
+    // watchdog that does apply measures from the continuation's start, not the advisor run.
     translator?.releaseAdvisor?.();
+    continuationActive = true;
     lastActivity = Date.now();
     try {
       await continueAfterAdvisor(id, continuationText, resIdx, endContinuationFailure);
@@ -675,17 +682,50 @@ async function handleMessages(req, res, body) {
         `[advisor consulted; the follow-up response failed (${err?.message ?? err}) — proceed using the advice above]`,
         "advisor-continuation-failed",
       );
+    } finally {
+      continuationActive = false;
     }
   };
 
-  // The second upstream call: appends the consult_advisor tool_use + tool_result to the original
-  // request and asks the model to continue. Non-streaming for simplicity (the first turn already
-  // streamed; this is the advisor-aware continuation).
-  // Passed in from onAdvisorToolUse: resIdx + endContinuationFailure live in that closure
-  // (resIdx is computed there); this sibling needs both for its success and non-2xx paths.
+  /**
+   * Second upstream call: appends the consult_advisor tool_use + tool_result and asks the model
+   * to continue. Streaming, like the first call, so Corti emits bytes as it generates — feeding
+   * the stream-idle watchdog and keeping long generations alive. A non-streaming continuation
+   * stalled at 120s on large sessions (watchdog fired "upstream stalled"; Corti's buffered
+   * endpoint 500'd before the whole response was ready). resIdx + endContinuationFailure come
+   * from the onAdvisorToolUse closure; this sibling needs both for non-2xx and throw paths.
+   */
   const continueAfterAdvisor = (toolUseId, advisorText, resIdx, endContinuationFailure) => {
+    // Emit a translated completion (a non-SSE upstream response) as a one-shot SSE turn that
+    // resumes after the synthetic advisor blocks. Reused by the drain path for JSON upstreams.
+    const emitContinuationCompletion = (msg) => {
+      let idx = resIdx + 1;
+      for (const block of msg.content) {
+        const skeleton =
+          block.type === "tool_use" ? { ...block, input: {} } :
+          block.type === "thinking" ? { type: "thinking", thinking: "", signature: "" } :
+          { type: "text", text: "" };
+        writeEvent("content_block_start", { type: "content_block_start", index: idx, content_block: skeleton });
+        if (block.type === "text")
+          writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: block.text } });
+        else if (block.type === "thinking") {
+          writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "thinking_delta", thinking: block.thinking } });
+          writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "signature_delta", signature: block.signature } });
+        } else if (block.type === "tool_use")
+          writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } });
+        writeEvent("content_block_stop", { type: "content_block_stop", index: idx });
+        idx++;
+      }
+      writeEvent("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: msg.stop_reason ?? "end_turn", stop_sequence: msg.stop_sequence ?? null },
+        usage: msg.usage,
+      });
+      writeEvent("message_stop", { type: "message_stop" });
+      if (!res.writableEnded) res.end();
+      finalize("advisor-continuation");
+    };
     return new Promise((resolve, reject) => {
-      // Build the continuation body: original messages + a new user turn carrying the tool_result.
       const contMessages = [...(anthropicBody.messages || [])];
       contMessages.push({
         role: "assistant",
@@ -695,72 +735,153 @@ async function handleMessages(req, res, body) {
         role: "user",
         content: [{ type: "tool_result", tool_use_id: toolUseId, content: advisorText, is_error: false }],
       });
-      const contAnthropic = { ...anthropicBody, messages: contMessages, stream: false };
-      // skipAdvisor: the continuation already carries the consult_advisor tool_use +
-      // tool_result we synthesized; re-running interceptConsultAdvisor would match that
-      // tool_result and spawn runAdvisor a second time. The continuation is ours, not a
-      // fresh client request, so the advisor intercept must not touch it.
+      // The first translateRequest mutated anthropicBody.tools to include consult_advisor; the
+      // spread carries that by reference. Strip it so the model can't call consult_advisor from
+      // the continuation — onAdvisorToolUse is unset there, so a nested consult would emit a real
+      // tool_use the harness has no implementation for (an "Unknown tool" error, no answer).
+      const contTools = Array.isArray(anthropicBody.tools)
+        ? anthropicBody.tools.filter((t) => t && t.name !== "consult_advisor")
+        : anthropicBody.tools;
+      const contAnthropic = { ...anthropicBody, tools: contTools, messages: contMessages, stream: true };
+      // skipAdvisor: re-running interceptConsultAdvisor would match the tool_result we just
+      // synthesized and spawn runAdvisor a second time. The continuation is ours, not a fresh
+      // client request, so the advisor intercept must not touch it.
       translateRequest(contAnthropic, { skipAdvisor: true })
         .then((out) => {
           const contTranslated = out.request;
           diagnostics.push(...out.dropped.map((d) => `continuation dropped: ${d}`));
           const body = Buffer.from(JSON.stringify(contTranslated));
+          logUpstreamRequest(id, sessionFile, url, body);
+          // Make this the live upstream the watchdog/shutdown/client-abort paths destroy: the
+          // original proxyReq is already finished, so point the closure's proxyReq at the
+          // continuation so finalize()'s `proxyReq.destroy()` aims at the right socket.
           const req = https.request(url, {
             agent, method: "POST",
             headers: { "content-type": "application/json", authorization: `Bearer ${BEARER}`, "content-length": body.length },
           }, (up) => {
-            const chunks = [];
-            // Feed the watchdog: a slow non-streaming response still arrives byte-by-byte.
-            up.on("data", (c) => { chunks.push(c); lastActivity = Date.now(); });
-            up.on("end", () => {
-              if (finalized || clientGone) return resolve();
-              // The continuation can't retry (advice SSE already written, invariant #3); a non-2xx
-              // must not be parsed as a completion (a blank block silently ends the turn).
-              const errCode = advisorContinuationErrorCode(up.statusCode);
-              if (errCode) {
-                endContinuationFailure(
-                  `[advisor consulted; the follow-up response failed (upstream ${up.statusCode}: ${errCode}) — proceed using the advice above]`,
-                  "advisor-continuation-upstream-error",
-                );
-                return resolve();
+            if (finalized || clientGone) return void up.destroy() & resolve();
+            lastActivity = Date.now();
+            // Can't retry (advice SSE already written, invariant #3); a non-2xx must not be parsed
+            // as a completion (a blank block silently ends the turn).
+            const errCode = advisorContinuationErrorCode(up.statusCode);
+            if (errCode) {
+              up.resume();
+              logUpstreamResponse(id, sessionFile, up.statusCode, Buffer.from("continuation non-2xx"), up.headers);
+              endContinuationFailure(
+                `[advisor consulted; the follow-up response failed (upstream ${up.statusCode}: ${errCode}) — proceed using the advice above]`,
+                "advisor-continuation-upstream-error",
+              );
+              return resolve();
+            }
+            const contentType = String(up.headers["content-type"] ?? "");
+            const isSse = contentType.includes("text/event-stream");
+            // Non-SSE: drain the JSON body and synthesize a one-shot SSE turn, same as the main
+            // !isSse path, so a JSON-upstream continuation still round-trips correctly.
+            if (!isSse) {
+              const chunks = [];
+              up.on("data", (c) => { chunks.push(c); lastActivity = Date.now(); });
+              up.on("end", () => {
+                if (finalized || clientGone) return resolve();
+                const raw = Buffer.concat(chunks);
+                logUpstreamResponse(id, sessionFile, up.statusCode, cap(raw)[0], up.headers);
+                try {
+                  emitContinuationCompletion(translateCompletion(JSON.parse(raw.toString()), ctx));
+                  resolve();
+                } catch (e) {
+                  reject(e);
+                }
+              });
+              up.on("error", reject);
+              return;
+            }
+            // Streaming SSE: a fresh translator seeded at resIdx + 1. message_start is suppressed
+            // (the harness already saw one for this turn — two would be malformed); onAdvisorToolUse
+            // is unset so done() emits the terminal message_stop instead of re-handing the turn
+            // to a now-defunct advisor hook.
+            const contCtx = { ...ctx, messageStarted: true, onAdvisorToolUse: undefined };
+            const contTranslator = createStreamTranslator(contCtx, writeEvent, resIdx + 1);
+            // Point backpressure at the continuation's stream: writeEvent pauses/resumes
+            // `upstreamRes` when res.write() returns false, and upstreamRes still holds the
+            // first call's finished response — without this a slow client gets unbounded
+            // buffering from a continuation that never pauses.
+            upstreamRes = up;
+            let buffer = "";
+            let sawDone = false;
+            const contUpstreamChunks = [];
+            up.on("data", (chunk) => {
+              if (sessionFile && (DEBUG_MAX_BODY <= 0 || contUpstreamChunks.length < 64)) contUpstreamChunks.push(chunk);
+            });
+            const processEventBlock = (block) => {
+              const dataLines = block
+                .split(/\r?\n/)
+                .filter((l) => l.startsWith("data:"))
+                .map((l) => l.slice(5).trimStart());
+              if (!dataLines.length) return;
+              const payload = dataLines.join("\n");
+              if (payload.trim() === "[DONE]") {
+                sawDone = true;
+                contTranslator.done();
+                if (contTranslator.terminated) {
+                  if (!res.writableEnded) res.end();
+                  finalize("advisor-continuation");
+                }
+                return;
               }
               try {
-                const msg = translateCompletion(JSON.parse(Buffer.concat(chunks).toString()), ctx);
-                // Continuation content blocks resume after the synthetic advisor blocks (srvIdx, resIdx).
-                // writeEvent bypasses the translator, so nextBlockIndex isn't advanced past them.
-                let idx = resIdx + 1;
-                for (const block of msg.content) {
-                  const skeleton =
-                    block.type === "tool_use" ? { ...block, input: {} } :
-                    block.type === "thinking" ? { type: "thinking", thinking: "", signature: "" } :
-                    { type: "text", text: "" };
-                  writeEvent("content_block_start", { type: "content_block_start", index: idx, content_block: skeleton });
-                  if (block.type === "text")
-                    writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: block.text } });
-                  else if (block.type === "thinking") {
-                    writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "thinking_delta", thinking: block.thinking } });
-                    writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "signature_delta", signature: block.signature } });
-                  } else if (block.type === "tool_use")
-                    writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } });
-                  writeEvent("content_block_stop", { type: "content_block_stop", index: idx });
-                  idx++;
-                }
-                writeEvent("message_delta", {
-                  type: "message_delta",
-                  delta: { stop_reason: msg.stop_reason ?? "end_turn", stop_sequence: msg.stop_sequence ?? null },
-                  usage: msg.usage,
-                });
-                writeEvent("message_stop", { type: "message_stop" });
-                res.end();
+                contTranslator.feed(JSON.parse(payload));
+              } catch {
+                diagnostics.push(`unparseable continuation data line skipped (${payload.slice(0, 120)})`);
+              }
+              if (!finalized && contTranslator.terminated && !sawDone) {
+                if (!res.writableEnded) res.end();
                 finalize("advisor-continuation");
-                resolve();
-              } catch (e) {
-                reject(e);
+              }
+            };
+            up.on("data", (chunk) => {
+              if (finalized || clientGone) return;
+              lastActivity = Date.now();
+              buffer += chunk.toString();
+              const parts = buffer.split(/\r?\n\r?\n/);
+              buffer = parts.pop();
+              for (const part of parts) {
+                if (finalized) break;
+                processEventBlock(part);
               }
             });
-            up.on("error", reject);
+            up.on("end", () => {
+              if (sessionFile) logUpstreamResponse(id, sessionFile, up.statusCode, cap(Buffer.concat(contUpstreamChunks))[0], up.headers);
+              if (finalized || clientGone) return resolve();
+              if (buffer.trim()) processEventBlock(buffer);
+              if (finalized) return resolve();
+              if (!sawDone) {
+                contTranslator.done();
+                diagnostics.push("continuation ended without [DONE]");
+              }
+              // done() may not terminate if a future hook holds the turn open; end the response
+              // regardless so the turn can't hang open when upstream closes without [DONE].
+              if (!contTranslator.terminated) {
+                if (!res.writableEnded) res.end();
+                finalize("advisor-continuation");
+              }
+              resolve();
+            });
+            up.on("error", (err) => {
+              if (finalized || clientGone) return;
+              reject(err);
+            });
           });
-          req.on("error", reject);
+          proxyReq = req;
+          // The 120s stream-idle watchdog is suppressed during the continuation (continuationActive),
+          // so this is the real ceiling: a truly dead continuation still terminates instead of
+          // hanging the turn open for the full keep-alive lifetime.
+          req.setTimeout(NONSTREAM_TIMEOUT_MS, () => {
+            if (finalized || clientGone) return;
+            req.destroy(Error("continuation timed out"));
+          });
+          req.on("error", (err) => {
+            if (finalized || clientGone) return;
+            reject(err);
+          });
           req.end(body);
         })
         .catch(reject);
@@ -847,6 +968,11 @@ async function handleMessages(req, res, body) {
     // mid-advisor and kill the turn before the advisor finishes. The advisor's own timeout
     // (ADVISOR_TIMEOUT_MS) is the real ceiling here.
     if (translator?.advisorHandoff) return; // hook owns the turn; ADVISOR_TIMEOUT_MS is the ceiling
+    // The advisor continuation (2nd upstream call after hold-and-continue) can legitimately run
+    // for minutes, like the advisor phase — the model is reading advice and answering. Exempt
+    // it from this 120s watchdog or it kills a live mid-continuation generation; the
+    // continuation's own req.setTimeout (NONSTREAM_TIMEOUT_MS) is the real ceiling.
+    if (continuationActive) return;
     // An advisor child (wantsNoAdvisor) is its own handleMessages whose translator never sets
     // advisorHandoff, so the guard above doesn't cover it. The same ADVISOR_TIMEOUT_MS ceiling
     // applies — applied at the child's execFile layer. Exempt the child from this 120s watchdog

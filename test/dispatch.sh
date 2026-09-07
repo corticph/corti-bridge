@@ -308,6 +308,143 @@ set -e
 kill "$C1_OK_GW_PID" "$C1OKSTUB_PID" 2>/dev/null || :
 wait "$C1_OK_GW_PID" "$C1OKSTUB_PID" 2>/dev/null || :
 
+# --- C1 streaming continuation: the continuation upstream answers with an SSE stream
+# (content-type text/event-stream), not a JSON completion. The proxy must route it through
+# a fresh stream translator seeded at resIdx+1 (not the JSON-drain path) and emit the deltas
+# as content blocks under the same turn. This is the path Corti's real streaming endpoint
+# takes — the fix that replaced the non-streaming continuation.
+cat > c1ssestub.mjs <<'SSESTUB'
+import fs from "node:fs";
+import https from "node:https";
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      const isContinuation = body.includes('"role":"tool"') && body.includes('"tool_call_id"');
+      if (isContinuation) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"STREAMED"}}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{"content":" ANSWER"}}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+        return res.end('data: [DONE]\n\n');
+      }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_c1","type":"function","function":{"name":"consult_advisor","arguments":""}}]}}]}\n\n');
+      res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`C1SSEPORT=${s.address().port}`));
+SSESTUB
+
+node c1ssestub.mjs > c1ssestub.out 2>&1 &
+C1SSESTUB_PID=$!
+C1SSEUP=""
+while [ -z "$C1SSEUP" ]; do C1SSEUP=$(sed -n 's/^C1SSEPORT=//p' c1ssestub.out); done
+
+C1_SSE_PORT=4400
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > c1ssegateway.mjs
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$C1SSEUP/v1" \
+CORTI_PORT="$C1_SSE_PORT" \
+CORTI_ADVISOR_STUB="$SCRATCH/advisor-stub.sh" \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node c1ssegateway.mjs > c1ssegw.out 2>&1 &
+C1_SSE_GW_PID=$!
+wait_banner c1ssegw.out || { echo "FAIL C1-SSE gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+
+C1SSEG="http://127.0.0.1:$C1_SSE_PORT"
+C1SSERESP=$(curl -s -m 15 -N -H 'content-type: application/json' -d "$C1BODY" "$C1SSEG/v1/messages" 2>&1 || true)
+
+set +e
+# The SSE continuation's streamed deltas must arrive as a text content block. Both fragments
+# prove the SSE path (not the JSON-drain path) translated incremental deltas.
+check "C1-SSE: streaming continuation emits first text delta" \
+  "$(printf '%s' "$C1SSERESP" | grep -c 'STREAMED')" "1"
+check "C1-SSE: streaming continuation emits second text delta" \
+  "$(printf '%s' "$C1SSERESP" | grep -c 'ANSWER')" "1"
+check "C1-SSE: streaming continuation streams advisor advice" \
+  "$(printf '%s' "$C1SSERESP" | grep -c 'stub advisor advice')" "1"
+check "C1-SSE: streaming continuation emits no failure note" \
+  "$(printf '%s' "$C1SSERESP" | grep -c 'proceed using the advice above')" "0"
+# Exactly one terminal message_delta — the continuation translator must not double-terminate.
+C1SSE_ENDTURN=$(printf '%s' "$C1SSERESP" | grep -A1 'event: message_delta' | grep -c '"stop_reason":"end_turn"')
+check "C1-SSE: streaming continuation ends with one end_turn" "$C1SSE_ENDTURN" "1"
+# Exactly one message_start — the continuation suppresses it (the harness already saw one).
+C1SSE_MSGSTART=$(printf '%s' "$C1SSERESP" | grep -c 'event: message_start')
+check "C1-SSE: exactly one message_start (continuation suppresses its own)" "$C1SSE_MSGSTART" "1"
+set -e
+
+kill "$C1_SSE_GW_PID" "$C1SSESTUB_PID" 2>/dev/null || :
+wait "$C1_SSE_GW_PID" "$C1SSESTUB_PID" 2>/dev/null || :
+
+# --- C1-SSE no-[DONE]: an SSE continuation that closes without a [DONE] frame must still end
+# the turn (res.end + finalize), not hang open. The stub emits the finish_reason chunk then ends
+# the socket without the trailing `data: [DONE]`.
+cat > c1nodonestub.mjs <<'NODSTUB'
+import fs from "node:fs";
+import https from "node:https";
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      const isContinuation = body.includes('"role":"tool"') && body.includes('"tool_call_id"');
+      if (isContinuation) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"NODONE ANSWER"}}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+        return res.end();
+      }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_c1","type":"function","function":{"name":"consult_advisor","arguments":""}}]}}]}\n\n');
+      res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`C1NODONEPORT=${s.address().port}`));
+NODSTUB
+
+node c1nodonestub.mjs > c1nodonestub.out 2>&1 &
+C1NODONESTUB_PID=$!
+C1NODONEUP=""
+while [ -z "$C1NODONEUP" ]; do C1NODONEUP=$(sed -n 's/^C1NODONEPORT=//p' c1nodonestub.out); done
+
+C1_NODONE_PORT=4500
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > c1nodonegateway.mjs
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$C1NODONEUP/v1" \
+CORTI_PORT="$C1_NODONE_PORT" \
+CORTI_ADVISOR_STUB="$SCRATCH/advisor-stub.sh" \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node c1nodonegateway.mjs > c1nodonegw.out 2>&1 &
+C1_NODONE_GW_PID=$!
+wait_banner c1nodonegw.out || { echo "FAIL C1-NODONE gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+
+C1NODONEG="http://127.0.0.1:$C1_NODONE_PORT"
+C1NODONERESP=$(curl -s -m 15 -N -H 'content-type: application/json' -d "$C1BODY" "$C1NODONEG/v1/messages" 2>&1 || true)
+
+set +e
+check "C1-NODONE: no-[DONE] continuation streams the answer" \
+  "$(printf '%s' "$C1NODONERESP" | grep -c 'NODONE ANSWER')" "1"
+check "C1-NODONE: no-[DONE] continuation ends with end_turn" \
+  "$(printf '%s' "$C1NODONERESP" | grep -A1 'event: message_delta' | grep -c '"stop_reason":"end_turn"')" "1"
+check "C1-NODONE: no-[DONE] continuation emits message_stop (turn closed)" \
+  "$(printf '%s' "$C1NODONERESP" | grep -c 'event: message_stop')" "1"
+set -e
+
+kill "$C1_NODONE_GW_PID" "$C1NODONESTUB_PID" 2>/dev/null || :
+wait "$C1_NODONE_GW_PID" "$C1NODONESTUB_PID" 2>/dev/null || :
+
 if [ "$FAILED" -gt 0 ]; then
   printf '\n%s check(s) failed\n' "$FAILED"
   exit 1
