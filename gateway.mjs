@@ -188,6 +188,11 @@ function healthPayload() {
   return {
     status: "healthy",
     gatewayVersion: 2,
+    // Opaque fingerprint of the source this process booted from, handed over by the wrapper at
+    // launch. The gateway never computes it: one side owns the algorithm, so the two can't drift.
+    // The wrapper re-fingerprints the clone on each launch and restarts us when it stops matching,
+    // which is what makes a `git pull` take effect instead of silently serving the old build.
+    buildId: process.env.CORTI_BUILD_ID || null,
     // A pre-dispatch wrapper compares this against the mode it wants, so it has to describe
     // bare-path behaviour rather than naming a process-wide mode that no longer exists.
     mode: BARE_PATH_IS_ANTHROPIC ? "anthropic" : "openai",

@@ -18,6 +18,7 @@ sh test/models.sh      # tier-mapping tests for lib/models.mjs against captured 
 sh test/retry.sh       # pure-function tests for lib/retry.mjs
 sh test/smoke.sh       # sandboxed install + idempotency for setup.sh (scratch HOME)
 sh test/dispatch.sh    # one gateway serving both modes, selected per request by path prefix
+sh test/update.sh      # build-fingerprint restarts + the commits-behind notice (sandboxed clone)
 ```
 
 There is no per-test runner — each script runs its whole suite and prints `ok`/`FAIL` lines. To iterate on one case, comment out or edit within the script.
@@ -45,6 +46,23 @@ Supporting pieces:
 - **`lib/models.mjs`** — ranks Corti's catalog into fable/opus/sonnet/haiku tiers by model-ID *shape* (size/speed/channel suffixes), not hardcoded names, so a new model generation needs no code change. Emits `models.env`; also serves the picker's candidate lists (`--candidates`/`--emit`) so the menu and the ranker can't drift.
 - **`lib/doctor.sh`** — `corti-bridge doctor`: ~18 passive checks on the install, gateway, and state, plus an active `/models` probe under `--deep`. Doctor output goes to stdout (a report) — a deliberate exception to the `ui_*`→stderr invariant, so `doctor | grep FAIL` and `doctor > file` work.
 - **`lib/retry.mjs`** — the upstream retry policy as pure functions/constants, tested in isolation.
+
+### Staying current
+
+The wrapper fingerprints the gateway's own source (`gateway.mjs`, `translate.mjs`, `lib/*.mjs`,
+`lib/*.txt`) with `cksum` on every launch, hands it to the gateway as `CORTI_BUILD_ID`, and gets
+it back in `/health` as `buildId`. A mismatch is a stale gateway and joins the existing
+restart-reason list. The gateway never computes the fingerprint — one side owns the algorithm, so
+the two can't drift. This is what makes a `git pull` take effect: the gateway holds its source in
+memory from boot, so before this it kept serving the old code until an explicit `corti-bridge
+restart`.
+
+Separately, the wrapper backgrounds a throttled `git fetch origin main` (once a day) and counts
+`HEAD..origin/main` from *local* refs at launch, so the count drops to zero the moment the user
+pulls rather than nagging until the next fetch. The notice prints **after** the session, not
+before: the wrapper hands the terminal to Claude Code, which repaints it. That is the one reason
+the launch path gives up `exec` — and only when there is something to print. Off for print runs,
+advisor children, non-clones, any branch but `main`, and `CORTI_NO_UPDATE_CHECK=1`.
 
 ### Mode dispatch
 

@@ -211,6 +211,8 @@ Read directly from the shell — no local secrets file.
 | `CORTI_BASE_URL` | yes | Must match `https://ai.<env>.corti.app/v1`; used as-is (OpenAI-compatible endpoints) |
 | `CORTI_HOST` | no | Proxy bind address, default `127.0.0.1` |
 | `CORTI_PORT` | no | Proxy bind port, default `4192` |
+| `CORTI_NO_UPDATE_CHECK` | no | `1` disables the update check entirely — no background `git fetch`, no notice. Already off for print runs, advisor children, non-clone installs, and any branch but `main` |
+| `CORTI_UPDATE_INTERVAL_S` | no | Seconds between background update fetches, default `86400` (once a day). The commits-behind count itself is read from local refs on every launch and costs no network |
 | `CORTI_REASONING_MODE` | no | `thinking` (default: reasoning becomes Anthropic thinking blocks), `text` (fold into reply text), `drop` |
 | `TAVILY_API_KEY` | no | Enables Tavily as the primary WebSearch backend; when unset (or when Tavily fails/rate-limits) the keyless DuckDuckGo scrape is used instead |
 | `CORTI_SEARCH_DEPTH` | no | Tavily search depth: `basic` (default, 1 credit) or `advanced` (2 credits, richer snippets); ignored without `TAVILY_API_KEY` |
