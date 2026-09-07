@@ -1224,11 +1224,15 @@ export function translateCompletion(completion, ctx) {
 /* streaming state machine                                             */
 /* ------------------------------------------------------------------ */
 
-export function createStreamTranslator(ctx, emit) {
-  // emit(eventName, dataObject) -> called for each Anthropic SSE event to send.
-  let messageStarted = false;
+/**
+ * Streaming state machine. `emit(eventName, data)` is called per Anthropic SSE event.
+ * `startIndex` seeds nextBlockIndex for a continuation appended to an in-progress turn;
+ * `ctx.messageStarted` suppresses the message_start event for such a continuation.
+ */
+export function createStreamTranslator(ctx, emit, startIndex = 0) {
+  let messageStarted = !!ctx.messageStarted;
   let open = null; // { kind: "thinking"|"text"|"tool", index }
-  let nextBlockIndex = 0;
+  let nextBlockIndex = startIndex;
   const toolBlocks = new Map(); // upstream tool_calls index -> { blockIndex, closed, name, id, args }
   let pendingStop = null;
   let doneEmitted = false;
@@ -1467,6 +1471,9 @@ export function createStreamTranslator(ctx, emit) {
     get nextBlockIndex() {
       return nextBlockIndex;
     },
+    // Close whatever block is still open (emitting the thinking signature first, when that is
+    // what is open) so a caller can append its own block at nextBlockIndex without nesting.
+    closeOpen,
     // True when the translator handed the turn to the gateway for an inline advisor result
     // (done() suppressed message_stop). The stream handlers use this to know not to finalize.
     get advisorHandoff() {
