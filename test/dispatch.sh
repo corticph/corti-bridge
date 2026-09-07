@@ -27,6 +27,10 @@ cleanup() {
   [ -n "${C1ABORTSTUB_PID:-}" ] && { kill "$C1ABORTSTUB_PID" 2>/dev/null || :; wait "$C1ABORTSTUB_PID" 2>/dev/null || :; }
   [ -n "${C1_SETTLE_GW_PID:-}" ] && { kill "$C1_SETTLE_GW_PID" 2>/dev/null || :; wait "$C1_SETTLE_GW_PID" 2>/dev/null || :; }
   [ -n "${C1SETTLESTUB_PID:-}" ] && { kill "$C1SETTLESTUB_PID" 2>/dev/null || :; wait "$C1SETTLESTUB_PID" 2>/dev/null || :; }
+  [ -n "${C1_ERR_GW_PID:-}" ] && { kill "$C1_ERR_GW_PID" 2>/dev/null || :; wait "$C1_ERR_GW_PID" 2>/dev/null || :; }
+  [ -n "${C1ERRSTUB_PID:-}" ] && { kill "$C1ERRSTUB_PID" 2>/dev/null || :; wait "$C1ERRSTUB_PID" 2>/dev/null || :; }
+  [ -n "${C1_PT_GW_PID:-}" ] && { kill "$C1_PT_GW_PID" 2>/dev/null || :; wait "$C1_PT_GW_PID" 2>/dev/null || :; }
+  [ -n "${C1PTSTUB_PID:-}" ] && { kill "$C1PTSTUB_PID" 2>/dev/null || :; wait "$C1PTSTUB_PID" 2>/dev/null || :; }
   rm -rf "$SCRATCH"
 }
 trap cleanup EXIT
@@ -601,6 +605,136 @@ set -e
 
 kill "$C1_SETTLE_GW_PID" "$C1SETTLESTUB_PID" 2>/dev/null || :
 wait "$C1_SETTLE_GW_PID" "$C1SETTLESTUB_PID" 2>/dev/null || :
+
+# --- C1-ERRFRAME: the continuation upstream answers 200 and then streams an *error frame*
+# mid-turn. feed() would terminate the translator with a bare `error` event and no terminal
+# frame, and the turn would settle as a clean success — stranding the advice exactly like the
+# stall this fix removes. It must be treated as a continuation failure so the note carries it.
+cat > c1errstub.mjs <<'ERRSTUB'
+import fs from "node:fs";
+import https from "node:https";
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      const isContinuation = body.includes('"role":"tool"') && body.includes('"tool_call_id"');
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (isContinuation) {
+        res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"BEFOREERR"}}]}\n\n');
+        return res.end('data: {"error":{"code":503,"message":"backend overloaded"}}\n\n');
+      }
+      res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_c1","type":"function","function":{"name":"consult_advisor","arguments":""}}]}}]}\n\n');
+      res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`C1ERRPORT=${s.address().port}`));
+ERRSTUB
+
+node c1errstub.mjs > c1errstub.out 2>&1 &
+C1ERRSTUB_PID=$!
+C1ERRUP=""
+while [ -z "$C1ERRUP" ]; do C1ERRUP=$(sed -n 's/^C1ERRPORT=//p' c1errstub.out); done
+
+C1_ERR_PORT=4900
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > c1errgateway.mjs
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$C1ERRUP/v1" \
+CORTI_PORT="$C1_ERR_PORT" \
+CORTI_ADVISOR_STUB="$SCRATCH/advisor-stub.sh" \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node c1errgateway.mjs > c1errgw.out 2>&1 &
+C1_ERR_GW_PID=$!
+wait_banner c1errgw.out || { echo "FAIL C1-ERRFRAME gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+
+C1ERRG="http://127.0.0.1:$C1_ERR_PORT"
+C1ERRRESP=$(curl -s -m 20 -N -H 'content-type: application/json' -d "$C1BODY" "$C1ERRG/v1/messages" 2>&1 || true)
+
+set +e
+check "C1-ERRFRAME: error frame produces the failure note, not a silent success" \
+  "$(printf '%s' "$C1ERRRESP" | grep -c 'the follow-up response failed')" "1"
+check "C1-ERRFRAME: the note carries the advice" \
+  "$(printf '%s' "$C1ERRRESP" | grep -c 'advisor_guidance')" "1"
+check "C1-ERRFRAME: the turn is closed with a terminal message_stop" \
+  "$(printf '%s' "$C1ERRRESP" | grep -c '^event: message_stop')" "1"
+# The translator must never have emitted its bare error event for this frame.
+check "C1-ERRFRAME: no raw upstream error event reaches the client" \
+  "$(printf '%s' "$C1ERRRESP" | grep -c '^event: error')" "0"
+check "C1-ERRFRAME: text streamed before the error survives" \
+  "$(printf '%s' "$C1ERRRESP" | grep -c 'BEFOREERR')" "1"
+set -e
+
+kill "$C1_ERR_GW_PID" "$C1ERRSTUB_PID" 2>/dev/null || :
+wait "$C1_ERR_GW_PID" "$C1ERRSTUB_PID" 2>/dev/null || :
+
+# --- C1-PARTIALTOOL: the continuation dies partway through a tool_use's argument JSON. The
+# accumulated partial_json is unrepairable, so the turn must at least stay well-formed and stamp
+# end_turn (never tool_use) — a tool_use stop_reason would ask the harness to dispatch a call
+# whose input cannot parse.
+cat > c1ptstub.mjs <<'PTSTUB'
+import fs from "node:fs";
+import https from "node:https";
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      const isContinuation = body.includes('"role":"tool"') && body.includes('"tool_call_id"');
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (isContinuation) {
+        res.write('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"tc9","type":"function","function":{"name":"Read","arguments":"{\\"file_pa"}}]}}]}\n\n');
+        return void setTimeout(() => res.socket.destroy(), 300);
+      }
+      res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_c1","type":"function","function":{"name":"consult_advisor","arguments":""}}]}}]}\n\n');
+      res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`C1PTPORT=${s.address().port}`));
+PTSTUB
+
+node c1ptstub.mjs > c1ptstub.out 2>&1 &
+C1PTSTUB_PID=$!
+C1PTUP=""
+while [ -z "$C1PTUP" ]; do C1PTUP=$(sed -n 's/^C1PTPORT=//p' c1ptstub.out); done
+
+C1_PT_PORT=4950
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > c1ptgateway.mjs
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$C1PTUP/v1" \
+CORTI_PORT="$C1_PT_PORT" \
+CORTI_ADVISOR_STUB="$SCRATCH/advisor-stub.sh" \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node c1ptgateway.mjs > c1ptgw.out 2>&1 &
+C1_PT_GW_PID=$!
+wait_banner c1ptgw.out || { echo "FAIL C1-PARTIALTOOL gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+
+C1PTG="http://127.0.0.1:$C1_PT_PORT"
+C1PTRESP=$(curl -s -m 20 -N -H 'content-type: application/json' -d "$C1BODY" "$C1PTG/v1/messages" 2>&1 || true)
+
+set +e
+check "C1-PARTIALTOOL: stop_reason is end_turn, never tool_use" \
+  "$(printf '%s' "$C1PTRESP" | grep -c '"stop_reason":"tool_use"')" "0"
+check "C1-PARTIALTOOL: the turn still ends with end_turn" \
+  "$(printf '%s' "$C1PTRESP" | grep -A1 '^event: message_delta' | grep -c '"stop_reason":"end_turn"')" "1"
+C1PT_STARTS=$(printf '%s' "$C1PTRESP" | grep -c '"type":"content_block_start"')
+check "C1-PARTIALTOOL: the partial tool block is closed" \
+  "$(printf '%s' "$C1PTRESP" | grep -c '"type":"content_block_stop"')" "$C1PT_STARTS"
+check "C1-PARTIALTOOL: the note still carries the advice" \
+  "$(printf '%s' "$C1PTRESP" | grep -c 'advisor_guidance')" "1"
+set -e
+
+kill "$C1_PT_GW_PID" "$C1PTSTUB_PID" 2>/dev/null || :
+wait "$C1_PT_GW_PID" "$C1PTSTUB_PID" 2>/dev/null || :
 
 if [ "$FAILED" -gt 0 ]; then
   printf '\n%s check(s) failed\n' "$FAILED"

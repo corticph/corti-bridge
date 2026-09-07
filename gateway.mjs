@@ -411,6 +411,10 @@ async function handleMessages(req, res, body) {
   // reads it to place its note after whatever the continuation already emitted; assigned once,
   // never reassigned, so the index it reports is always the live one.
   let contTranslator = null;
+  // Next free block index for a continuation that emitted without a translator (the non-SSE
+  // one-shot path). Keeps the note's placement keyed to what was actually emitted rather than to
+  // which branch produced it.
+  let contNextIndex = 0;
   // True while an advisor continuation (the 2nd upstream call after hold-and-continue) is in
   // flight. Like the advisor phase itself it can legitimately run for minutes, so the 120s
   // stream-idle watchdog must stay its hand — the continuation's own deadline is the ceiling.
@@ -632,7 +636,7 @@ async function handleMessages(req, res, body) {
       // Whatever the continuation already streamed stays intact: close its open block and take
       // the next free index. The captured resIdx is only correct before the continuation emits.
       contTranslator?.closeOpen();
-      const idx = contTranslator ? contTranslator.nextBlockIndex : resIdx + 1;
+      const idx = contTranslator ? contTranslator.nextBlockIndex : Math.max(resIdx + 1, contNextIndex);
       writeEvent("content_block_start", { type: "content_block_start", index: idx, content_block: { type: "text", text: "" } });
       writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: note } });
       writeEvent("content_block_stop", { type: "content_block_stop", index: idx });
@@ -744,6 +748,7 @@ async function handleMessages(req, res, body) {
           writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } });
         writeEvent("content_block_stop", { type: "content_block_stop", index: idx });
         idx++;
+        contNextIndex = idx;
       }
       writeEvent("message_delta", {
         type: "message_delta",
@@ -761,7 +766,6 @@ async function handleMessages(req, res, body) {
       const settle = (err) => {
         if (settled) return;
         settled = true;
-        if (deadline) clearTimeout(deadline);
         if (err) return reject(err);
         // Logged before the caller finalizes, so it lands in the RESPONSE entry's diagnostics.
         diagnostics.push("advisor continuation settled: upstream turn complete");
@@ -896,13 +900,24 @@ async function handleMessages(req, res, body) {
                 contTranslator.done();
                 return upstreamTurnDone();
               }
+              let parsed;
               try {
-                contTranslator.feed(JSON.parse(payload));
+                parsed = JSON.parse(payload);
               } catch {
                 diagnostics.push(`unparseable continuation data line skipped (${payload.slice(0, 120)})`);
+                return;
               }
-              // feed() terminates the turn on an upstream error frame, which emits its own
-              // terminal event — nothing more can be written under this message.
+              // Intercept an upstream error frame before the translator sees it. feed() would
+              // terminate the turn with a bare `error` event and no terminal frame, and this path
+              // would then settle as a success — stranding the advice exactly like the stall this
+              // whole fix removes. Failing here routes it to the note, which carries the advice.
+              if (parsed?.error && typeof parsed.error === "object") {
+                const detail = parsed.error.message ?? parsed.error.code ?? "unknown";
+                return settleFailed(`upstream error frame: ${detail}`, "advisor-continuation-upstream-error");
+              }
+              contTranslator.feed(parsed);
+              // Defensive: any other route to a terminated translator has emitted its own
+              // terminal event, so nothing more can be written under this message.
               if (contTranslator.terminated) upstreamTurnDone();
             };
             up.on("data", (chunk) => {
@@ -950,9 +965,16 @@ async function handleMessages(req, res, body) {
           // after the client gave up, so a hung continuation would never get the failure note.
           const budget = Math.max(CONTINUATION_MIN_MS, NONSTREAM_TIMEOUT_MS - (Date.now() - started) - CONTINUATION_GRACE_MS);
           deadline = setTimeout(() => {
-            if (settled) return;
-            req.destroy(Error(`continuation exceeded its ${Math.round(budget / 1000)}s budget`));
+            // Deliberately fires even after the turn settled: once [DONE] is seen we drop
+            // proxyReq so finalize() can't tear the socket down, so if upstream then never sends
+            // the terminating chunk this timer is the only thing left to reclaim it. settleFailed
+            // is a no-op on an already-settled turn.
+            if (!req.destroyed) req.destroy(Error(`continuation exceeded its ${Math.round(budget / 1000)}s budget`));
+            settleFailed("continuation exceeded its budget", "advisor-continuation-failed");
           }, budget);
+          // Cleared on 'close', not in settle(): the request always closes eventually, and until
+          // it does the timer is the socket's only backstop.
+          req.on("close", () => { if (deadline) clearTimeout(deadline); });
           req.on("error", (err) => {
             if (settled || finalized || clientGone) return settle();
             settleFailed(err?.message ?? String(err), "advisor-continuation-failed");
