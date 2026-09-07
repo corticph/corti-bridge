@@ -406,6 +406,7 @@ async function handleMessages(req, res, body) {
   let upstreamRes = null;
   let headersSentToClient = false;
   let lastActivity = Date.now();
+  let lastPing = 0;
   let translator = null;
   // The continuation's own stream translator, once it starts streaming. endContinuationFailure
   // reads it to place its note after whatever the continuation already emitted; assigned once,
@@ -714,6 +715,12 @@ async function handleMessages(req, res, body) {
       finalize("advisor-continuation");
     } catch (err) {
       endContinuationFailure(err?.message ?? String(err), err?.contTag ?? "advisor-continuation-failed");
+      // endContinuationFailure declines when the turn is already closed. Finalize regardless, or
+      // a request whose note could not be written waits for the watchdog and is logged under it.
+      if (!finalized) {
+        if (!res.writableEnded) res.end();
+        finalize(err?.contTag ?? "advisor-continuation-failed");
+      }
     } finally {
       continuationActive = false;
     }
@@ -965,12 +972,14 @@ async function handleMessages(req, res, body) {
           // after the client gave up, so a hung continuation would never get the failure note.
           const budget = Math.max(CONTINUATION_MIN_MS, NONSTREAM_TIMEOUT_MS - (Date.now() - started) - CONTINUATION_GRACE_MS);
           deadline = setTimeout(() => {
-            // Deliberately fires even after the turn settled: once [DONE] is seen we drop
-            // proxyReq so finalize() can't tear the socket down, so if upstream then never sends
-            // the terminating chunk this timer is the only thing left to reclaim it. settleFailed
-            // is a no-op on an already-settled turn.
-            if (!req.destroyed) req.destroy(Error(`continuation exceeded its ${Math.round(budget / 1000)}s budget`));
-            settleFailed("continuation exceeded its budget", "advisor-continuation-failed");
+            // Settle first: destroying the request races the 'close' and 'error' handlers, and
+            // first-settle wins — reporting the teardown would shadow the budget reason in the
+            // one diagnostic this timer exists to produce. No-op if the turn already settled.
+            settleFailed(`continuation exceeded its ${Math.round(budget / 1000)}s budget`, "advisor-continuation-failed");
+            // Deliberately also fires after a settled turn: once [DONE] is seen we drop proxyReq
+            // so finalize() can't tear the socket down, leaving this the only thing that can
+            // reclaim it if upstream never sends the terminating chunk.
+            if (!req.destroyed) req.destroy();
           }, budget);
           // Cleared on 'close', not in settle(): the request always closes eventually, and until
           // it does the timer is the socket's only backstop.
@@ -1025,6 +1034,11 @@ async function handleMessages(req, res, body) {
 
   const writePing = () => {
     if (clientGone || res.writableEnded) return;
+    // PING_INTERVAL_MS is the ping *period*. deadlineCheck ticks every second and a ping does not
+    // count as activity, so without this a quiet stream emits one ping per tick — bounded before
+    // only by the watchdog kill, which the advisor continuation is now exempt from.
+    if (Date.now() - lastPing < PING_INTERVAL_MS) return;
+    lastPing = Date.now();
     // While the translator handed the turn to the advisor hook, the stream is idle by
     // design (runAdvisor is spawning). Pings here render as a thinking-spinner line that
     // displaces the "Advising" indicator, so suppress them for the duration of the handoff.
