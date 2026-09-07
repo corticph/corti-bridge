@@ -539,6 +539,25 @@ const a2bdelta = a2bevents.find((e) => e.ev === "message_delta");
 check("A2b: fully-cached turn input_tokens floored at 1 (not 0)", a2bdelta?.data?.usage?.input_tokens, 1);
 check("A2b: fully-cached turn cache_read preserved", a2bdelta?.data?.usage?.cache_read_input_tokens, 50000);
 
+// --- A3: closeOpen() is public so the advisor continuation can append a failure note after
+// whatever it already streamed. It must emit the thinking signature before the stop — a
+// hand-rolled content_block_stop would drop it silently and every other test would still pass.
+const a3events = [];
+const a3ctx = { msgId: "msg_a3", requestedModel: "corti-s1", reasoningMode: "thinking", estimatedInput: 10 };
+const a3tx = createStreamTranslator(a3ctx, (ev, data) => a3events.push({ ev, data }));
+a3tx.feed({ choices: [{ delta: { reasoning_content: "pondering" } }] });
+a3events.length = 0;
+a3tx.closeOpen();
+check("A3: closeOpen on a thinking block emits signature then stop", a3events.map((e) => e.ev).join(","), "content_block_delta,content_block_stop");
+check("A3: the signature delta is a signature_delta", a3events[0]?.data?.delta?.type, "signature_delta");
+// Idempotent: nothing open, nothing emitted — the note path calls it unconditionally.
+a3events.length = 0;
+a3tx.closeOpen();
+check("A3: closeOpen with nothing open emits nothing", a3events.length, 0);
+// The next block lands at nextBlockIndex, after the closed one — this is the index the
+// failure note from the advisor continuation takes, and reusing an earlier one is the bug.
+check("A3: nextBlockIndex is past the closed block", a3tx.nextBlockIndex, 1);
+
 // --- D1: translateCompletion generates a fallback tool_use id when upstream omits it. The
 // streaming path already does (translate.mjs:1301); the non-streaming path used call.id directly,
 // so a missing id left id:undefined and the harness could not pair the tool_result -> broken loop.

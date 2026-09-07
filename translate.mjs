@@ -1471,6 +1471,9 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
     get nextBlockIndex() {
       return nextBlockIndex;
     },
+    // Close whatever block is still open (emitting the thinking signature first, when that is
+    // what is open) so a caller can append its own block at nextBlockIndex without nesting.
+    closeOpen,
     // True when the translator handed the turn to the gateway for an inline advisor result
     // (done() suppressed message_stop). The stream handlers use this to know not to finalize.
     get advisorHandoff() {

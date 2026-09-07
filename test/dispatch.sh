@@ -23,6 +23,10 @@ cleanup() {
   [ -n "${C1STUB_PID:-}" ] && { kill "$C1STUB_PID" 2>/dev/null || :; wait "$C1STUB_PID" 2>/dev/null || :; }
   [ -n "${C1_OK_GW_PID:-}" ] && { kill "$C1_OK_GW_PID" 2>/dev/null || :; wait "$C1_OK_GW_PID" 2>/dev/null || :; }
   [ -n "${C1OKSTUB_PID:-}" ] && { kill "$C1OKSTUB_PID" 2>/dev/null || :; wait "$C1OKSTUB_PID" 2>/dev/null || :; }
+  [ -n "${C1_ABORT_GW_PID:-}" ] && { kill "$C1_ABORT_GW_PID" 2>/dev/null || :; wait "$C1_ABORT_GW_PID" 2>/dev/null || :; }
+  [ -n "${C1ABORTSTUB_PID:-}" ] && { kill "$C1ABORTSTUB_PID" 2>/dev/null || :; wait "$C1ABORTSTUB_PID" 2>/dev/null || :; }
+  [ -n "${C1_SETTLE_GW_PID:-}" ] && { kill "$C1_SETTLE_GW_PID" 2>/dev/null || :; wait "$C1_SETTLE_GW_PID" 2>/dev/null || :; }
+  [ -n "${C1SETTLESTUB_PID:-}" ] && { kill "$C1SETTLESTUB_PID" 2>/dev/null || :; wait "$C1SETTLESTUB_PID" 2>/dev/null || :; }
   rm -rf "$SCRATCH"
 }
 trap cleanup EXIT
@@ -222,15 +226,20 @@ C1RESP=$(curl -s -m 15 -N -H 'content-type: application/json' -d "$C1BODY" "$C1G
 # zero matches, which set -e would turn into a silent abort. We want clean FAIL lines instead.
 set +e
 check "C1: continuation 500 ends with the text note" \
-  "$(printf '%s' "$C1RESP" | grep -c 'proceed using the advice above')" "1"
+  "$(printf '%s' "$C1RESP" | grep -c 'the follow-up response failed')" "1"
 # The non-2xx note names the upstream status; the thrown/catch path names an error message
 # instead. Asserting this proves the stub's 500 path was actually taken, not a parse-error catch.
 check "C1: note names upstream 500 (non-2xx path taken)" \
   "$(printf '%s' "$C1RESP" | grep -c 'upstream 500')" "1"
 check "C1: no second advisor_tool_result_error after success" \
   "$(printf '%s' "$C1RESP" | grep -c 'advisor_tool_result_error')" "0"
-check "C1: advisor advice was streamed (advisor_result)" \
-  "$(printf '%s' "$C1RESP" | grep -c 'stub advisor advice')" "1"
+# Twice: once in the advisor_tool_result block the harness renders, and once repeated verbatim
+# inside the failure note. The harness does not replay advisor blocks into the next request's
+# history, so the note is the only copy that survives into the model's context.
+check "C1: failure note repeats the advice verbatim" \
+  "$(printf '%s' "$C1RESP" | grep -c 'stub advisor advice')" "2"
+check "C1: failure note wraps the advice in advisor_guidance" \
+  "$(printf '%s' "$C1RESP" | grep -c 'advisor_guidance')" "1"
 # The terminal message_delta carries end_turn; the advisor_result block also carries stop_reason
 # end_turn, so assert on the message_delta event specifically (exactly one terminal delta).
 C1_ENDTURN=$(printf '%s' "$C1RESP" | grep -A1 'event: message_delta' | grep -c '"stop_reason":"end_turn"')
@@ -444,6 +453,154 @@ set -e
 
 kill "$C1_NODONE_GW_PID" "$C1NODONESTUB_PID" 2>/dev/null || :
 wait "$C1_NODONE_GW_PID" "$C1NODONESTUB_PID" 2>/dev/null || :
+
+# --- C1-ABORT: the continuation dies mid-turn *after* streaming blocks of its own. The failure
+# note must land after them at a fresh index — a note pinned to resIdx+1 re-opens a block the
+# continuation already used, clobbering finished model output and leaving the open one dangling.
+# The note must also repeat the advice: the harness never replays advisor blocks into the next
+# request's history, so this note is the only copy that reaches the model's context.
+cat > c1abortstub.mjs <<'ABORTSTUB'
+import fs from "node:fs";
+import https from "node:https";
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      const isContinuation = body.includes('"role":"tool"') && body.includes('"tool_call_id"');
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (isContinuation) {
+        // A finished text block, then an *open* tool_use block, then the socket dies.
+        res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"PARTIALTEXT"}}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"tc1","type":"function","function":{"name":"Read","arguments":"{}"}}]}}]}\n\n');
+        return void setTimeout(() => res.socket.destroy(), 300);
+      }
+      res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_c1","type":"function","function":{"name":"consult_advisor","arguments":""}}]}}]}\n\n');
+      res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`C1ABORTPORT=${s.address().port}`));
+ABORTSTUB
+
+node c1abortstub.mjs > c1abortstub.out 2>&1 &
+C1ABORTSTUB_PID=$!
+C1ABORTUP=""
+while [ -z "$C1ABORTUP" ]; do C1ABORTUP=$(sed -n 's/^C1ABORTPORT=//p' c1abortstub.out); done
+
+C1_ABORT_PORT=4600
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > c1abortgateway.mjs
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$C1ABORTUP/v1" \
+CORTI_PORT="$C1_ABORT_PORT" \
+CORTI_ADVISOR_STUB="$SCRATCH/advisor-stub.sh" \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node c1abortgateway.mjs > c1abortgw.out 2>&1 &
+C1_ABORT_GW_PID=$!
+wait_banner c1abortgw.out || { echo "FAIL C1-ABORT gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+
+C1ABORTG="http://127.0.0.1:$C1_ABORT_PORT"
+C1ABORTRESP=$(curl -s -m 20 -N -H 'content-type: application/json' -d "$C1BODY" "$C1ABORTG/v1/messages" 2>&1 || true)
+
+set +e
+# Every content_block_start index appears exactly once: no block is ever re-opened.
+C1ABORT_IDX=$(printf '%s' "$C1ABORTRESP" | sed -n 's/.*"type":"content_block_start","index":\([0-9]*\).*/\1/p')
+C1ABORT_IDX_ALL=$(printf '%s\n' "$C1ABORT_IDX" | grep -c .)
+C1ABORT_IDX_UNIQ=$(printf '%s\n' "$C1ABORT_IDX" | sort -u | grep -c .)
+check "C1-ABORT: no content block index is re-opened" "$C1ABORT_IDX_ALL" "$C1ABORT_IDX_UNIQ"
+# Every started block is also stopped — closeOpen() must close the dangling tool_use.
+check "C1-ABORT: every started block is stopped" \
+  "$(printf '%s' "$C1ABORTRESP" | grep -c '"type":"content_block_stop"')" "$C1ABORT_IDX_ALL"
+check "C1-ABORT: streamed text survives the failure note" \
+  "$(printf '%s' "$C1ABORTRESP" | grep -c 'PARTIALTEXT')" "1"
+check "C1-ABORT: failure note carries the advice verbatim" \
+  "$(printf '%s' "$C1ABORTRESP" | grep -c 'advisor_guidance')" "1"
+# Exactly one terminal frame: the abort must not append a second message_stop to a closed turn.
+check "C1-ABORT: exactly one message_stop" \
+  "$(printf '%s' "$C1ABORTRESP" | grep -c '^event: message_stop')" "1"
+set -e
+
+kill "$C1_ABORT_GW_PID" "$C1ABORTSTUB_PID" 2>/dev/null || :
+wait "$C1_ABORT_GW_PID" "$C1ABORTSTUB_PID" 2>/dev/null || :
+
+# --- C1-SETTLE: the continuation promise must settle on the *success* path. A stub that flushes
+# [DONE] and the chunk terminator in separate writes (what a real stream does) used to leave the
+# promise pending forever: finalize() destroyed the socket before 'end' could fire, so the whole
+# request frame stayed suspended and the continuation's upstream response never reached the log.
+# Both the settled diagnostic and the tagged UPSTREAM-RESPONSE entry prove the path completed.
+cat > c1settlestub.mjs <<'SETTLESTUB'
+import fs from "node:fs";
+import https from "node:https";
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      const isContinuation = body.includes('"role":"tool"') && body.includes('"tool_call_id"');
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (isContinuation) {
+        res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"SETTLED"}}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+        // [DONE] alone, terminator later: the response is not complete when [DONE] is parsed.
+        return void setTimeout(() => {
+          res.write('data: [DONE]\n\n');
+          setTimeout(() => res.end(), 300);
+        }, 300);
+      }
+      res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_c1","type":"function","function":{"name":"consult_advisor","arguments":""}}]}}]}\n\n');
+      res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`C1SETTLEPORT=${s.address().port}`));
+SETTLESTUB
+
+node c1settlestub.mjs > c1settlestub.out 2>&1 &
+C1SETTLESTUB_PID=$!
+C1SETTLEUP=""
+while [ -z "$C1SETTLEUP" ]; do C1SETTLEUP=$(sed -n 's/^C1SETTLEPORT=//p' c1settlestub.out); done
+
+C1_SETTLE_PORT=4700
+mkdir -p "$SCRATCH/settle-logs"
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > c1settlegateway.mjs
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$C1SETTLEUP/v1" \
+CORTI_PORT="$C1_SETTLE_PORT" \
+CORTI_ADVISOR_STUB="$SCRATCH/advisor-stub.sh" \
+CORTI_DEBUG=1 \
+CORTI_DEBUG_DIR="$SCRATCH/settle-logs" \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node c1settlegateway.mjs > c1settlegw.out 2>&1 &
+C1_SETTLE_GW_PID=$!
+wait_banner c1settlegw.out || { echo "FAIL C1-SETTLE gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+
+C1SETTLEG="http://127.0.0.1:$C1_SETTLE_PORT"
+C1SETTLERESP=$(curl -s -m 20 -N -H 'content-type: application/json' -d "$C1BODY" "$C1SETTLEG/v1/messages" 2>&1 || true)
+C1SETTLELOG=$(cat "$SCRATCH"/settle-logs/*.log 2>/dev/null || true)
+
+set +e
+check "C1-SETTLE: continuation answer reaches the client" \
+  "$(printf '%s' "$C1SETTLERESP" | grep -c 'SETTLED')" "1"
+check "C1-SETTLE: no failure note on the success path" \
+  "$(printf '%s' "$C1SETTLERESP" | grep -c 'the follow-up response failed')" "0"
+# The diagnostic is pushed when the promise settles and written by finalize() — its presence in
+# the RESPONSE entry proves the await returned rather than hanging.
+check "C1-SETTLE: continuation promise settled" \
+  "$(printf '%s' "$C1SETTLELOG" | grep -c 'advisor continuation settled')" "1"
+check "C1-SETTLE: continuation upstream response is logged" \
+  "$(printf '%s' "$C1SETTLELOG" | grep -c 'UPSTREAM-RESPONSE \[continuation\]')" "1"
+set -e
+
+kill "$C1_SETTLE_GW_PID" "$C1SETTLESTUB_PID" 2>/dev/null || :
+wait "$C1_SETTLE_GW_PID" "$C1SETTLESTUB_PID" 2>/dev/null || :
 
 if [ "$FAILED" -gt 0 ]; then
   printf '\n%s check(s) failed\n' "$FAILED"
