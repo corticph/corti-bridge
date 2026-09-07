@@ -31,6 +31,7 @@ cleanup() {
   [ -n "${C1ERRSTUB_PID:-}" ] && { kill "$C1ERRSTUB_PID" 2>/dev/null || :; wait "$C1ERRSTUB_PID" 2>/dev/null || :; }
   [ -n "${C1_PT_GW_PID:-}" ] && { kill "$C1_PT_GW_PID" 2>/dev/null || :; wait "$C1_PT_GW_PID" 2>/dev/null || :; }
   [ -n "${C1PTSTUB_PID:-}" ] && { kill "$C1PTSTUB_PID" 2>/dev/null || :; wait "$C1PTSTUB_PID" 2>/dev/null || :; }
+  [ -n "${CALSTUB_PID:-}" ] && { kill "$CALSTUB_PID" 2>/dev/null || :; wait "$CALSTUB_PID" 2>/dev/null || :; }
   rm -rf "$SCRATCH"
 }
 trap cleanup EXIT
@@ -735,6 +736,115 @@ set -e
 
 kill "$C1_PT_GW_PID" "$C1PTSTUB_PID" 2>/dev/null || :
 wait "$C1_PT_GW_PID" "$C1PTSTUB_PID" 2>/dev/null || :
+
+# --- CAL e2e: message_start carries the char/4 estimate, and a turn that dies before its real
+# message_delta leaves that estimate standing as its final recorded usage. An estimate below the
+# previous turn therefore walks the context readout backwards. The gateway must scale it by what
+# upstream actually charged for the last turn of the same session. The stub reports an absurd
+# prompt_tokens so the ratio ceiling is what decides the result.
+cat > calstub.mjs <<'CALSTUB'
+import fs from "node:fs";
+import https from "node:https";
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      // The advisor continuation must not answer, so the turn ends on the proxy's failure note.
+      if (body.includes('"role":"tool"') && body.includes('"tool_call_id"')) {
+        res.writeHead(500, { "content-type": "application/json" });
+        return res.end('{"error":{"message":"unavailable"}}');
+      }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (body.includes("TRIGGER-ADVISOR")) {
+        res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_cal","type":"function","function":{"name":"consult_advisor","arguments":""}}]}}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":999999,"completion_tokens":1}}\n\n');
+        return res.end('data: [DONE]\n\n');
+      }
+      res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"HI"}}]}\n\n');
+      // Two usage frames: real streams report a partial before the final one, and only the last
+      // is the turn's actual prompt cost.
+      res.write('data: {"choices":[{"index":0,"delta":{"content":"!"}}],"usage":{"prompt_tokens":5,"completion_tokens":1}}\n\n');
+      res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":999999,"completion_tokens":1}}\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`CALPORT=${s.address().port}`));
+CALSTUB
+
+node calstub.mjs > calstub.out 2>&1 &
+CALSTUB_PID=$!
+CALUP=""
+while [ -z "$CALUP" ]; do CALUP=$(sed -n 's/^CALPORT=//p' calstub.out); done
+
+CAL_PORT=4960
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > calgateway.mjs
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$CALUP/v1" \
+CORTI_PORT="$CAL_PORT" \
+CORTI_ADVISOR_STUB="$SCRATCH/advisor-stub.sh" \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node calgateway.mjs > calgw.out 2>&1 &
+CAL_GW_PID=$!
+wait_banner calgw.out || { echo "FAIL CAL gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+
+# The sample floor is in tokens, so the prompt has to be big enough to clear it.
+CALPAD=$(awk 'BEGIN{s="";while(length(s)<24000)s=s "corti bridge padding text ";print s}')
+CALBODY='{"model":"corti-s1","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"'"$CALPAD"'"}]}'
+CALG="http://127.0.0.1:$CAL_PORT"
+cal_post() {
+  curl -s -m 15 -N -H 'content-type: application/json' -H "x-claude-code-session-id: $1" \
+    -d "$CALBODY" "$CALG/v1/messages" 2>&1 || true
+}
+cal_input() { printf '%s' "$1" | grep -A1 '^event: message_start' | sed -n 's/.*"input_tokens":\([0-9]*\).*/\1/p' | head -1; }
+
+cal_note_input() { printf '%s' "$1" | grep -A1 '^event: message_delta' | sed -n 's/.*"input_tokens":\([0-9]*\).*/\1/p' | tail -1; }
+
+CAL_A1=$(cal_input "$(cal_post cal-a)")
+CAL_A2=$(cal_input "$(cal_post cal-a)")
+CAL_B1=$(cal_input "$(cal_post cal-b)")
+
+# The failure note ends the turn with a usage of its own, and that is the shape behind the two
+# largest backward steps observed in real transcripts. It has to carry the same calibrated number
+# message_start did, not the raw estimate.
+CALADVBODY='{"model":"corti-s1","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"TRIGGER-ADVISOR '"$CALPAD"'"}]}'
+cal_adv_post() {
+  curl -s -m 20 -N -H 'content-type: application/json' -H "x-claude-code-session-id: $1" \
+    -d "$CALADVBODY" "$CALG/v1/messages" 2>&1 || true
+}
+# cal-a is already calibrated by the two turns above; cal-c has never been seen, so its estimate
+# is raw. Same body, so the gap between them is the calibration and nothing else.
+CALADV_WARM=$(cal_adv_post cal-a)
+CALADV_COLD=$(cal_adv_post cal-c)
+# Derived from the policy module rather than restated here, so the ceiling constant has one owner.
+CAL_WANT=$(node --input-type=module -e '
+import { calibrationKey, calibratedEstimate, recordPromptTokens } from "'"$REPO"'/lib/prompt-estimate.mjs";
+const k = calibrationKey("t", "corti-s1");
+recordPromptTokens(k, '"$CAL_A1"', 999999);
+console.log(calibratedEstimate(k, '"$CAL_A1"'));
+')
+
+set +e
+check "CAL: the first turn of a session reports the raw estimate" \
+  "$([ "$CAL_A1" -gt 4096 ] && echo yes || echo no)" "yes"
+check "CAL: the next turn is scaled by what upstream charged" "$CAL_A2" "$CAL_WANT"
+check "CAL: scaling never lands below the raw estimate" \
+  "$([ "$CAL_A2" -ge "$CAL_A1" ] && echo yes || echo no)" "yes"
+check "CAL: a different session is not calibrated by this one" "$CAL_B1" "$CAL_A1"
+check "CAL-NOTE: the advisor failure note is reached" \
+  "$(printf '%s' "$CALADV_WARM" | grep -c 'the follow-up response failed')" "1"
+check "CAL-NOTE: the note ends the turn on the calibrated estimate" \
+  "$(cal_note_input "$CALADV_WARM")" "$(cal_input "$CALADV_WARM")"
+check "CAL-NOTE: and that is above what an uncalibrated session reports" \
+  "$([ "$(cal_note_input "$CALADV_WARM")" -gt "$(cal_note_input "$CALADV_COLD")" ] && echo yes || echo no)" "yes"
+set -e
+
+kill "$CAL_GW_PID" "$CALSTUB_PID" 2>/dev/null || :
+wait "$CAL_GW_PID" "$CALSTUB_PID" 2>/dev/null || :
 
 if [ "$FAILED" -gt 0 ]; then
   printf '\n%s check(s) failed\n' "$FAILED"

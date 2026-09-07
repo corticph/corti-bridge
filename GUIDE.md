@@ -28,7 +28,7 @@ This is a reference, not a tutorial. For install and run, see the [README](READM
 - **thinking config** — Anthropic `thinking` maps to upstream `reasoning_effort` + `thinking_token_budget`; upstream reasoning streams back as Anthropic thinking blocks. History thinking blocks are stripped on re-entry (signatures are synthetic, see below).
 - **images** — converted to `image_url` parts, including images inside tool results, which are attached as a following user message
 - **auth** — whatever token the client sends is discarded; the real `CORTI_BEARER` is injected
-- **`/v1/messages/count_tokens`** — handled locally (estimator: chars/4 + tools schema + per-image flat count)
+- **`/v1/messages/count_tokens`** — handled locally (estimator: chars/4 + tools schema + per-image flat count). The same estimator seeds `message_start.usage.input_tokens`, but there it is first scaled by the last real/estimate ratio observed for that session and model, so a turn that dies before upstream reports usage does not record less context than the turn before it. `count_tokens` itself and the local overflow guard stay on the raw estimate.
 - **errors** — upstream errors translated into Anthropic's envelope. Critically, context-overflow conditions become `400 prompt is too long`, which is what drives Claude Code's auto-compact
 - **`/v1/models`** — serves the translated catalog for gateway model discovery
 

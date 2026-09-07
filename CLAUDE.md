@@ -16,6 +16,7 @@ There is no build or lint step. Tests are plain shell scripts, each a self-conta
 sh test/translate.sh   # pure-function tests for translate.mjs — offline, no credentials
 sh test/models.sh      # tier-mapping tests for lib/models.mjs against captured fixtures
 sh test/retry.sh       # pure-function tests for lib/retry.mjs
+sh test/prompt-estimate.sh  # pure-function tests for lib/prompt-estimate.mjs
 sh test/smoke.sh       # sandboxed install + idempotency for setup.sh (scratch HOME)
 sh test/dispatch.sh    # one gateway serving both modes, selected per request by path prefix
 ```
@@ -45,6 +46,7 @@ Supporting pieces:
 - **`lib/models.mjs`** — ranks Corti's catalog into fable/opus/sonnet/haiku tiers by model-ID *shape* (size/speed/channel suffixes), not hardcoded names, so a new model generation needs no code change. Emits `models.env`; also serves the picker's candidate lists (`--candidates`/`--emit`) so the menu and the ranker can't drift.
 - **`lib/doctor.sh`** — `corti-bridge doctor`: ~18 passive checks on the install, gateway, and state, plus an active `/models` probe under `--deep`. Doctor output goes to stdout (a report) — a deliberate exception to the `ui_*`→stderr invariant, so `doctor | grep FAIL` and `doctor > file` work.
 - **`lib/retry.mjs`** — the upstream retry policy as pure functions/constants, tested in isolation.
+- **`lib/prompt-estimate.mjs`** — calibration for the char/4 prompt estimate, same shape: pure functions over one bounded per-session store, tested in isolation.
 
 ### Mode dispatch
 
@@ -64,6 +66,7 @@ One gateway process serves both modes simultaneously, chosen per request by URL 
 
 - `message_start.usage.input_tokens` carries the char/4 prompt estimate, **not 0**. Zeroing it (fbb9d23) froze the `/workflows` live per-agent token counter at "1 tok" — the harness reads `message_start` usage off yielded events *before* `message_delta` arrives; the estimate is the proxy's only live-growth signal (upstream only delivers usage in the final `include_usage` chunk). Reversed by `8e316a0`.
 - Real `anthropicUsage` floors `input_tokens` at 1 (never 0): the harness merge keeps the old value when the incoming field is 0, so a 0 would leave the estimate standing and re-create the statusline double-count (estimate + cache_read ≈ 329k shown for ~170k real). Fully-cached turns reporting 1 instead of Anthropic's 0 is accepted.
+- The estimate in `message_start` is **calibrated**, not raw char/4 (`lib/prompt-estimate.mjs`). A real `message_delta` normally overwrites it, but a turn that dies first — client abort, upstream error mid-response, a failed advisor continuation — leaves it standing as that message's *final* recorded usage. Raw char/4 lands a few percent under the truth, so the harness then holds less context than the previous turn did and the context readout steps backwards before recovering (measured: a visible backward step on 24 of 48 turns, worst -9328). Scaling by the last real/estimate ratio for that session+model, never below the raw estimate, drops that to 1 of 48 — the survivor being a rewind where the prompt genuinely shrank. Scale by the ratio rather than pinning to the last real total: after an auto-compact the estimate legitimately collapses, and a pinned floor would keep reporting the pre-compact size. The advisor continuation is deliberately excluded from feeding it — its prompt carries the advisor's answer on top of the body the estimate was measured from.
 
 **Prefix-cache stability (A1)** — mid-conversation `role:"system"` messages and `mid_conv_system` blocks must **never** be folded into the upstream system string. The harness injects reminders (task nudges, CLAUDE.md replays, plan-mode exits) as mid-conv system messages; folding them grew the cached prefix every few turns and broke Corti's automatic prefix cache — cache_read collapse plus ~25x cost spikes. They are emitted as user content at their original position; the upstream system string must stay byte-stable across turns. `body.system` itself (base prompt, appended prompts, output styles) is untouched and stable.
 

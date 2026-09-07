@@ -1182,6 +1182,9 @@ function anthropicUsage(usage) {
 }
 
 export function translateCompletion(completion, ctx) {
+  // The only place upstream's own prompt_tokens surfaces off the streaming path; the gateway
+  // calibrates the estimate it reports for the session's next turn against it.
+  ctx?.onPromptTokens?.(completion?.usage?.prompt_tokens);
   const choice = completion?.choices?.[0] ?? {};
   const message = choice.message ?? {};
   const reasoning = message.reasoning ?? message.reasoning_content;
@@ -1390,6 +1393,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
 
   const usageEvent = (usage) => {
     latestUsage = usage;
+    ctx.onPromptTokens?.(usage?.prompt_tokens);
   };
 
   const emitDeltaEvent = () => {

@@ -22,6 +22,7 @@ import {
   translateRequest,
 } from "./translate.mjs";
 import { serializeAdvisorInput } from "./lib/advisor-transcript.mjs";
+import { calibrationKey, calibratedEstimate, recordPromptTokens } from "./lib/prompt-estimate.mjs";
 import {
   RETRY_MAX_ATTEMPTS,
   isRetryableNetworkError,
@@ -582,12 +583,21 @@ async function handleMessages(req, res, body) {
     throw err;
   }
 
+  // The overflow guard above deliberately stays on the raw estimate; this is only what the client
+  // is told the prompt cost, and it has to survive becoming a turn's final usage when the turn dies
+  // before upstream reports anything real.
+  const calKey = calibrationKey(parentSessionId, anthropicBody.model);
+  const estimatedInput = calibratedEstimate(calKey, est);
+
   const ctx = {
     msgId: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
     requestedModel: anthropicBody.model,
     reasoningMode: REASONING_MODE,
-    estimatedInput: est,
+    estimatedInput,
     onDiagnostic: (m) => diagnostics.push(m),
+    // Fires wherever translate.mjs sees upstream's own prompt_tokens, streaming or not. Paired
+    // with the raw estimate for this same body, so the ratio compares like with like.
+    onPromptTokens: (n) => recordPromptTokens(calKey, est, n),
   };
 
   // Hold-and-continue advisor: when the turn ends on a consult_advisor tool_use, the translator
@@ -644,7 +654,7 @@ async function handleMessages(req, res, body) {
       writeEvent("message_delta", {
         type: "message_delta",
         delta: { stop_reason: "end_turn", stop_sequence: null },
-        usage: { input_tokens: est, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        usage: { input_tokens: estimatedInput, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
       });
       writeEvent("message_stop", { type: "message_stop" });
       res.end();
@@ -859,7 +869,12 @@ async function handleMessages(req, res, body) {
                 logContResponse();
                 if (finalized || clientGone) return settle();
                 try {
-                  emitContinuationCompletion(translateCompletion(JSON.parse(Buffer.concat(chunks).toString()), ctx));
+                  emitContinuationCompletion(
+                    // onPromptTokens dropped: the continuation's prompt carries the advisor's
+                    // answer on top of the body `est` was measured from, so the pair would not
+                    // compare like with like.
+                    translateCompletion(JSON.parse(Buffer.concat(chunks).toString()), { ...ctx, onPromptTokens: undefined }),
+                  );
                   proxyReq = null; // response is complete; don't let finalize() tear down a reusable socket
                   settle();
                 } catch (e) {
@@ -874,7 +889,7 @@ async function handleMessages(req, res, body) {
             // (the harness already saw one for this turn — two would be malformed); onAdvisorToolUse
             // is unset so done() emits the terminal message_stop instead of re-handing the turn
             // to a now-defunct advisor hook.
-            const contCtx = { ...ctx, messageStarted: true, onAdvisorToolUse: undefined };
+            const contCtx = { ...ctx, messageStarted: true, onAdvisorToolUse: undefined, onPromptTokens: undefined };
             contTranslator = createStreamTranslator(contCtx, writeEvent, resIdx + 1);
             // Point backpressure at the continuation's stream: writeEvent pauses/resumes
             // `upstreamRes` when res.write() returns false, and upstreamRes still holds the
@@ -1286,7 +1301,7 @@ async function handleMessages(req, res, body) {
                   // The live per-agent counter reads this off the streamed event; the estimate is
                   // its only growth signal. anthropicUsage floors input_tokens at 1 so the
                   // statusline merge overwrites this with the real value (no cached-prefix double-count).
-                  input_tokens: est,
+                  input_tokens: estimatedInput,
                   output_tokens: 1,
                   cache_creation_input_tokens: 0,
                   cache_read_input_tokens: 0,
