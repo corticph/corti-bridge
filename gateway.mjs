@@ -9,6 +9,7 @@ import crypto from "node:crypto";
 import zlib from "node:zlib";
 import {
   TranslateRejection,
+  advisorContinuationErrorCode,
   applyIntercepts,
   createStreamTranslator,
   estimateTokens,
@@ -595,6 +596,26 @@ async function handleMessages(req, res, body) {
     });
     writeEvent("content_block_stop", { type: "content_block_stop", index: srvIdx });
 
+    /** Advisor succeeded but the continuation (proxy's own 2nd call) failed: a proxy-internal
+     *  event, not an advisor failure. A text note ends the turn so the model uses the advice in
+     *  history next turn rather than re-consulting — no second advisor_tool_result (spec: one per call). */
+    const endContinuationFailure = (note, tag) => {
+      if (finalized || res.writableEnded) return;
+      diagnostics.push(`advisor continuation failed: ${note}`);
+      const idx = resIdx + 1;
+      writeEvent("content_block_start", { type: "content_block_start", index: idx, content_block: { type: "text", text: "" } });
+      writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: note } });
+      writeEvent("content_block_stop", { type: "content_block_stop", index: idx });
+      writeEvent("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { input_tokens: est, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      });
+      writeEvent("message_stop", { type: "message_stop" });
+      res.end();
+      finalize(tag);
+    };
+
     // 2. Run the advisor on the serialized transcript. Non-blocking UI: "Advising" shows while this runs.
     // runAdvisor returns {ok:true,text} or {ok:false,code} (official advisor_tool_result_error
     // error_code: execution_time_exceeded | unavailable | overloaded | too_many_requests |
@@ -648,26 +669,21 @@ async function handleMessages(req, res, body) {
     translator?.releaseAdvisor?.();
     lastActivity = Date.now();
     try {
-      await continueAfterAdvisor(id, continuationText);
+      await continueAfterAdvisor(id, continuationText, resIdx, endContinuationFailure);
     } catch (err) {
-      diagnostics.push(`advisor continuation failed: ${err?.message ?? err}`);
-      if (!finalized && !res.writableEnded) {
-        writeEvent("message_delta", {
-          type: "message_delta",
-          delta: { stop_reason: "end_turn", stop_sequence: null },
-          usage: { input_tokens: est, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-        });
-        writeEvent("message_stop", { type: "message_stop" });
-        res.end();
-        finalize("advisor-continuation-failed");
-      }
+      endContinuationFailure(
+        `[advisor consulted; the follow-up response failed (${err?.message ?? err}) — proceed using the advice above]`,
+        "advisor-continuation-failed",
+      );
     }
   };
 
   // The second upstream call: appends the consult_advisor tool_use + tool_result to the original
   // request and asks the model to continue. Non-streaming for simplicity (the first turn already
   // streamed; this is the advisor-aware continuation).
-  const continueAfterAdvisor = (toolUseId, advisorText) => {
+  // Passed in from onAdvisorToolUse: resIdx + endContinuationFailure live in that closure
+  // (resIdx is computed there); this sibling needs both for its success and non-2xx paths.
+  const continueAfterAdvisor = (toolUseId, advisorText, resIdx, endContinuationFailure) => {
     return new Promise((resolve, reject) => {
       // Build the continuation body: original messages + a new user turn carrying the tool_result.
       const contMessages = [...(anthropicBody.messages || [])];
@@ -694,9 +710,20 @@ async function handleMessages(req, res, body) {
             headers: { "content-type": "application/json", authorization: `Bearer ${BEARER}`, "content-length": body.length },
           }, (up) => {
             const chunks = [];
-            up.on("data", (c) => chunks.push(c));
+            // Feed the watchdog: a slow non-streaming response still arrives byte-by-byte.
+            up.on("data", (c) => { chunks.push(c); lastActivity = Date.now(); });
             up.on("end", () => {
               if (finalized || clientGone) return resolve();
+              // The continuation can't retry (advice SSE already written, invariant #3); a non-2xx
+              // must not be parsed as a completion (a blank block silently ends the turn).
+              const errCode = advisorContinuationErrorCode(up.statusCode);
+              if (errCode) {
+                endContinuationFailure(
+                  `[advisor consulted; the follow-up response failed (upstream ${up.statusCode}: ${errCode}) — proceed using the advice above]`,
+                  "advisor-continuation-upstream-error",
+                );
+                return resolve();
+              }
               try {
                 const msg = translateCompletion(JSON.parse(Buffer.concat(chunks).toString()), ctx);
                 // Continuation content blocks resume after the synthetic advisor blocks (srvIdx, resIdx).
@@ -1338,6 +1365,10 @@ function logResponse({ id, sessionFile, started, status, headers, body, note, di
 }
 
 function teeResponse(id, sessionFile, started, upstream, res) {
+  // With debug off, sessionFile is null and logResponse early-returns — so buffering every chunk
+  // and running Buffer.concat is pure waste on every passthrough response. Skip it entirely.
+  if (!sessionFile) return;
+
   const chunks = [];
   let size = 0;
   let truncated = false;

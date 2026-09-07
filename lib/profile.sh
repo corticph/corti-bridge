@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=sh
 # Which Claude Code profile Corti sessions run against (CLAUDE_CONFIG_DIR).
 
 # Resolves a typed config directory to an absolute path, echoing nothing when it cannot.

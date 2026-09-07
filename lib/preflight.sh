@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=sh
 # Pre-install dependency and credential checks. Blocking (node, curl) abort the install;
 # advisory (claude, pkill, credentials) are reported but the wrapper installs anyway.
 

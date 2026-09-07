@@ -24,9 +24,13 @@ const check = (name, got, want) => {
   else { console.log(`FAIL ${name} (expected ${want}, got ${got})`); failed++; }
 };
 
-// A blip worth outlasting.
-for (const s of [408, 429, 500, 502, 503, 504, 529])
+// A blip worth outlasting. 429 is deliberately absent: it is "slow down", not a transient
+// fault a fresh attempt fixes — retrying multiplies load into the very throttle that caused it
+// (a live incident saw 6,558 retried 429s cascade into 503/500s). The client backs off on its
+// own and Retry-After is preserved by translateError, so it still gets the signal.
+for (const s of [408, 500, 502, 503, 504, 529])
   check(`retries HTTP ${s}`, isRetryableStatus(s), true);
+check("does not retry HTTP 429", isRetryableStatus(429), false);
 
 // A bad CORTI_BEARER or a rejected request must fail on the first attempt: retrying
 // tripled the cost of every request during a real credential problem.
