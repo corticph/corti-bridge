@@ -70,6 +70,8 @@ One gateway process serves both modes simultaneously, chosen per request by URL 
 
 **Prefix-cache stability (A1)** — mid-conversation `role:"system"` messages and `mid_conv_system` blocks must **never** be folded into the upstream system string. The harness injects reminders (task nudges, CLAUDE.md replays, plan-mode exits) as mid-conv system messages; folding them grew the cached prefix every few turns and broke Corti's automatic prefix cache — cache_read collapse plus ~25x cost spikes. They are emitted as user content at their original position; the upstream system string must stay byte-stable across turns. `body.system` itself (base prompt, appended prompts, output styles) is untouched and stable.
 
+**A past turn's tool_result must never change (A1, second form).** `interceptWebSearch` walks the whole history each request, so before the per-session cache it re-ran every historical WebSearch every turn. Live results drift, so the rewritten `tool_result` bytes changed mid-conversation and collapsed the prefix cache — the same failure as folding mid-conv system messages, reached from the other direction. Measured in one session: 132 searches for 2 queries, 4 cache collapses (80128→21632, 84480→21632, 95872→22784, 110848→0), and both watchdog kills landing on the first request to carry a changed body. Cached by `tool_use_id`, which is stable across turns; no session id means no cache, as with the advisor dedup.
+
 **Other known sharp edges:**
 
 - `estimateTokens` (chars/4) undercounts real `prompt_tokens` by up to ~65% on long sessions. The overflow guard uses it, so it won't trip near the real 262k ceiling — with auto-compact off, sessions can die suddenly at the wall. Known, deliberately left; fix would be tracking real prompt_tokens.

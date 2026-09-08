@@ -256,7 +256,11 @@ async function handlePassthrough(req, res, reqPath) {
   if (!isCountTokens && req.method === "POST" && reqPath === "/v1/messages") {
     try {
       const parsed = JSON.parse(body.toString());
-      await applyIntercepts(parsed, { skipAdvisor: wantsNoAdvisor(req), mode: "anthropic" });
+      await applyIntercepts(parsed, {
+        skipAdvisor: wantsNoAdvisor(req),
+        mode: "anthropic",
+        parentSessionId: req.headers["x-claude-code-session-id"],
+      });
       body = Buffer.from(JSON.stringify(parsed));
     } catch {
       // JSON parse failed — forward original body; upstream will reject

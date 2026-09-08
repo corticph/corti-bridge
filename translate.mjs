@@ -23,6 +23,28 @@ const SERVER_BLOCK_TYPES = new Set([
 
 const WEBSEARCH_TOOL_NAMES = new Set(["web_search", "WebSearch"]);
 
+/** Per-session cache: WebSearch tool_use id -> formatted results. A past turn's tool_result is
+ *  what the model already reasoned about, so it must not change: re-running the search each turn
+ *  rewrote history bytes mid-conversation and collapsed Corti's prefix cache (A1). No session id →
+ *  throwaway map, same rule as the advisor dedup. */
+const WEBSEARCH_CACHE_CAP = 64;
+const WEBSEARCH_CACHE_PER_SESSION = 128;
+const webSearchBySession = new Map();
+
+function webSearchCacheMap(sessionId) {
+  if (!sessionId) return new Map();
+  let map = webSearchBySession.get(sessionId);
+  if (!map) {
+    if (webSearchBySession.size >= WEBSEARCH_CACHE_CAP)
+      webSearchBySession.delete(webSearchBySession.keys().next().value);
+    map = new Map();
+    webSearchBySession.set(sessionId, map);
+  }
+  return map;
+}
+
+export function _resetWebSearchCache() { webSearchBySession.clear(); }
+
 export class TranslateRejection extends Error {
   constructor(status, envelope) {
     super(envelope.error.message);
@@ -460,6 +482,10 @@ export function runAdvisor(text, opts = {}) {
 // `runAdvisor` param that shadows the export, so this alias is how the fallback reaches it.
 const defaultRunAdvisor = runAdvisor;
 
+// Unshadowed reference for interceptWebSearch, which takes an injectable `webSearch` so tests
+// stay offline.
+const defaultWebSearch = webSearch;
+
 // The executor-side timing + advice-weight block, read once from disk and cached. Prepended to
 // the executor's system prompt whenever the advisor tool is injected, so the executor calls at
 // the official cadence (before substantive work, before declaring done). From
@@ -553,18 +579,27 @@ async function interceptModelMapping(body) {
   return [`model mapped: ${orig} → ${mapped}`];
 }
 
-async function interceptWebSearch(body, { toolUseMap }) {
+async function interceptWebSearch(body, { toolUseMap, parentSessionId, webSearch, webSearchCache } = {}) {
   const diagnostics = [];
+  const search = webSearch || defaultWebSearch;
+  const cached = webSearchCache ?? webSearchCacheMap(parentSessionId);
   for (const msg of body.messages ?? []) {
     if (msg?.role !== "user" || !Array.isArray(msg.content)) continue;
     for (const b of msg.content) {
       if (b?.type !== "tool_result") continue;
       const toolUse = toolUseMap.get(b.tool_use_id);
       if (!toolUse || !WEBSEARCH_TOOL_NAMES.has(toolUse.name) || !toolUse.input?.query) continue;
-      const results = await webSearch(toolUse.input.query);
+      const hit = cached.get(b.tool_use_id);
+      if (hit !== undefined) {
+        b.content = hit;
+        continue;
+      }
+      const results = await search(toolUse.input.query);
       const formatted = formatSearchResults(toolUse.input.query, results);
       if (formatted) {
         b.content = formatted;
+        if (cached.size >= WEBSEARCH_CACHE_PER_SESSION) cached.delete(cached.keys().next().value);
+        cached.set(b.tool_use_id, formatted);
         diagnostics.push(`web_search intercepted: "${toolUse.input.query.slice(0, 60)}" → ${results.length} results`);
       }
     }

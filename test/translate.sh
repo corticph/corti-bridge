@@ -8,7 +8,7 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
-import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance } from "'"$REPO"'/translate.mjs";
+import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 
 let failed = 0;
@@ -61,6 +61,43 @@ const wsTools = (await translateRequest({
   tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }],
 })).request.tools;
 check("websearch: converted to function tool", wsTools?.length === 1 && wsTools[0]?.function?.name === "WebSearch", true);
+
+// A past turn\x27s tool_result is what the model already reasoned about, so it must not change.
+// Re-running the search every turn rewrote history bytes mid-conversation and collapsed the
+// prefix cache: measured 4 collapses and 2 watchdog kills in one session, 132 searches for 2
+// queries. The cache is per-session and keyed on tool_use_id, which is stable across turns.
+_resetWebSearchCache();
+let searchCalls = 0;
+// Deliberately unstable, like the live search: a re-fetch would change the bytes.
+const drifting = async (q) => { searchCalls++; return [{ title: `hit ${searchCalls}`, url: "https://x/" + searchCalls, snippet: "s" }]; };
+const searchTurn = () => ({
+  model: "corti-s1", max_tokens: 16,
+  messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "ws1", name: "WebSearch", input: { query: "codex config" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "ws1", content: "" }] },
+  ],
+});
+const wsTurn1 = searchTurn();
+await applyIntercepts(wsTurn1, { webSearch: drifting, parentSessionId: "sess-ws" });
+const wsTurn2 = searchTurn();
+await applyIntercepts(wsTurn2, { webSearch: drifting, parentSessionId: "sess-ws" });
+check("websearch: a historical search is fetched once, not once per turn", searchCalls, 1);
+check("websearch: the rewritten tool_result is byte-identical across turns",
+  wsTurn2.messages[1].content[0].content, wsTurn1.messages[1].content[0].content);
+check("websearch: the first turn still got real results",
+  wsTurn1.messages[1].content[0].content.includes("hit 1"), true);
+// A second, distinct search in the same session is its own entry.
+const twoSearches = searchTurn();
+twoSearches.messages[0].content.push({ type: "tool_use", id: "ws2", name: "WebSearch", input: { query: "other" } });
+twoSearches.messages[1].content.push({ type: "tool_result", tool_use_id: "ws2", content: "" });
+await applyIntercepts(twoSearches, { webSearch: drifting, parentSessionId: "sess-ws" });
+check("websearch: an unseen query in the same session is fetched", searchCalls, 2);
+// Session isolation, and no session id means no cross-request key (same rule as the advisor).
+await applyIntercepts(searchTurn(), { webSearch: drifting, parentSessionId: "sess-ws-other" });
+check("websearch: another session does not read this one\x27s cache", searchCalls, 3);
+await applyIntercepts(searchTurn(), { webSearch: drifting });
+await applyIntercepts(searchTurn(), { webSearch: drifting });
+check("websearch: no session id re-fetches (no cross-request cache)", searchCalls, 5);
 
 // --- advisor (consult_advisor) ------------------------------------------------
 // Gating (translate.mjs:advisorWanted): one knob, CORTI_ADVISOR=auto|on|off.
