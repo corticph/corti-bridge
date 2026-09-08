@@ -23,6 +23,10 @@ const effort = async (model, thinking) =>
 
 const ENABLED = (n) => ({ type: "enabled", budget_tokens: n });
 
+// The advisor intercept skips a request with no tools (a one-shot side call cannot act on advice),
+// so every fixture that must reach the advisor carries one.
+const ANYTOOL = () => ({ name: "run_bash", description: "Run a bash command", input_schema: { type: "object" } });
+
 // Effort is budget-derived and model-independent.
 for (const m of ["corti-s1", "corti-s1-mini", "corti-s1-ultra-beta", "corti-s1-ultra-instant-beta"]) {
   check(`${m}: adaptive is medium`, await effort(m, { type: "adaptive" }), "medium");
@@ -72,7 +76,7 @@ delete process.env.CORTI_ADVISOR;
 delete process.env.CORTI_ADVISOR_TOOL;
 
 // Block A — tool def injected. openai mode default-on (no env var needed).
-const advBody = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], system: "You are a coding agent." };
+const advBody = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [ANYTOOL()], system: "You are a coding agent." };
 await applyIntercepts(advBody, { mode: "openai" });
 check("advisor (openai): tool def injected", advBody.tools?.some((t) => t.name === "consult_advisor"), true);
 // Empty input_schema: the executor signals timing only — the harness forwards the transcript.
@@ -85,15 +89,15 @@ check("advisor (openai): executor timing prompt prepended", String(advBody.syste
 check("advisor (openai): original system preserved after timing block", String(advBody.system).includes("You are a coding agent."), true);
 // The openai translate path filters tools to input_schema + string name; ours has both, so it survives.
 const advTools = (await translateRequest({
-  model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }],
+  model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [ANYTOOL()],
 }, { mode: "openai" })).request.tools;
 check("advisor (openai): survives openai filter", advTools?.some((t) => t.function?.name === "consult_advisor"), true);
 
 // Block B — opt-out: CORTI_ADVISOR=off turns the advisor off even in openai (default-on) mode.
 process.env.CORTI_ADVISOR = "off";
-const advBody2 = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [], system: "agent" };
+const advBody2 = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [ANYTOOL()], system: "agent" };
 await applyIntercepts(advBody2, { mode: "openai" });
-check("advisor (openai+off): not injected when off", advBody2.tools.length, 0);
+check("advisor (openai+off): not injected when off", advBody2.tools.length, 1);
 // Timing prompt is NOT prepended when the advisor is off (system untouched).
 check("advisor (openai+off): no timing prompt when off", advBody2.system === "agent", true);
 delete process.env.CORTI_ADVISOR;
@@ -127,7 +131,7 @@ check("advisor (openai): is_error cleared", advResult.is_error, false);
 // Maps to the official advisor_tool_result_error error_code (e.g. execution_time_exceeded).
 const failStub = async () => ({ ok: false, code: "execution_time_exceeded" });
 const failBody = {
-  model: "corti-s1", max_tokens: 16, system: "agent",
+  model: "corti-s1", max_tokens: 16, system: "agent", tools: [ANYTOOL()],
   messages: [
     { role: "user", content: "Fix the bug" },
     { role: "assistant", content: [{ type: "tool_use", id: "tu_f1", name: "consult_advisor", input: {} }] },
@@ -161,7 +165,7 @@ check("advisor (openai): executor tool result forwarded", ser.includes("x.foo()"
 // Block D — truncation: large tool results are head/tail-truncated with an elision marker.
 const big = "x".repeat(20000);
 const truncBody = {
-  model: "corti-s1", max_tokens: 16,
+  model: "corti-s1", max_tokens: 16, tools: [ANYTOOL()],
   messages: [
     { role: "assistant", content: [{ type: "tool_use", id: "tb1", name: "run_bash", input: {} }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "tb1", content: big }] },
@@ -177,7 +181,7 @@ check("advisor (openai): large tool result truncated with elision marker", (trun
 process.env.CORTI_ADVISOR_MAX_TOKENS = "768";
 const budgetCap = [];
 await applyIntercepts({
-  model: "corti-s1", max_tokens: 16,
+  model: "corti-s1", max_tokens: 16, tools: [ANYTOOL()],
   messages: [
     { role: "assistant", content: [{ type: "tool_use", id: "bm1", name: "consult_advisor", input: {} }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "bm1", content: "Unknown tool", is_error: true }] },
@@ -201,7 +205,7 @@ check("advisor (openai): no duplicate timing prompt", (String(advBody4.system).m
 let stubCalls = 0;
 const countingStub = async (text) => { stubCalls++; return `stub advice`; };
 const continuationBody = {
-  model: "corti-s1", max_tokens: 16,
+  model: "corti-s1", max_tokens: 16, tools: [ANYTOOL()],
   messages: [
     { role: "user", content: "should I ship this?" },
     { role: "assistant", content: [{ type: "tool_use", id: "tu_adv1", name: "consult_advisor", input: {} }] },
@@ -246,7 +250,7 @@ _resetAdvisorProcessed();
 let a1Calls = 0;
 const a1Stub = async () => { a1Calls++; return `advice ${a1Calls}`; };
 const a1Body = {
-  model: "corti-s1", max_tokens: 16, system: "agent",
+  model: "corti-s1", max_tokens: 16, system: "agent", tools: [ANYTOOL()],
   messages: [
     { role: "user", content: "go" },
     { role: "assistant", content: [{ type: "tool_use", id: "a1_1", name: "consult_advisor", input: {} }] },
@@ -305,7 +309,7 @@ const beforeRecord = await translateRequest(collapsedTurn(), { skipAdvisor: true
 check("A4: nothing re-inserted before the consult is recorded",
   beforeRecord.request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
 
-recordAdvisorGuidance("sess-a2", anchorText, "ship it, the tests cover the regression");
+recordAdvisorGuidance("sess-a2", { text: anchorText }, "ship it, the tests cover the regression");
 const afterRecord = await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2" });
 const a2Assistant = afterRecord.request.messages.find((m) => m.role === "assistant");
 check("A4: advice re-inserted into assistant history",
@@ -348,11 +352,65 @@ check("A4: a repeated anchor re-inserts only once",
 const noSess = await translateRequest(collapsedTurn(), { skipAdvisor: true });
 check("A4: no session id re-inserts nothing",
   noSess.request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
-recordAdvisorGuidance(undefined, anchorText, "should not be stored");
-recordAdvisorGuidance("sess-a2-empty", "", "should not be stored");
+recordAdvisorGuidance(undefined, { text: anchorText }, "should not be stored");
+recordAdvisorGuidance("sess-a2-empty", { text: "" }, "should not be stored");
+recordAdvisorGuidance("sess-a2-empty", null, "should not be stored");
 check("A4: an empty anchor is not recorded",
   (await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2-empty" }))
     .request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
+
+// A consult the model followed straight with a tool call has no prose on either side. The tool_use
+// id anchors it — ids round-trip because tool_result pairing depends on them — and the advice
+// belongs *before* that call, since that is where the consult ran.
+_resetAdvisorGuidance();
+const toolTurn = () => ({
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [
+    { role: "user", content: "check this" },
+    { role: "assistant", content: [{ type: "tool_use", id: "tu_after_advice", name: "run_bash", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_after_advice", content: "done" }] },
+  ],
+});
+recordAdvisorGuidance("sess-a4-tool", { toolUseId: "tu_after_advice", before: true }, "read the file first");
+const toolAnchored = await translateRequest(toolTurn(), { skipAdvisor: true, parentSessionId: "sess-a4-tool" });
+const a4ToolAsst = toolAnchored.request.messages.find((m) => m.role === "assistant");
+check("A4: a tool_use id anchors a consult with no prose around it",
+  String(a4ToolAsst.content).includes("<advisor_guidance>\nread the file first\n</advisor_guidance>"), true);
+check("A4: the tool call it advised still round-trips",
+  a4ToolAsst.tool_calls?.[0]?.id, "tu_after_advice");
+// before:true also applies to a text anchor — the consult ran ahead of the continuation it produced.
+recordAdvisorGuidance("sess-a4-before", { text: "Here is the answer.", before: true }, "advice first");
+const beforeAnchored = await translateRequest({
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [{ role: "assistant", content: [{ type: "text", text: "Here is the answer." }] }],
+}, { skipAdvisor: true, parentSessionId: "sess-a4-before" });
+const a4Before = String(beforeAnchored.request.messages.find((m) => m.role === "assistant").content);
+check("A4: before:true puts the advice ahead of its anchor",
+  a4Before.indexOf("<advisor_guidance>") < a4Before.indexOf("Here is the answer."), true);
+
+// Block G5 — the advisor intercept skips a request with no tools. Those are the harness one-shot
+// side calls (summarise a fetched page, title a chat); they cannot act on advice, and in one
+// measured session 6 of 7 consults came from them, spending 50s of Opus-tier advisor time.
+let toollessCalls = 0;
+const toollessStub = async () => { toollessCalls++; return "advice"; };
+const toollessBody = () => ({
+  model: "corti-s1", max_tokens: 16, system: "summarise this",
+  messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "tl1", name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tl1", content: "Unknown tool", is_error: true }] },
+  ],
+});
+const noTools = toollessBody();
+await applyIntercepts(noTools, { runAdvisor: toollessStub, mode: "openai" });
+check("G5: a request with no tools does not spawn the advisor", toollessCalls, 0);
+check("G5: and gets no tool def injected", Boolean(noTools.tools?.length), false);
+check("G5: and its system prompt is untouched", noTools.system, "summarise this");
+const emptyTools = { ...toollessBody(), tools: [] };
+await applyIntercepts(emptyTools, { runAdvisor: toollessStub, mode: "openai" });
+check("G5: an empty tools array counts as no tools", toollessCalls, 0);
+const withTools = { ...toollessBody(), tools: [ANYTOOL()] };
+await applyIntercepts(withTools, { runAdvisor: toollessStub, mode: "openai" });
+check("G5: one real tool is enough to reach the advisor", toollessCalls, 1);
 
 // The stream translator\x27s lastText is the gateway\x27s anchor source: it must hold the newest text
 // block verbatim, and reset at each new block so a consult anchors on its own announcement.
@@ -364,6 +422,12 @@ check("A4: lastText accumulates a text block", lt.lastText, "first block");
 lt.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "t1", type: "function", function: { name: "run_bash", arguments: "{}" } }] } }] });
 lt.feed({ choices: [{ index: 0, delta: { content: "second" } }] });
 check("A4: lastText resets on a new text block", lt.lastText, "second");
+check("A4: firstBlock keeps the first block, not the newest", JSON.stringify({ ...lt.firstBlock, index: undefined }), JSON.stringify({ type: "text", index: undefined, text: "first block" }));
+// A continuation that opens on a tool call exposes that id as the anchor.
+const lt2 = createStreamTranslator({}, () => {});
+lt2.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "tu_first", type: "function", function: { name: "run_bash", arguments: "{}" } }] } }] });
+lt2.feed({ choices: [{ index: 0, delta: { content: "after the call" } }] });
+check("A4: firstBlock reports a leading tool call by id", JSON.stringify(lt2.firstBlock), JSON.stringify({ type: "tool", id: "tu_first" }));
 
 // Block H — C6: prior-turn advisor advice round-trips into history instead of being dropped.
 // advisor_tool_result is NOT in SERVER_BLOCK_TYPES (only server_tool_use is); before the fix it
@@ -464,7 +528,7 @@ check("advisor C2: no advisorEffort leaves adaptive→medium untouched", noOverr
 // consult_advisor tool_use, so injection is the only observable: tools.some(name match).
 // applyIntercepts mutates the body in place and returns diagnostics, so run it on a fresh
 // body and read tools off the body, not the return value.
-const gateBody = () => ({ model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }] });
+const gateBody = () => ({ model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [ANYTOOL()] });
 const injected = (b) => Boolean(b.tools?.some((t) => t?.name === "consult_advisor"));
 const runGate = async (opts) => { const b = gateBody(); await applyIntercepts(b, opts); return b; };
 

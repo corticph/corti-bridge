@@ -224,7 +224,10 @@ C1_GW_PID=$!
 wait_banner c1gw.out || { echo "FAIL C1 gateway did not start" >&2; FAILED=$((FAILED + 1)); }
 
 C1G="http://127.0.0.1:$C1_GW_PORT"
-C1BODY='{"model":"corti-s1","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"advise me"}]}'
+# The tools array is load-bearing: the advisor intercept skips a request without one, so a body
+# with no tools models a harness side call and never reaches the advisor at all.
+C1TOOLS='"tools":[{"name":"run_bash","input_schema":{"type":"object"}}]'
+C1BODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"advise me"}]}'
 # `|| true` so a gateway that crashes mid-stream (curl exits non-zero, e.g. 18 partial) yields a
 # partial/empty C1RESP and clean FAIL lines, instead of set -e aborting before the checks run.
 C1RESP=$(curl -s -m 15 -N -H 'content-type: application/json' -d "$C1BODY" "$C1G/v1/messages" 2>&1 || true)
@@ -677,7 +680,7 @@ CARRYSESS='x-claude-code-session-id: carry-sess-1'
 CARRYRESP1=$(curl -s -m 20 -N -H 'content-type: application/json' -H "$CARRYSESS" \
   -d "$C1BODY" "$C1CARRYG/v1/messages" 2>&1 || true)
 # Turn 2: the history the harness actually replays — the two text blocks, consult gone.
-CARRYBODY2='{"model":"corti-s1","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"advise me"},{"role":"assistant","content":[{"type":"text","text":"Calling the advisor now."},{"type":"text","text":"Acting on it."}]},{"role":"user","content":"TURN2 did it actually answer?"}]}'
+CARRYBODY2='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"advise me"},{"role":"assistant","content":[{"type":"text","text":"Calling the advisor now."},{"type":"text","text":"Acting on it."}]},{"role":"user","content":"TURN2 did it actually answer?"}]}'
 CARRYRESP2=$(curl -s -m 20 -N -H 'content-type: application/json' -H "$CARRYSESS" \
   -d "$CARRYBODY2" "$C1CARRYG/v1/messages" 2>&1 || true)
 # Same history, a session that never consulted: proves the carry-forward is keyed on the session
@@ -720,6 +723,30 @@ check "C1-CARRY: the advisor was spawned for both turns and the control" \
   "$(grep -c '<transcript>' "$CARRY_ADVISOR_IN")" "3"
 check "C1-CARRY: the advisor sees the prior consult in its transcript" \
   "$(grep -c 'stub advisor advice' "$CARRY_ADVISOR_IN")" "1"
+set -e
+
+# --- C1-SIDECALL: a request with no tools is a harness one-shot (summarise a page, title a chat).
+# It cannot act on advice, yet these were consulting: 6 of 7 consults in one measured session,
+# 50s of Opus-tier advisor time. The upstream stub still offers a consult, so this also proves the
+# gateway declines to hold the turn open rather than merely skipping the tool injection.
+SIDEBODY='{"model":"corti-s1","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"TURN2 summarise this"}]}'
+SIDESPAWNS_BEFORE=$(grep -c '<transcript>' "$CARRY_ADVISOR_IN" || true)
+SIDERESP=$(curl -s -m 20 -N -H 'content-type: application/json' \
+  -H 'x-claude-code-session-id: carry-sess-3' \
+  -d "$SIDEBODY" "$C1CARRYG/v1/messages" 2>&1 || true)
+SIDELOG=$(cat "$SCRATCH"/carry-logs/*carry-sess-3*.log 2>/dev/null || true)
+
+set +e
+check "C1-SIDECALL: no advisor spawn for a toolless request" \
+  "$(grep -c '<transcript>' "$CARRY_ADVISOR_IN")" "$SIDESPAWNS_BEFORE"
+# Scoped to the request body: the stub still *offers* a consult in its response, which is the
+# point — the gateway must decline it rather than hold the turn open.
+check "C1-SIDECALL: the consult_advisor tool is not offered upstream" \
+  "$(carry_upstream "$SIDELOG" 1 | grep -c 'consult_advisor')" "0"
+check "C1-SIDECALL: no executor advisor prompt is prepended" \
+  "$(carry_upstream "$SIDELOG" 1 | grep -c 'You have access to an .advisor. tool')" "0"
+check "C1-SIDECALL: the turn still completes normally" \
+  "$(printf '%s' "$SIDERESP" | grep -c '^event: message_stop')" "1"
 set -e
 
 kill "$C1_CARRY_GW_PID" "$C1CARRYSTUB_PID" 2>/dev/null || :
@@ -929,7 +956,7 @@ CAL_B1=$(cal_input "$(cal_post cal-b)")
 # The failure note ends the turn with a usage of its own, and that is the shape behind the two
 # largest backward steps observed in real transcripts. It has to carry the same calibrated number
 # message_start did, not the raw estimate.
-CALADVBODY='{"model":"corti-s1","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"TRIGGER-ADVISOR '"$CALPAD"'"}]}'
+CALADVBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"TRIGGER-ADVISOR '"$CALPAD"'"}]}'
 cal_adv_post() {
   curl -s -m 20 -N -H 'content-type: application/json' -H "x-claude-code-session-id: $1" \
     -d "$CALADVBODY" "$CALG/v1/messages" 2>&1 || true

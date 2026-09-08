@@ -607,19 +607,21 @@ async function handleMessages(req, res, body) {
   // inline (the shape the harness renders as "Advising…"), run the advisor, then make a second
   // upstream call with the consult_advisor tool_use + a real client tool_result appended so the
   // model reads the advice and actually answers the user. The gateway owns the terminal events.
+  // Only wire the hook when the intercept actually offered the tool: a toolless side call was
+  // never given the advisor, so it must not be able to hold a turn open for one either.
+  const advisorOffered = anthropicBody.tools?.some((t) => t?.name === "consult_advisor");
   let advisorHandled = false;
-  ctx.onAdvisorToolUse = async ({ id }) => {
+  const onAdvisorToolUse = async ({ id }) => {
     if (advisorHandled || finalized || clientGone) return;
     advisorHandled = true;
-    // The text the model emitted immediately before the consult — captured now, while it is still
-    // the newest block. It is the anchor the advice is re-inserted against on later turns, and the
-    // very sentence ("calling the advisor now") the model would otherwise read as an unkept promise.
+    // Captured while it is still the newest block: the sentence the model would otherwise read
+    // next turn as an unkept promise, and the anchor the advice is re-inserted against.
     const preCallText = translator?.lastText ?? "";
     // Serialize the executor's full request (system + tools + transcript + budget line) for the
     // advisor. The tool input is empty — the executor signals timing only; the harness forwards
     // context automatically, per the official advisor tool design.
-    // Restored history: an advisor reading the excised version cannot see the consults it already
-    // answered, so it confirms the executor's false "I never called it" rather than correcting it.
+    // Restored history: shown the excised version, the advisor confirms the executor's false
+    // "I never called it" rather than correcting it.
     const { text: advisorInput, elidedCount } = serializeAdvisorInput(
       { ...anthropicBody, messages: restoreAdvisorGuidance(parentSessionId, anthropicBody.messages) },
       { maxTokens: Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2048 },
@@ -727,11 +729,16 @@ async function handleMessages(req, res, body) {
     lastActivity = Date.now();
     try {
       await continueAfterAdvisor(id, continuationText, resIdx);
-      // The consult is now two adjacent text blocks in the client's history with the advice gone
-      // from between them. Record it against whichever of those blocks we have verbatim so later
-      // turns see the advice rather than an announcement with nothing behind it.
-      if (advisorResult.ok)
-        recordAdvisorGuidance(parentSessionId, preCallText || contTranslator?.lastText || "", advisorResult.text);
+      // The harness drops the consult from history; anchor the advice on a block that survives
+      // beside it — what preceded the call, else the first block the continuation emitted.
+      if (advisorResult.ok) {
+        const first = contTranslator?.firstBlock;
+        const anchor = preCallText ? { text: preCallText }
+          : first?.type === "text" ? { text: first.text, before: true }
+          : first?.type === "tool" ? { toolUseId: first.id, before: true }
+          : null;
+        if (anchor) recordAdvisorGuidance(parentSessionId, anchor, advisorResult.text);
+      }
       // Reached only once the continuation's upstream turn is complete and every frame is
       // written. Ending the turn here rather than inside the stream handler keeps settlement on
       // the critical path: a continuation that never settles can no longer finalize silently.
@@ -749,6 +756,7 @@ async function handleMessages(req, res, body) {
       continuationActive = false;
     }
   };
+  if (advisorOffered) ctx.onAdvisorToolUse = onAdvisorToolUse;
 
   /**
    * Second upstream call: appends the consult_advisor tool_use + tool_result and asks the model
@@ -824,9 +832,8 @@ async function handleMessages(req, res, body) {
       // skipAdvisor: re-running interceptConsultAdvisor would match the tool_result we just
       // synthesized and spawn runAdvisor a second time. The continuation is ours, not a fresh
       // client request, so the advisor intercept must not touch it.
-      // parentSessionId carries only the guidance re-insertion for *prior* consults, so the
-      // continuation reads the same history the first call did. This turn's own consult is not
-      // recorded until the continuation settles, so it cannot double up here.
+      // parentSessionId only re-inserts *prior* consults, so the continuation reads the history
+      // the first call did; this turn's own consult is not recorded until the continuation settles.
       translateRequest(contAnthropic, { skipAdvisor: true, parentSessionId })
         .then((out) => {
           const contTranslated = out.request;

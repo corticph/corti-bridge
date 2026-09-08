@@ -264,21 +264,20 @@ function advisorProcessedMap(sessionId) {
 
 export function _resetAdvisorProcessed() { advisorProcessedBySession.clear(); }
 
-/** Per-session record of consults the hold-and-continue path already answered, keyed by an anchor:
- *  the verbatim text block the assistant emitted beside the consult. The harness renders the
- *  server_tool_use / advisor_tool_result pair but never replays it, so the consult reaches the next
- *  turn as two adjacent text blocks with the advice excised from between them — leaving the model's
- *  own "calling the advisor now" reading as a promise it never kept. Re-inserting the guidance at
- *  the anchor restores exactly what C6 round-trips when the blocks do come back. */
+/** Per-session record of answered consults, keyed by a block that survives beside each one. The
+ *  harness renders the server_tool_use / advisor_tool_result pair but never replays it, so without
+ *  this the model reads its own "calling the advisor now" as a promise it never kept. */
 const ADVISOR_GUIDANCE_CAP = 64;
 const ADVISOR_GUIDANCE_PER_SESSION = 32;
 const advisorGuidanceBySession = new Map();
 
-// Called by the gateway once a consult's continuation has settled. No anchor (a consult with no
-// text on either side) means no re-insertion — that degrades to the pre-fix behaviour rather than
-// guessing at a position.
-export function recordAdvisorGuidance(sessionId, anchorText, advice) {
-  if (!sessionId || !anchorText || !advice) return;
+// Anchor is `{ text }` or `{ toolUseId }` (ids round-trip because tool_result pairing needs them,
+// so they cover a consult followed straight by a tool call); `before` says which side it sat on.
+export function recordAdvisorGuidance(sessionId, anchor, advice) {
+  const key = anchor?.toolUseId ? `u:${anchor.toolUseId}`
+    : anchor?.text ? `t:${anchor.text}`
+    : "";
+  if (!sessionId || !key || !advice) return;
   let map = advisorGuidanceBySession.get(sessionId);
   if (!map) {
     if (advisorGuidanceBySession.size >= ADVISOR_GUIDANCE_CAP)
@@ -287,32 +286,35 @@ export function recordAdvisorGuidance(sessionId, anchorText, advice) {
     advisorGuidanceBySession.set(sessionId, map);
   }
   if (map.size >= ADVISOR_GUIDANCE_PER_SESSION) map.delete(map.keys().next().value);
-  map.set(anchorText, advice);
+  map.set(key, { advice, before: !!anchor.before });
 }
 
-// Put a session's recorded consults back where the harness excised them: a <advisor_guidance> text
-// block right after the text block each was anchored on. Returns a new list, sharing every message
-// it did not change. Both readers of the history go through this — the executor's upstream view and
-// the advisor's own transcript — because an advisor reading the excised history corroborates the
-// executor's false "I never called it" instead of correcting it.
+// Put a session's consults back where the harness excised them. Both readers go through this: an
+// advisor shown the excised history corroborates the executor's false "I never called it".
 export function restoreAdvisorGuidance(sessionId, messages) {
   if (!Array.isArray(messages)) return messages ?? [];
   const store = sessionId ? advisorGuidanceBySession.get(sessionId) : null;
   if (!store?.size) return messages;
-  // One insertion per recorded consult, even if its anchor text repeats in the history.
+  // One insertion per recorded consult, even if its anchor repeats in the history.
   const used = new Set();
   return messages.map((msg) => {
     if (msg?.role !== "assistant") return msg;
     const out = [];
     let inserted = false;
     for (const b of blocksOf(msg.content)) {
-      out.push(b);
-      if (b?.type !== "text" || typeof b.text !== "string") continue;
-      const advice = store.get(b.text);
-      if (!advice || used.has(b.text)) continue;
-      used.add(b.text);
+      const key = b?.type === "text" && typeof b.text === "string" ? `t:${b.text}`
+        : b?.type === "tool_use" && typeof b.id === "string" ? `u:${b.id}`
+        : null;
+      const rec = key && !used.has(key) ? store.get(key) : null;
+      if (!rec) {
+        out.push(b);
+        continue;
+      }
+      used.add(key);
       inserted = true;
-      out.push({ type: "text", text: advisorGuidanceText(advice) });
+      const guidance = { type: "text", text: advisorGuidanceText(rec.advice) };
+      if (rec.before) out.push(guidance, b);
+      else out.push(b, guidance);
     }
     return inserted ? { ...msg, content: out } : msg;
   });
@@ -605,6 +607,9 @@ function advisorWanted(mode, skipAdvisor) {
 // dependency is injectable via ctx so tests stay hermetic (no child_process spawn).
 async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor, mode, parentSessionId, advisorProcessed } = {}) {
   if (!advisorWanted(mode, skipAdvisor)) return [];
+  // No tools means no next action to steer — a one-shot side call (summarise a page, title a
+  // chat), not an agent loop. Measured: 6 of 7 consults in one session, 50s of Opus time wasted.
+  if (!Array.isArray(body.tools) || body.tools.length === 0) return [];
   const diagnostics = [];
 
   // (a) inject the tool def so the model sees it (idempotent — don't push if present)
@@ -644,9 +649,8 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
         diagnostics.push(`advisor cached: id=${b.tool_use_id} (no re-spawn)`);
         continue;
       }
-      // Restored history: an advisor reading the excised version cannot see the consults it
-      // already answered, and confirms the executor's false "I never called it" instead of
-      // correcting it — the exact loop this whole mechanism exists to break.
+      // Restored history: see restoreAdvisorGuidance — an advisor shown the excised version
+      // corroborates the false confession instead of correcting it.
       const { text, elidedCount } = serializeAdvisorInput(
         { ...body, messages: restoreAdvisorGuidance(parentSessionId, body.messages) },
         { maxTokens: advisorMaxTokens() },
@@ -1307,9 +1311,9 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
   let terminated = false;
   let latestUsage = null;
   let outputChars = 0;
-  // Text of the most recent text block, verbatim as the client received it. The gateway anchors a
-  // consult's re-inserted advice on this, so it must match the client's history byte for byte.
+  // Anchor sources for a consult's advice; must match the client's history byte for byte.
   let lastText = "";
+  let firstBlock = null; // { type:"text", text } | { type:"tool", id }
   let advisorToolUse = null; // { id, name, args } when the turn ends on a consult_advisor tool_use
 
   const closeOpen = () => {
@@ -1382,9 +1386,11 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
     if (open?.kind !== "text") {
       openBlock("text", { type: "text", text: "" });
       lastText = "";
+      if (!firstBlock) firstBlock = { type: "text", index: open.index, text: "" };
     }
     outputChars += text.length;
     lastText += text;
+    if (firstBlock?.type === "text" && firstBlock.index === open.index) firstBlock.text += text;
     emit("content_block_delta", {
       type: "content_block_delta",
       index: open.index,
@@ -1412,6 +1418,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
           toolBlocks.set(idx, { blockIndex: -1, closed: true, name, id, args: "" });
         } else {
           openBlock("tool", { type: "tool_use", id, name, input: {} });
+          if (!firstBlock) firstBlock = { type: "tool", id };
           toolBlocks.set(idx, { blockIndex: open.index, closed: false, name, id, args: "" });
         }
       }
@@ -1547,10 +1554,12 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
     get nextBlockIndex() {
       return nextBlockIndex;
     },
-    // The most recent text block's full text — the gateway's anchor for re-inserting a consult's
-    // advice into later turns (see recordAdvisorGuidance).
+    // Anchors for re-inserting a consult's advice into later turns (see recordAdvisorGuidance).
     get lastText() {
       return lastText;
+    },
+    get firstBlock() {
+      return firstBlock;
     },
     // Close whatever block is still open (emitting the thinking signature first, when that is
     // what is open) so a caller can append its own block at nextBlockIndex without nesting.
