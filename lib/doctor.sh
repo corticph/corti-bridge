@@ -402,6 +402,13 @@ _d_check_update() {
         return 0
     fi
     _d_branch="$(git -C "$PROXY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+    # An empty read means git could not answer at all; reporting OK for it would print
+    # "on branch ''" and pass, which reads like a real branch on a healthy clone.
+    if [ -z "$_d_branch" ]; then
+        _d_report WARN update "could not read the git branch - update check skipped" \
+            "Check the clone: git -C \"$PROXY_DIR\" status"
+        return 0
+    fi
     if [ "$_d_branch" != main ]; then
         _d_report OK update "on branch '$_d_branch' - not compared against origin/main"
         return 0
@@ -410,13 +417,13 @@ _d_check_update() {
     case "$_d_behind" in
         ''|*[!0-9]*)
             _d_report WARN update "no origin/main ref yet - nothing fetched to compare against" \
-                "Run: git -C $PROXY_DIR fetch origin main"
+                "Run: git -C \"$PROXY_DIR\" fetch origin main"
             return 0
             ;;
     esac
     if [ "$_d_behind" -gt 0 ]; then
         _d_report WARN update "$_d_behind commit(s) behind origin/main" \
-            "Update: cd $PROXY_DIR && git pull && ./setup.sh"
+            "Update: cd \"$PROXY_DIR\" && git pull && ./setup.sh"
     else
         _d_report OK update "up to date with the last fetch of origin/main"
     fi

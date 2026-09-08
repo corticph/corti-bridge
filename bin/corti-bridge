@@ -175,7 +175,7 @@ update_notice() {
     if [ "$1" = 1 ]; then _u_s=""; fi
     echo "" >&2
     echo "corti-bridge: $1 new commit$_u_s on main." >&2
-    echo "  cd $PROXY_DIR && git pull && ./setup.sh" >&2
+    echo "  cd \"$PROXY_DIR\" && git pull && ./setup.sh" >&2
 }
 
 # --stop / --restart bypass the credential and claude-installed guards: --stop needs
