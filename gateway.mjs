@@ -746,7 +746,7 @@ async function handleMessages(req, res, body) {
           : first?.type === "text" ? { text: first.text, before: true }
           : first?.type === "tool" ? { toolUseId: first.id, before: true }
           : null;
-        if (anchor) recordAdvisorGuidance(parentSessionId, anchor, advisorResult.text);
+        if (anchor) recordAdvisorGuidance(parentSessionId, anchor, advisorResult.text, id);
       }
       // Reached only once the continuation's upstream turn is complete and every frame is
       // written. Ending the turn here rather than inside the stream handler keeps settlement on

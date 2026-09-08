@@ -629,17 +629,20 @@ const s = https.createServer(
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const body = Buffer.concat(chunks).toString();
-      const isContinuation = body.includes('"role":"tool"') && body.includes('"tool_call_id"');
+      // Both turns narrate then consult. Turn 1 creates the record; turn 2 consults again, which
+      // is what puts the restored history in front of the advisor.
+      const narration = body.includes("TURN2") ? "Checking with the advisor." : "Calling the advisor now.";
+      const callId = body.includes("TURN2") ? "call_carry2" : "call_carry";
+      // Keyed on *this* turn's call id, not on any tool message: turn 2's history legitimately
+      // carries the restored pair from turn 1, which a generic tool_call_id probe reads as a
+      // continuation and answers instead of consulting.
+      const isContinuation = body.includes('"tool_call_id":"' + callId + '"');
       res.writeHead(200, { "content-type": "text/event-stream" });
       if (isContinuation) {
         res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"ANSWER"}}]}\n\n');
         res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
         return void res.end('data: [DONE]\n\n');
       }
-      // Both turns narrate then consult. Turn 1 creates the record; turn 2 consults again, which
-      // is what puts the restored history in front of the advisor.
-      const narration = body.includes("TURN2") ? "Checking with the advisor." : "Calling the advisor now.";
-      const callId = body.includes("TURN2") ? "call_carry2" : "call_carry";
       res.write(`data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"${narration}"}}]}\n\n`);
       res.write(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"${callId}","type":"function","function":{"name":"consult_advisor","arguments":""}}]}}]}\n\n`);
       res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
@@ -713,6 +716,18 @@ check "C1-CARRY: turn 2 upstream carries the prior advice" \
   "$(printf '%s' "$CARRYTURN2REQ" | grep -c 'stub advisor advice')" "1"
 check "C1-CARRY: the advice is re-inserted as advisor_guidance" \
   "$(printf '%s' "$CARRYTURN2REQ" | grep -c 'advisor_guidance')" "1"
+# Shape matters, not just presence. Rendered as assistant prose the model read advice it had no
+# memory of writing as its own fabrication and told the user it had faked the consult; as the
+# result of a call it made, there is nothing to disown.
+check "C1-CARRY: the advice arrives as a tool result, not assistant prose" \
+  "$(printf '%s' "$CARRYTURN2REQ" | python3 -c '
+import sys, json
+b = json.JSONDecoder().raw_decode(sys.stdin.read().split("body:",1)[1].lstrip())[0]
+tool = [m for m in b["messages"] if m.get("role") == "tool" and "advisor_guidance" in str(m.get("content"))]
+asst = [m for m in b["messages"] if m.get("role") == "assistant" and "advisor_guidance" in str(m.get("content"))]
+calls = [c for m in b["messages"] for c in (m.get("tool_calls") or []) if c["function"]["name"] == "consult_advisor"]
+print("tool=%d asst=%d calls=%d" % (len(tool), len(asst), len(calls)))
+')" "tool=1 asst=0 calls=1"
 check "C1-CARRY: a session that never consulted gets no advice" \
   "$(printf '%s' "$CARRYCTRLREQ" | grep -c 'advisor_guidance')" "0"
 # The advisor reads the history too. Shown the excised version it cannot see the consult it just

@@ -295,11 +295,11 @@ const advisorGuidanceBySession = new Map();
 
 // Anchor is `{ text }` or `{ toolUseId }` (ids round-trip because tool_result pairing needs them,
 // so they cover a consult followed straight by a tool call); `before` says which side it sat on.
-export function recordAdvisorGuidance(sessionId, anchor, advice) {
+export function recordAdvisorGuidance(sessionId, anchor, advice, consultId) {
   const key = anchor?.toolUseId ? `u:${anchor.toolUseId}`
     : anchor?.text ? `t:${anchor.text}`
     : "";
-  if (!sessionId || !key || !advice) return;
+  if (!sessionId || !key || !advice || !consultId) return;
   let map = advisorGuidanceBySession.get(sessionId);
   if (!map) {
     if (advisorGuidanceBySession.size >= ADVISOR_GUIDANCE_CAP)
@@ -308,7 +308,7 @@ export function recordAdvisorGuidance(sessionId, anchor, advice) {
     advisorGuidanceBySession.set(sessionId, map);
   }
   if (map.size >= ADVISOR_GUIDANCE_PER_SESSION) map.delete(map.keys().next().value);
-  map.set(key, { advice, before: !!anchor.before });
+  map.set(key, { advice, before: !!anchor.before, consultId });
 }
 
 // Put a session's consults back where the harness excised them. Both readers go through this: an
@@ -319,27 +319,54 @@ export function restoreAdvisorGuidance(sessionId, messages) {
   if (!store?.size) return messages;
   // One insertion per recorded consult, even if its anchor repeats in the history.
   const used = new Set();
-  return messages.map((msg) => {
-    if (msg?.role !== "assistant") return msg;
-    const out = [];
-    let inserted = false;
+  const out = [];
+  for (const msg of messages) {
+    if (msg?.role !== "assistant") {
+      out.push(msg);
+      continue;
+    }
+    let acc = [];
+    let split = false;
+    // Close the assistant message on the consult's own tool_use and answer it with a tool_result,
+    // which is the shape the continuation already sends. Rendering the advice as assistant text
+    // instead made the model read advice it had no memory of writing as its own fabrication, and
+    // tell the user it had faked the consult.
+    const emitConsult = (rec) => {
+      acc.push({ type: "tool_use", id: rec.consultId, name: ADVISOR_TOOL_NAME, input: {} });
+      out.push({ ...msg, content: acc });
+      out.push({
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: rec.consultId,
+          content: advisorGuidanceText(rec.advice),
+        }],
+      });
+      acc = [];
+      split = true;
+    };
     for (const b of blocksOf(msg.content)) {
       const key = b?.type === "text" && typeof b.text === "string" ? `t:${b.text}`
         : b?.type === "tool_use" && typeof b.id === "string" ? `u:${b.id}`
         : null;
       const rec = key && !used.has(key) ? store.get(key) : null;
       if (!rec) {
-        out.push(b);
+        acc.push(b);
         continue;
       }
       used.add(key);
-      inserted = true;
-      const guidance = { type: "text", text: advisorGuidanceText(rec.advice) };
-      if (rec.before) out.push(guidance, b);
-      else out.push(b, guidance);
+      if (rec.before) {
+        emitConsult(rec);
+        acc.push(b);
+      } else {
+        acc.push(b);
+        emitConsult(rec);
+      }
     }
-    return inserted ? { ...msg, content: out } : msg;
-  });
+    if (acc.length) out.push({ ...msg, content: acc });
+    else if (!split) out.push(msg);
+  }
+  return out;
 }
 
 export function _resetAdvisorGuidance() { advisorGuidanceBySession.clear(); }

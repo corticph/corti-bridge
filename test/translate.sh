@@ -360,16 +360,26 @@ const beforeRecord = await translateRequest(collapsedTurn(), { skipAdvisor: true
 check("A4: nothing re-inserted before the consult is recorded",
   beforeRecord.request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
 
-recordAdvisorGuidance("sess-a2", { text: anchorText }, "ship it, the tests cover the regression");
+recordAdvisorGuidance("sess-a2", { text: anchorText }, "ship it, the tests cover the regression", "tu_consult_1");
 const afterRecord = await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2" });
-const a2Assistant = afterRecord.request.messages.find((m) => m.role === "assistant");
-check("A4: advice re-inserted into assistant history",
-  a2Assistant.content.includes("<advisor_guidance>\nship it, the tests cover the regression\n</advisor_guidance>"), true);
-// Position matters: the advice belongs where the consult was — after the announcement it answers,
-// before the continuation that acted on it. Anywhere else and the turn reads out of order.
-check("A4: advice sits between the announcement and the continuation",
-  a2Assistant.content.indexOf(anchorText) < a2Assistant.content.indexOf("<advisor_guidance>")
-  && a2Assistant.content.indexOf("<advisor_guidance>") < a2Assistant.content.indexOf("The advisor agrees."), true);
+const a2Msgs = afterRecord.request.messages;
+// The advice comes back as the tool_result of a call the model made, never as assistant prose:
+// rendered as its own words it read as something it had fabricated, and it told the user so.
+const a2Tool = a2Msgs.find((m) => m.role === "tool" && m.tool_call_id === "tu_consult_1");
+check("A4: the advice returns as a tool result, not as assistant text",
+  a2Tool?.content, "<advisor_guidance>\nship it, the tests cover the regression\n</advisor_guidance>");
+check("A4: no assistant message claims the advice as its own words",
+  a2Msgs.some((m) => m.role === "assistant" && String(m.content).includes("<advisor_guidance>")), false);
+check("A4: the consult is restored as a real tool call the model made",
+  a2Msgs.some((m) => m.role === "assistant" && m.tool_calls?.some((c) => c.id === "tu_consult_1" && c.function.name === "consult_advisor")), true);
+// Position matters: the consult sat between the announcement and the continuation it produced, so
+// the reconstructed call/result pair has to sit there too or the turn reads out of order.
+const a2Order = a2Msgs.map((m) => String(m.content ?? "") + JSON.stringify(m.tool_calls ?? ""));
+const idxCall = a2Order.findIndex((s) => s.includes("tu_consult_1") && s.includes(anchorText));
+const idxResult = a2Msgs.findIndex((m) => m.role === "tool" && m.tool_call_id === "tu_consult_1");
+const idxAfter = a2Order.findIndex((s) => s.includes("The advisor agrees."));
+check("A4: the call sits with the announcement and the result before the continuation",
+  idxCall >= 0 && idxCall < idxResult && idxResult < idxAfter, true);
 // Stability is the A1 prefix-cache requirement: the same history must translate byte-identically
 // on every later turn, or the cached prefix grows and Corti\x27s automatic cache collapses.
 const afterRecord2 = await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2" });
@@ -403,9 +413,10 @@ check("A4: a repeated anchor re-inserts only once",
 const noSess = await translateRequest(collapsedTurn(), { skipAdvisor: true });
 check("A4: no session id re-inserts nothing",
   noSess.request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
-recordAdvisorGuidance(undefined, { text: anchorText }, "should not be stored");
-recordAdvisorGuidance("sess-a2-empty", { text: "" }, "should not be stored");
-recordAdvisorGuidance("sess-a2-empty", null, "should not be stored");
+recordAdvisorGuidance(undefined, { text: anchorText }, "should not be stored", "tu_x");
+recordAdvisorGuidance("sess-a2-empty", { text: "" }, "should not be stored", "tu_x");
+recordAdvisorGuidance("sess-a2-empty", null, "should not be stored", "tu_x");
+recordAdvisorGuidance("sess-a2-empty", { text: anchorText }, "should not be stored");
 check("A4: an empty anchor is not recorded",
   (await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2-empty" }))
     .request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
@@ -422,22 +433,35 @@ const toolTurn = () => ({
     { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_after_advice", content: "done" }] },
   ],
 });
-recordAdvisorGuidance("sess-a4-tool", { toolUseId: "tu_after_advice", before: true }, "read the file first");
+recordAdvisorGuidance("sess-a4-tool", { toolUseId: "tu_after_advice", before: true }, "read the file first", "tu_consult_2");
 const toolAnchored = await translateRequest(toolTurn(), { skipAdvisor: true, parentSessionId: "sess-a4-tool" });
-const a4ToolAsst = toolAnchored.request.messages.find((m) => m.role === "assistant");
+const a4Msgs = toolAnchored.request.messages;
 check("A4: a tool_use id anchors a consult with no prose around it",
-  String(a4ToolAsst.content).includes("<advisor_guidance>\nread the file first\n</advisor_guidance>"), true);
+  a4Msgs.find((m) => m.role === "tool" && m.tool_call_id === "tu_consult_2")?.content,
+  "<advisor_guidance>\nread the file first\n</advisor_guidance>");
+// The consult ran before the tool call it advised, so its pair must be resolved before that call
+// is issued — a tool_call left open across another call is an invalid history.
+const a4CallIdx = a4Msgs.findIndex((m) => m.tool_calls?.some((c) => c.id === "tu_consult_2"));
+const a4ResIdx = a4Msgs.findIndex((m) => m.role === "tool" && m.tool_call_id === "tu_consult_2");
+const a4AdvisedIdx = a4Msgs.findIndex((m) => m.tool_calls?.some((c) => c.id === "tu_after_advice"));
+check("A4: the consult resolves before the call it advised",
+  a4CallIdx >= 0 && a4CallIdx < a4ResIdx && a4ResIdx < a4AdvisedIdx, true);
 check("A4: the tool call it advised still round-trips",
-  a4ToolAsst.tool_calls?.[0]?.id, "tu_after_advice");
-// before:true also applies to a text anchor — the consult ran ahead of the continuation it produced.
-recordAdvisorGuidance("sess-a4-before", { text: "Here is the answer.", before: true }, "advice first");
-const beforeAnchored = await translateRequest({
-  model: "corti-s1", max_tokens: 16, system: "agent",
-  messages: [{ role: "assistant", content: [{ type: "text", text: "Here is the answer." }] }],
-}, { skipAdvisor: true, parentSessionId: "sess-a4-before" });
-const a4Before = String(beforeAnchored.request.messages.find((m) => m.role === "assistant").content);
-check("A4: before:true puts the advice ahead of its anchor",
-  a4Before.indexOf("<advisor_guidance>") < a4Before.indexOf("Here is the answer."), true);
+  a4Msgs[a4AdvisedIdx]?.tool_calls?.[0]?.id, "tu_after_advice");
+check("A4: every tool_call still has its result (no dangling pair)",
+  (toolAnchored.dropped || []).some((d) => d.includes("dangling") || d.includes("placeholder")), false);
+// The restored pair looks exactly like a consult awaiting a rewrite, so it must never reach
+// interceptConsultAdvisor: buildToolUseMap runs inside applyIntercepts, and the hold-and-continue
+// path never fills advisorProcessedBySession, so the dedup cache would not catch the re-spawn.
+// This holds only because restoreAdvisorGuidance runs after applyIntercepts — keep that order.
+let restoreSpawns = 0;
+_resetAdvisorProcessed();
+recordAdvisorGuidance("sess-a4-spawn", { text: "Consulting." }, "prior advice", "tu_consult_3");
+await translateRequest({
+  model: "corti-s1", max_tokens: 16, system: "agent", tools: [ANYTOOL()],
+  messages: [{ role: "assistant", content: [{ type: "text", text: "Consulting." }] }, { role: "user", content: "go on" }],
+}, { mode: "openai", parentSessionId: "sess-a4-spawn", runAdvisor: async () => { restoreSpawns++; return "fresh"; } });
+check("A4: a restored consult does not spawn the advisor again", restoreSpawns, 0);
 
 // Block G5 — the advisor intercept skips a request with no tools. Those are the harness one-shot
 // side calls (summarise a fetched page, title a chat); they cannot act on advice, and in one
