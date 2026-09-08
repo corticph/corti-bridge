@@ -14,6 +14,8 @@ import {
   createStreamTranslator,
   estimateTokens,
   promptTooLong,
+  recordAdvisorGuidance,
+  restoreAdvisorGuidance,
   runAdvisor,
   translateCompletion,
   translateError,
@@ -22,6 +24,7 @@ import {
   translateRequest,
 } from "./translate.mjs";
 import { serializeAdvisorInput } from "./lib/advisor-transcript.mjs";
+import { calibrationKey, calibratedEstimate, recordPromptTokens } from "./lib/prompt-estimate.mjs";
 import {
   RETRY_MAX_ATTEMPTS,
   isRetryableNetworkError,
@@ -258,7 +261,11 @@ async function handlePassthrough(req, res, reqPath) {
   if (!isCountTokens && req.method === "POST" && reqPath === "/v1/messages") {
     try {
       const parsed = JSON.parse(body.toString());
-      await applyIntercepts(parsed, { skipAdvisor: wantsNoAdvisor(req), mode: "anthropic" });
+      await applyIntercepts(parsed, {
+        skipAdvisor: wantsNoAdvisor(req),
+        mode: "anthropic",
+        parentSessionId: req.headers["x-claude-code-session-id"],
+      });
       body = Buffer.from(JSON.stringify(parsed));
     } catch {
       // JSON parse failed — forward original body; upstream will reject
@@ -587,12 +594,21 @@ async function handleMessages(req, res, body) {
     throw err;
   }
 
+  // The overflow guard above deliberately stays on the raw estimate; this is only what the client
+  // is told the prompt cost, and it has to survive becoming a turn's final usage when the turn dies
+  // before upstream reports anything real.
+  const calKey = calibrationKey(parentSessionId, anthropicBody.model);
+  const estimatedInput = calibratedEstimate(calKey, est);
+
   const ctx = {
     msgId: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
     requestedModel: anthropicBody.model,
     reasoningMode: REASONING_MODE,
-    estimatedInput: est,
+    estimatedInput,
     onDiagnostic: (m) => diagnostics.push(m),
+    // Fires wherever translate.mjs sees upstream's own prompt_tokens, streaming or not. Paired
+    // with the raw estimate for this same body, so the ratio compares like with like.
+    onPromptTokens: (n) => recordPromptTokens(calKey, est, n),
   };
 
   // Hold-and-continue advisor: when the turn ends on a consult_advisor tool_use, the translator
@@ -600,16 +616,25 @@ async function handleMessages(req, res, body) {
   // inline (the shape the harness renders as "Advising…"), run the advisor, then make a second
   // upstream call with the consult_advisor tool_use + a real client tool_result appended so the
   // model reads the advice and actually answers the user. The gateway owns the terminal events.
+  // Only wire the hook when the intercept actually offered the tool: a toolless side call was
+  // never given the advisor, so it must not be able to hold a turn open for one either.
+  const advisorOffered = anthropicBody.tools?.some((t) => t?.name === "consult_advisor");
   let advisorHandled = false;
-  ctx.onAdvisorToolUse = async ({ id }) => {
+  const onAdvisorToolUse = async ({ id }) => {
     if (advisorHandled || finalized || clientGone) return;
     advisorHandled = true;
+    // Captured while it is still the newest block: the sentence the model would otherwise read
+    // next turn as an unkept promise, and the anchor the advice is re-inserted against.
+    const preCallText = translator?.lastText ?? "";
     // Serialize the executor's full request (system + tools + transcript + budget line) for the
     // advisor. The tool input is empty — the executor signals timing only; the harness forwards
     // context automatically, per the official advisor tool design.
-    const { text: advisorInput, elidedCount } = serializeAdvisorInput(anthropicBody, {
-      maxTokens: Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2048,
-    });
+    // Restored history: shown the excised version, the advisor confirms the executor's false
+    // "I never called it" rather than correcting it.
+    const { text: advisorInput, elidedCount } = serializeAdvisorInput(
+      { ...anthropicBody, messages: restoreAdvisorGuidance(parentSessionId, anthropicBody.messages) },
+      { maxTokens: Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2048 },
+    );
     const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
     diagnostics.push(`advisor hold-and-continue: id=${id} transcript=${advisorInput.length} chars${elidedStr}`);
 
@@ -649,7 +674,7 @@ async function handleMessages(req, res, body) {
       writeEvent("message_delta", {
         type: "message_delta",
         delta: { stop_reason: "end_turn", stop_sequence: null },
-        usage: { input_tokens: est, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        usage: { input_tokens: estimatedInput, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
       });
       writeEvent("message_stop", { type: "message_stop" });
       res.end();
@@ -713,6 +738,16 @@ async function handleMessages(req, res, body) {
     lastActivity = Date.now();
     try {
       await continueAfterAdvisor(id, continuationText, resIdx);
+      // The harness drops the consult from history; anchor the advice on a block that survives
+      // beside it — what preceded the call, else the first block the continuation emitted.
+      if (advisorResult.ok) {
+        const first = contTranslator?.firstBlock;
+        const anchor = preCallText ? { text: preCallText }
+          : first?.type === "text" ? { text: first.text, before: true }
+          : first?.type === "tool" ? { toolUseId: first.id, before: true }
+          : null;
+        if (anchor) recordAdvisorGuidance(parentSessionId, anchor, advisorResult.text);
+      }
       // Reached only once the continuation's upstream turn is complete and every frame is
       // written. Ending the turn here rather than inside the stream handler keeps settlement on
       // the critical path: a continuation that never settles can no longer finalize silently.
@@ -730,6 +765,7 @@ async function handleMessages(req, res, body) {
       continuationActive = false;
     }
   };
+  if (advisorOffered) ctx.onAdvisorToolUse = onAdvisorToolUse;
 
   /**
    * Second upstream call: appends the consult_advisor tool_use + tool_result and asks the model
@@ -805,7 +841,9 @@ async function handleMessages(req, res, body) {
       // skipAdvisor: re-running interceptConsultAdvisor would match the tool_result we just
       // synthesized and spawn runAdvisor a second time. The continuation is ours, not a fresh
       // client request, so the advisor intercept must not touch it.
-      translateRequest(contAnthropic, { skipAdvisor: true })
+      // parentSessionId only re-inserts *prior* consults, so the continuation reads the history
+      // the first call did; this turn's own consult is not recorded until the continuation settles.
+      translateRequest(contAnthropic, { skipAdvisor: true, parentSessionId })
         .then((out) => {
           const contTranslated = out.request;
           diagnostics.push(...out.dropped.map((d) => `continuation dropped: ${d}`));
@@ -864,7 +902,12 @@ async function handleMessages(req, res, body) {
                 logContResponse();
                 if (finalized || clientGone) return settle();
                 try {
-                  emitContinuationCompletion(translateCompletion(JSON.parse(Buffer.concat(chunks).toString()), ctx));
+                  emitContinuationCompletion(
+                    // onPromptTokens dropped: the continuation's prompt carries the advisor's
+                    // answer on top of the body `est` was measured from, so the pair would not
+                    // compare like with like.
+                    translateCompletion(JSON.parse(Buffer.concat(chunks).toString()), { ...ctx, onPromptTokens: undefined }),
+                  );
                   proxyReq = null; // response is complete; don't let finalize() tear down a reusable socket
                   settle();
                 } catch (e) {
@@ -879,7 +922,7 @@ async function handleMessages(req, res, body) {
             // (the harness already saw one for this turn — two would be malformed); onAdvisorToolUse
             // is unset so done() emits the terminal message_stop instead of re-handing the turn
             // to a now-defunct advisor hook.
-            const contCtx = { ...ctx, messageStarted: true, onAdvisorToolUse: undefined };
+            const contCtx = { ...ctx, messageStarted: true, onAdvisorToolUse: undefined, onPromptTokens: undefined };
             contTranslator = createStreamTranslator(contCtx, writeEvent, resIdx + 1);
             // Point backpressure at the continuation's stream: writeEvent pauses/resumes
             // `upstreamRes` when res.write() returns false, and upstreamRes still holds the
@@ -1291,7 +1334,7 @@ async function handleMessages(req, res, body) {
                   // The live per-agent counter reads this off the streamed event; the estimate is
                   // its only growth signal. anthropicUsage floors input_tokens at 1 so the
                   // statusline merge overwrites this with the real value (no cached-prefix double-count).
-                  input_tokens: est,
+                  input_tokens: estimatedInput,
                   output_tokens: 1,
                   cache_creation_input_tokens: 0,
                   cache_read_input_tokens: 0,
