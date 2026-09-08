@@ -8,7 +8,7 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
-import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed } from "'"$REPO"'/translate.mjs";
+import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 
 let failed = 0;
@@ -283,6 +283,87 @@ check("A1: no session id still spawns (3)", a1Calls, 3);
 a1Calls = 0;
 await applyIntercepts(JSON.parse(JSON.stringify(a1Body)), { runAdvisor: a1Stub, mode: "openai" });
 check("A1: no session id re-spawns on replay (no cross-request cache)", a1Calls, 3);
+
+// Block G4 — A4: a hold-and-continue consult must survive into later turns. The harness renders
+// the server_tool_use / advisor_tool_result pair but never replays it, so the consult arrives as
+// two adjacent text blocks with the advice excised — and the model reads its own announcement as
+// a promise it never kept (observed: four false "I never actually called the advisor" apologies
+// in one session). recordAdvisorGuidance anchors the advice on the surviving text block; the
+// assistant walk re-inserts it. This is the C6 path fed from the gateway instead of the harness.
+_resetAdvisorGuidance();
+const anchorText = "Let me confirm this with the advisor. Calling it now.";
+const collapsedTurn = () => ({
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [
+    { role: "user", content: "should I ship this?" },
+    // What the harness replays: the two text blocks, consult gone from between them.
+    { role: "assistant", content: [{ type: "text", text: anchorText }, { type: "text", text: "The advisor agrees." }] },
+    { role: "user", content: "did it actually answer?" },
+  ],
+});
+const beforeRecord = await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2" });
+check("A4: nothing re-inserted before the consult is recorded",
+  beforeRecord.request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
+
+recordAdvisorGuidance("sess-a2", anchorText, "ship it, the tests cover the regression");
+const afterRecord = await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2" });
+const a2Assistant = afterRecord.request.messages.find((m) => m.role === "assistant");
+check("A4: advice re-inserted into assistant history",
+  a2Assistant.content.includes("<advisor_guidance>\nship it, the tests cover the regression\n</advisor_guidance>"), true);
+// Position matters: the advice belongs where the consult was — after the announcement it answers,
+// before the continuation that acted on it. Anywhere else and the turn reads out of order.
+check("A4: advice sits between the announcement and the continuation",
+  a2Assistant.content.indexOf(anchorText) < a2Assistant.content.indexOf("<advisor_guidance>")
+  && a2Assistant.content.indexOf("<advisor_guidance>") < a2Assistant.content.indexOf("The advisor agrees."), true);
+// Stability is the A1 prefix-cache requirement: the same history must translate byte-identically
+// on every later turn, or the cached prefix grows and Corti\x27s automatic cache collapses.
+const afterRecord2 = await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2" });
+check("A4: re-insertion is byte-stable across turns",
+  JSON.stringify(afterRecord2.request.messages), JSON.stringify(afterRecord.request.messages));
+// Session isolation: another session must not inherit this session\x27s advice.
+const otherSession = await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2-other" });
+check("A4: another session gets no re-insertion",
+  otherSession.request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
+// A rewind past the consult drops the anchor from history, so nothing is re-inserted — the advice
+// is not smuggled back into a turn the user rewound away from.
+const rewound = await translateRequest({
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [{ role: "user", content: "should I ship this?" }],
+}, { skipAdvisor: true, parentSessionId: "sess-a2" });
+check("A4: a rewind past the anchor re-inserts nothing",
+  rewound.request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
+// A repeated anchor inserts once, not once per occurrence.
+const dupTurn = {
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [
+    { role: "assistant", content: [{ type: "text", text: anchorText }] },
+    { role: "user", content: "and?" },
+    { role: "assistant", content: [{ type: "text", text: anchorText }] },
+  ],
+};
+const dup = await translateRequest(dupTurn, { skipAdvisor: true, parentSessionId: "sess-a2" });
+check("A4: a repeated anchor re-inserts only once",
+  (JSON.stringify(dup.request.messages).match(/advisor_guidance/g) || []).length, 2); // one open + one close tag
+// No session id: no store key, so no re-insertion (same rule as the dedup cache).
+const noSess = await translateRequest(collapsedTurn(), { skipAdvisor: true });
+check("A4: no session id re-inserts nothing",
+  noSess.request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
+recordAdvisorGuidance(undefined, anchorText, "should not be stored");
+recordAdvisorGuidance("sess-a2-empty", "", "should not be stored");
+check("A4: an empty anchor is not recorded",
+  (await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2-empty" }))
+    .request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
+
+// The stream translator\x27s lastText is the gateway\x27s anchor source: it must hold the newest text
+// block verbatim, and reset at each new block so a consult anchors on its own announcement.
+const ltEvents = [];
+const lt = createStreamTranslator({}, (e, d) => ltEvents.push([e, d]));
+lt.feed({ choices: [{ index: 0, delta: { content: "first " } }] });
+lt.feed({ choices: [{ index: 0, delta: { content: "block" } }] });
+check("A4: lastText accumulates a text block", lt.lastText, "first block");
+lt.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "t1", type: "function", function: { name: "run_bash", arguments: "{}" } }] } }] });
+lt.feed({ choices: [{ index: 0, delta: { content: "second" } }] });
+check("A4: lastText resets on a new text block", lt.lastText, "second");
 
 // Block H — C6: prior-turn advisor advice round-trips into history instead of being dropped.
 // advisor_tool_result is NOT in SERVER_BLOCK_TYPES (only server_tool_use is); before the fix it

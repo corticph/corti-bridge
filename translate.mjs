@@ -263,6 +263,63 @@ function advisorProcessedMap(sessionId) {
 }
 
 export function _resetAdvisorProcessed() { advisorProcessedBySession.clear(); }
+
+/** Per-session record of consults the hold-and-continue path already answered, keyed by an anchor:
+ *  the verbatim text block the assistant emitted beside the consult. The harness renders the
+ *  server_tool_use / advisor_tool_result pair but never replays it, so the consult reaches the next
+ *  turn as two adjacent text blocks with the advice excised from between them — leaving the model's
+ *  own "calling the advisor now" reading as a promise it never kept. Re-inserting the guidance at
+ *  the anchor restores exactly what C6 round-trips when the blocks do come back. */
+const ADVISOR_GUIDANCE_CAP = 64;
+const ADVISOR_GUIDANCE_PER_SESSION = 32;
+const advisorGuidanceBySession = new Map();
+
+// Called by the gateway once a consult's continuation has settled. No anchor (a consult with no
+// text on either side) means no re-insertion — that degrades to the pre-fix behaviour rather than
+// guessing at a position.
+export function recordAdvisorGuidance(sessionId, anchorText, advice) {
+  if (!sessionId || !anchorText || !advice) return;
+  let map = advisorGuidanceBySession.get(sessionId);
+  if (!map) {
+    if (advisorGuidanceBySession.size >= ADVISOR_GUIDANCE_CAP)
+      advisorGuidanceBySession.delete(advisorGuidanceBySession.keys().next().value);
+    map = new Map();
+    advisorGuidanceBySession.set(sessionId, map);
+  }
+  if (map.size >= ADVISOR_GUIDANCE_PER_SESSION) map.delete(map.keys().next().value);
+  map.set(anchorText, advice);
+}
+
+// Put a session's recorded consults back where the harness excised them: a <advisor_guidance> text
+// block right after the text block each was anchored on. Returns a new list, sharing every message
+// it did not change. Both readers of the history go through this — the executor's upstream view and
+// the advisor's own transcript — because an advisor reading the excised history corroborates the
+// executor's false "I never called it" instead of correcting it.
+export function restoreAdvisorGuidance(sessionId, messages) {
+  if (!Array.isArray(messages)) return messages ?? [];
+  const store = sessionId ? advisorGuidanceBySession.get(sessionId) : null;
+  if (!store?.size) return messages;
+  // One insertion per recorded consult, even if its anchor text repeats in the history.
+  const used = new Set();
+  return messages.map((msg) => {
+    if (msg?.role !== "assistant") return msg;
+    const out = [];
+    let inserted = false;
+    for (const b of blocksOf(msg.content)) {
+      out.push(b);
+      if (b?.type !== "text" || typeof b.text !== "string") continue;
+      const advice = store.get(b.text);
+      if (!advice || used.has(b.text)) continue;
+      used.add(b.text);
+      inserted = true;
+      out.push({ type: "text", text: advisorGuidanceText(advice) });
+    }
+    return inserted ? { ...msg, content: out } : msg;
+  });
+}
+
+export function _resetAdvisorGuidance() { advisorGuidanceBySession.clear(); }
+
 // Empty input_schema: the executor signals *timing only*. Letting it write a query loses
 // exactly the detail the advisor is there to catch — the harness forwards the full transcript
 // automatically (see serializeAdvisorInput). `additionalProperties: false` matters: models
@@ -587,7 +644,13 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
         diagnostics.push(`advisor cached: id=${b.tool_use_id} (no re-spawn)`);
         continue;
       }
-      const { text, elidedCount } = serializeAdvisorInput(body, { maxTokens: advisorMaxTokens() });
+      // Restored history: an advisor reading the excised version cannot see the consults it
+      // already answered, and confirms the executor's false "I never called it" instead of
+      // correcting it — the exact loop this whole mechanism exists to break.
+      const { text, elidedCount } = serializeAdvisorInput(
+        { ...body, messages: restoreAdvisorGuidance(parentSessionId, body.messages) },
+        { maxTokens: advisorMaxTokens() },
+      );
       const out = await call(text, { parentSessionId });
       // A bare string is a test stub (backward compat) — treat as success.
       const res = typeof out === "string" ? { ok: true, text: out } : out;
@@ -722,6 +785,8 @@ export async function translateRequest(body, opts) {
 
   const messages = [];
   let pendingCalls = [];
+  // Consults this session already made, put back before anything walks the history.
+  const history = restoreAdvisorGuidance(opts?.parentSessionId, body.messages);
 
   const flushPending = () => {
     for (const id of pendingCalls) {
@@ -735,7 +800,7 @@ export async function translateRequest(body, opts) {
     pendingCalls = [];
   };
 
-  for (const msg of body.messages) {
+  for (const msg of history) {
     if (!msg || typeof msg !== "object") continue;
 
     // Mid-conversation role:system messages are harness-injected reminders (task-tool nudges,
@@ -1242,6 +1307,9 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
   let terminated = false;
   let latestUsage = null;
   let outputChars = 0;
+  // Text of the most recent text block, verbatim as the client received it. The gateway anchors a
+  // consult's re-inserted advice on this, so it must match the client's history byte for byte.
+  let lastText = "";
   let advisorToolUse = null; // { id, name, args } when the turn ends on a consult_advisor tool_use
 
   const closeOpen = () => {
@@ -1311,8 +1379,12 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
 
   const textDelta = (text) => {
     if (!text) return;
-    if (open?.kind !== "text") openBlock("text", { type: "text", text: "" });
+    if (open?.kind !== "text") {
+      openBlock("text", { type: "text", text: "" });
+      lastText = "";
+    }
     outputChars += text.length;
+    lastText += text;
     emit("content_block_delta", {
       type: "content_block_delta",
       index: open.index,
@@ -1474,6 +1546,11 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
     },
     get nextBlockIndex() {
       return nextBlockIndex;
+    },
+    // The most recent text block's full text — the gateway's anchor for re-inserting a consult's
+    // advice into later turns (see recordAdvisorGuidance).
+    get lastText() {
+      return lastText;
     },
     // Close whatever block is still open (emitting the thinking signature first, when that is
     // what is open) so a caller can append its own block at nextBlockIndex without nesting.

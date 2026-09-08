@@ -168,7 +168,9 @@ check "HEAD /api/hello answered locally, prefixed" \
 # advisor child is stubbed via CORTI_ADVISOR_STUB so no live headless session is spawned.
 cat > advisor-stub.sh <<'ADVSTUB'
 #!/bin/sh
-cat >/dev/null  # discard the transcript
+# Keep the transcript when asked (C1-CARRY asserts on what the advisor was actually shown);
+# discard it otherwise, so the other suites stay unaffected.
+if [ -n "${ADVISOR_STUB_CAPTURE:-}" ]; then cat >> "$ADVISOR_STUB_CAPTURE"; else cat >/dev/null; fi
 printf '{"ok":true,"text":"stub advisor advice"}'
 ADVSTUB
 chmod +x advisor-stub.sh
@@ -606,6 +608,122 @@ set -e
 
 kill "$C1_SETTLE_GW_PID" "$C1SETTLESTUB_PID" 2>/dev/null || :
 wait "$C1_SETTLE_GW_PID" "$C1SETTLESTUB_PID" 2>/dev/null || :
+
+# --- C1-CARRY: a consult must still be visible to the NEXT turn. The harness renders the
+# server_tool_use / advisor_tool_result pair but never replays it, so turn 2 arrives with the
+# consult excised from between two text blocks — and the model reads its own announcement as a
+# promise it never kept, apologising for a call it did make. The gateway records the advice
+# against the surviving text block; translateRequest re-inserts it. Two real turns through one
+# gateway process are required: the store is per-session and lives in the gateway, so a
+# single-request test cannot see the carry-forward at all.
+cat > c1carrystub.mjs <<'CARRYSTUB'
+import fs from "node:fs";
+import https from "node:https";
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      const isContinuation = body.includes('"role":"tool"') && body.includes('"tool_call_id"');
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (isContinuation) {
+        res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"ANSWER"}}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+        return void res.end('data: [DONE]\n\n');
+      }
+      // Both turns narrate then consult. Turn 1 creates the record; turn 2 consults again, which
+      // is what puts the restored history in front of the advisor.
+      const narration = body.includes("TURN2") ? "Checking with the advisor." : "Calling the advisor now.";
+      const callId = body.includes("TURN2") ? "call_carry2" : "call_carry";
+      res.write(`data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"${narration}"}}]}\n\n`);
+      res.write(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"${callId}","type":"function","function":{"name":"consult_advisor","arguments":""}}]}}]}\n\n`);
+      res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`C1CARRYPORT=${s.address().port}`));
+CARRYSTUB
+
+node c1carrystub.mjs > c1carrystub.out 2>&1 &
+C1CARRYSTUB_PID=$!
+C1CARRYUP=""
+while [ -z "$C1CARRYUP" ]; do C1CARRYUP=$(sed -n 's/^C1CARRYPORT=//p' c1carrystub.out); done
+
+C1_CARRY_PORT=4701
+mkdir -p "$SCRATCH/carry-logs"
+# Every transcript the advisor child is handed, appended in spawn order.
+CARRY_ADVISOR_IN="$SCRATCH/carry-advisor-input.txt"
+: > "$CARRY_ADVISOR_IN"
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > c1carrygateway.mjs
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$C1CARRYUP/v1" \
+CORTI_PORT="$C1_CARRY_PORT" \
+CORTI_ADVISOR_STUB="$SCRATCH/advisor-stub.sh" \
+ADVISOR_STUB_CAPTURE="$CARRY_ADVISOR_IN" \
+CORTI_DEBUG=1 \
+CORTI_DEBUG_DIR="$SCRATCH/carry-logs" \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node c1carrygateway.mjs > c1carrygw.out 2>&1 &
+C1_CARRY_GW_PID=$!
+wait_banner c1carrygw.out || { echo "FAIL C1-CARRY gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+
+C1CARRYG="http://127.0.0.1:$C1_CARRY_PORT"
+CARRYSESS='x-claude-code-session-id: carry-sess-1'
+# Turn 1: the consult runs and the advisor answers.
+CARRYRESP1=$(curl -s -m 20 -N -H 'content-type: application/json' -H "$CARRYSESS" \
+  -d "$C1BODY" "$C1CARRYG/v1/messages" 2>&1 || true)
+# Turn 2: the history the harness actually replays — the two text blocks, consult gone.
+CARRYBODY2='{"model":"corti-s1","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"advise me"},{"role":"assistant","content":[{"type":"text","text":"Calling the advisor now."},{"type":"text","text":"Acting on it."}]},{"role":"user","content":"TURN2 did it actually answer?"}]}'
+CARRYRESP2=$(curl -s -m 20 -N -H 'content-type: application/json' -H "$CARRYSESS" \
+  -d "$CARRYBODY2" "$C1CARRYG/v1/messages" 2>&1 || true)
+# Same history, a session that never consulted: proves the carry-forward is keyed on the session
+# and not simply injected into every request that looks like this one.
+CARRYRESP3=$(curl -s -m 20 -N -H 'content-type: application/json' \
+  -H 'x-claude-code-session-id: carry-sess-2' \
+  -d "$CARRYBODY2" "$C1CARRYG/v1/messages" 2>&1 || true)
+
+CARRYLOG1=$(cat "$SCRATCH"/carry-logs/*carry-sess-1*.log 2>/dev/null || true)
+CARRYLOG2=$(cat "$SCRATCH"/carry-logs/*carry-sess-2*.log 2>/dev/null || true)
+# The upstream request body is what the model actually reads, so assert on one body at a time
+# rather than on the whole log (which also holds the responses the advice appears in).
+carry_upstream() { # <log> <n>: the Nth UPSTREAM-REQUEST body in that log
+  printf '%s' "$1" | awk -v want="$2" '
+    /^=== .*UPSTREAM-REQUEST/ { n++; inb = (n == want); next }
+    /^=== / { inb = 0 }
+    inb'
+}
+# sess-1 makes three upstream calls: turn 1 initial, turn 1 continuation, turn 2 initial.
+CARRYTURN1REQ=$(carry_upstream "$CARRYLOG1" 1)
+CARRYTURN2REQ=$(carry_upstream "$CARRYLOG1" 3)
+CARRYCTRLREQ=$(carry_upstream "$CARRYLOG2" 1)
+
+set +e
+check "C1-CARRY: both turns consulted" \
+  "$(printf '%s' "$CARRYLOG1" | grep -c 'advisor ok')" "2"
+check "C1-CARRY: turn 1 has no prior consult to carry" \
+  "$(printf '%s' "$CARRYTURN1REQ" | grep -c 'advisor_guidance')" "0"
+check "C1-CARRY: turn 2 upstream carries the prior advice" \
+  "$(printf '%s' "$CARRYTURN2REQ" | grep -c 'stub advisor advice')" "1"
+check "C1-CARRY: the advice is re-inserted as advisor_guidance" \
+  "$(printf '%s' "$CARRYTURN2REQ" | grep -c 'advisor_guidance')" "1"
+check "C1-CARRY: a session that never consulted gets no advice" \
+  "$(printf '%s' "$CARRYCTRLREQ" | grep -c 'advisor_guidance')" "0"
+# The advisor reads the history too. Shown the excised version it cannot see the consult it just
+# answered, so it corroborates the executor's false "I never called it" instead of correcting it —
+# which is how the reported apology loop got its confidence. Three spawns run here (sess-1 turn 1,
+# sess-1 turn 2, sess-2 turn 2) and only sess-1's second one has a prior consult to be shown.
+check "C1-CARRY: the advisor was spawned for both turns and the control" \
+  "$(grep -c '<transcript>' "$CARRY_ADVISOR_IN")" "3"
+check "C1-CARRY: the advisor sees the prior consult in its transcript" \
+  "$(grep -c 'stub advisor advice' "$CARRY_ADVISOR_IN")" "1"
+set -e
+
+kill "$C1_CARRY_GW_PID" "$C1CARRYSTUB_PID" 2>/dev/null || :
+wait "$C1_CARRY_GW_PID" "$C1CARRYSTUB_PID" 2>/dev/null || :
 
 # --- C1-ERRFRAME: the continuation upstream answers 200 and then streams an *error frame*
 # mid-turn. feed() would terminate the translator with a bare `error` event and no terminal

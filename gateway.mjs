@@ -14,6 +14,8 @@ import {
   createStreamTranslator,
   estimateTokens,
   promptTooLong,
+  recordAdvisorGuidance,
+  restoreAdvisorGuidance,
   runAdvisor,
   translateCompletion,
   translateError,
@@ -609,12 +611,19 @@ async function handleMessages(req, res, body) {
   ctx.onAdvisorToolUse = async ({ id }) => {
     if (advisorHandled || finalized || clientGone) return;
     advisorHandled = true;
+    // The text the model emitted immediately before the consult — captured now, while it is still
+    // the newest block. It is the anchor the advice is re-inserted against on later turns, and the
+    // very sentence ("calling the advisor now") the model would otherwise read as an unkept promise.
+    const preCallText = translator?.lastText ?? "";
     // Serialize the executor's full request (system + tools + transcript + budget line) for the
     // advisor. The tool input is empty — the executor signals timing only; the harness forwards
     // context automatically, per the official advisor tool design.
-    const { text: advisorInput, elidedCount } = serializeAdvisorInput(anthropicBody, {
-      maxTokens: Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2048,
-    });
+    // Restored history: an advisor reading the excised version cannot see the consults it already
+    // answered, so it confirms the executor's false "I never called it" rather than correcting it.
+    const { text: advisorInput, elidedCount } = serializeAdvisorInput(
+      { ...anthropicBody, messages: restoreAdvisorGuidance(parentSessionId, anthropicBody.messages) },
+      { maxTokens: Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2048 },
+    );
     const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
     diagnostics.push(`advisor hold-and-continue: id=${id} transcript=${advisorInput.length} chars${elidedStr}`);
 
@@ -718,6 +727,11 @@ async function handleMessages(req, res, body) {
     lastActivity = Date.now();
     try {
       await continueAfterAdvisor(id, continuationText, resIdx);
+      // The consult is now two adjacent text blocks in the client's history with the advice gone
+      // from between them. Record it against whichever of those blocks we have verbatim so later
+      // turns see the advice rather than an announcement with nothing behind it.
+      if (advisorResult.ok)
+        recordAdvisorGuidance(parentSessionId, preCallText || contTranslator?.lastText || "", advisorResult.text);
       // Reached only once the continuation's upstream turn is complete and every frame is
       // written. Ending the turn here rather than inside the stream handler keeps settlement on
       // the critical path: a continuation that never settles can no longer finalize silently.
@@ -810,7 +824,10 @@ async function handleMessages(req, res, body) {
       // skipAdvisor: re-running interceptConsultAdvisor would match the tool_result we just
       // synthesized and spawn runAdvisor a second time. The continuation is ours, not a fresh
       // client request, so the advisor intercept must not touch it.
-      translateRequest(contAnthropic, { skipAdvisor: true })
+      // parentSessionId carries only the guidance re-insertion for *prior* consults, so the
+      // continuation reads the same history the first call did. This turn's own consult is not
+      // recorded until the continuation settles, so it cannot double up here.
+      translateRequest(contAnthropic, { skipAdvisor: true, parentSessionId })
         .then((out) => {
           const contTranslated = out.request;
           diagnostics.push(...out.dropped.map((d) => `continuation dropped: ${d}`));
