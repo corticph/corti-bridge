@@ -8,7 +8,7 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
-import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed } from "'"$REPO"'/translate.mjs";
+import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 
 let failed = 0;
@@ -22,6 +22,10 @@ const effort = async (model, thinking) =>
     .request.reasoning_effort;
 
 const ENABLED = (n) => ({ type: "enabled", budget_tokens: n });
+
+// The advisor intercept skips a request with no tools (a one-shot side call cannot act on advice),
+// so every fixture that must reach the advisor carries one.
+const ANYTOOL = () => ({ name: "run_bash", description: "Run a bash command", input_schema: { type: "object" } });
 
 // Effort is budget-derived and model-independent.
 for (const m of ["corti-s1", "corti-s1-mini", "corti-s1-ultra-beta", "corti-s1-ultra-instant-beta"]) {
@@ -58,6 +62,57 @@ const wsTools = (await translateRequest({
 })).request.tools;
 check("websearch: converted to function tool", wsTools?.length === 1 && wsTools[0]?.function?.name === "WebSearch", true);
 
+// The harness sends a schemaed WebSearch of its own alongside the server-side one. That survives
+// the filter, so pushing the synthetic replacement too put two tools of the same name upstream.
+const wsBoth = (await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }],
+  tools: [
+    { type: "web_search_20250305", name: "web_search", max_uses: 5 },
+    { name: "WebSearch", description: "harness own", input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
+  ],
+})).request.tools;
+check("websearch: the harness own tool is not duplicated",
+  wsBoth.filter((t) => t.function?.name === "WebSearch").length, 1);
+check("websearch: and it is the harness description that survives",
+  wsBoth.find((t) => t.function?.name === "WebSearch")?.function?.description, "harness own");
+
+// A past turn\x27s tool_result is what the model already reasoned about, so it must not change.
+// Re-running the search every turn rewrote history bytes mid-conversation and collapsed the
+// prefix cache: measured 4 collapses and 2 watchdog kills in one session, 132 searches for 2
+// queries. The cache is per-session and keyed on tool_use_id, which is stable across turns.
+_resetWebSearchCache();
+let searchCalls = 0;
+// Deliberately unstable, like the live search: a re-fetch would change the bytes.
+const drifting = async (q) => { searchCalls++; return [{ title: `hit ${searchCalls}`, url: "https://x/" + searchCalls, snippet: "s" }]; };
+const searchTurn = () => ({
+  model: "corti-s1", max_tokens: 16,
+  messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "ws1", name: "WebSearch", input: { query: "codex config" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "ws1", content: "" }] },
+  ],
+});
+const wsTurn1 = searchTurn();
+await applyIntercepts(wsTurn1, { webSearch: drifting, parentSessionId: "sess-ws" });
+const wsTurn2 = searchTurn();
+await applyIntercepts(wsTurn2, { webSearch: drifting, parentSessionId: "sess-ws" });
+check("websearch: a historical search is fetched once, not once per turn", searchCalls, 1);
+check("websearch: the rewritten tool_result is byte-identical across turns",
+  wsTurn2.messages[1].content[0].content, wsTurn1.messages[1].content[0].content);
+check("websearch: the first turn still got real results",
+  wsTurn1.messages[1].content[0].content.includes("hit 1"), true);
+// A second, distinct search in the same session is its own entry.
+const twoSearches = searchTurn();
+twoSearches.messages[0].content.push({ type: "tool_use", id: "ws2", name: "WebSearch", input: { query: "other" } });
+twoSearches.messages[1].content.push({ type: "tool_result", tool_use_id: "ws2", content: "" });
+await applyIntercepts(twoSearches, { webSearch: drifting, parentSessionId: "sess-ws" });
+check("websearch: an unseen query in the same session is fetched", searchCalls, 2);
+// Session isolation, and no session id means no cross-request key (same rule as the advisor).
+await applyIntercepts(searchTurn(), { webSearch: drifting, parentSessionId: "sess-ws-other" });
+check("websearch: another session does not read this one\x27s cache", searchCalls, 3);
+await applyIntercepts(searchTurn(), { webSearch: drifting });
+await applyIntercepts(searchTurn(), { webSearch: drifting });
+check("websearch: no session id re-fetches (no cross-request cache)", searchCalls, 5);
+
 // --- advisor (consult_advisor) ------------------------------------------------
 // Gating (translate.mjs:advisorWanted): one knob, CORTI_ADVISOR=auto|on|off.
 //   auto (unset) → openai ON, anthropic OFF (the mode defaults)
@@ -72,7 +127,7 @@ delete process.env.CORTI_ADVISOR;
 delete process.env.CORTI_ADVISOR_TOOL;
 
 // Block A — tool def injected. openai mode default-on (no env var needed).
-const advBody = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], system: "You are a coding agent." };
+const advBody = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [ANYTOOL()], system: "You are a coding agent." };
 await applyIntercepts(advBody, { mode: "openai" });
 check("advisor (openai): tool def injected", advBody.tools?.some((t) => t.name === "consult_advisor"), true);
 // Empty input_schema: the executor signals timing only — the harness forwards the transcript.
@@ -85,15 +140,15 @@ check("advisor (openai): executor timing prompt prepended", String(advBody.syste
 check("advisor (openai): original system preserved after timing block", String(advBody.system).includes("You are a coding agent."), true);
 // The openai translate path filters tools to input_schema + string name; ours has both, so it survives.
 const advTools = (await translateRequest({
-  model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }],
+  model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [ANYTOOL()],
 }, { mode: "openai" })).request.tools;
 check("advisor (openai): survives openai filter", advTools?.some((t) => t.function?.name === "consult_advisor"), true);
 
 // Block B — opt-out: CORTI_ADVISOR=off turns the advisor off even in openai (default-on) mode.
 process.env.CORTI_ADVISOR = "off";
-const advBody2 = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [], system: "agent" };
+const advBody2 = { model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [ANYTOOL()], system: "agent" };
 await applyIntercepts(advBody2, { mode: "openai" });
-check("advisor (openai+off): not injected when off", advBody2.tools.length, 0);
+check("advisor (openai+off): not injected when off", advBody2.tools.length, 1);
 // Timing prompt is NOT prepended when the advisor is off (system untouched).
 check("advisor (openai+off): no timing prompt when off", advBody2.system === "agent", true);
 delete process.env.CORTI_ADVISOR;
@@ -127,7 +182,7 @@ check("advisor (openai): is_error cleared", advResult.is_error, false);
 // Maps to the official advisor_tool_result_error error_code (e.g. execution_time_exceeded).
 const failStub = async () => ({ ok: false, code: "execution_time_exceeded" });
 const failBody = {
-  model: "corti-s1", max_tokens: 16, system: "agent",
+  model: "corti-s1", max_tokens: 16, system: "agent", tools: [ANYTOOL()],
   messages: [
     { role: "user", content: "Fix the bug" },
     { role: "assistant", content: [{ type: "tool_use", id: "tu_f1", name: "consult_advisor", input: {} }] },
@@ -161,7 +216,7 @@ check("advisor (openai): executor tool result forwarded", ser.includes("x.foo()"
 // Block D — truncation: large tool results are head/tail-truncated with an elision marker.
 const big = "x".repeat(20000);
 const truncBody = {
-  model: "corti-s1", max_tokens: 16,
+  model: "corti-s1", max_tokens: 16, tools: [ANYTOOL()],
   messages: [
     { role: "assistant", content: [{ type: "tool_use", id: "tb1", name: "run_bash", input: {} }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "tb1", content: big }] },
@@ -177,7 +232,7 @@ check("advisor (openai): large tool result truncated with elision marker", (trun
 process.env.CORTI_ADVISOR_MAX_TOKENS = "768";
 const budgetCap = [];
 await applyIntercepts({
-  model: "corti-s1", max_tokens: 16,
+  model: "corti-s1", max_tokens: 16, tools: [ANYTOOL()],
   messages: [
     { role: "assistant", content: [{ type: "tool_use", id: "bm1", name: "consult_advisor", input: {} }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "bm1", content: "Unknown tool", is_error: true }] },
@@ -201,7 +256,7 @@ check("advisor (openai): no duplicate timing prompt", (String(advBody4.system).m
 let stubCalls = 0;
 const countingStub = async (text) => { stubCalls++; return `stub advice`; };
 const continuationBody = {
-  model: "corti-s1", max_tokens: 16,
+  model: "corti-s1", max_tokens: 16, tools: [ANYTOOL()],
   messages: [
     { role: "user", content: "should I ship this?" },
     { role: "assistant", content: [{ type: "tool_use", id: "tu_adv1", name: "consult_advisor", input: {} }] },
@@ -246,7 +301,7 @@ _resetAdvisorProcessed();
 let a1Calls = 0;
 const a1Stub = async () => { a1Calls++; return `advice ${a1Calls}`; };
 const a1Body = {
-  model: "corti-s1", max_tokens: 16, system: "agent",
+  model: "corti-s1", max_tokens: 16, system: "agent", tools: [ANYTOOL()],
   messages: [
     { role: "user", content: "go" },
     { role: "assistant", content: [{ type: "tool_use", id: "a1_1", name: "consult_advisor", input: {} }] },
@@ -283,6 +338,171 @@ check("A1: no session id still spawns (3)", a1Calls, 3);
 a1Calls = 0;
 await applyIntercepts(JSON.parse(JSON.stringify(a1Body)), { runAdvisor: a1Stub, mode: "openai" });
 check("A1: no session id re-spawns on replay (no cross-request cache)", a1Calls, 3);
+
+// Block G4 — A4: a hold-and-continue consult must survive into later turns. The harness renders
+// the server_tool_use / advisor_tool_result pair but never replays it, so the consult arrives as
+// two adjacent text blocks with the advice excised — and the model reads its own announcement as
+// a promise it never kept (observed: four false "I never actually called the advisor" apologies
+// in one session). recordAdvisorGuidance anchors the advice on the surviving text block; the
+// assistant walk re-inserts it. This is the C6 path fed from the gateway instead of the harness.
+_resetAdvisorGuidance();
+const anchorText = "Let me confirm this with the advisor. Calling it now.";
+const collapsedTurn = () => ({
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [
+    { role: "user", content: "should I ship this?" },
+    // What the harness replays: the two text blocks, consult gone from between them.
+    { role: "assistant", content: [{ type: "text", text: anchorText }, { type: "text", text: "The advisor agrees." }] },
+    { role: "user", content: "did it actually answer?" },
+  ],
+});
+const beforeRecord = await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2" });
+check("A4: nothing re-inserted before the consult is recorded",
+  beforeRecord.request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
+
+recordAdvisorGuidance("sess-a2", { text: anchorText }, "ship it, the tests cover the regression", "tu_consult_1");
+const afterRecord = await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2" });
+const a2Msgs = afterRecord.request.messages;
+// The advice comes back as the tool_result of a call the model made, never as assistant prose:
+// rendered as its own words it read as something it had fabricated, and it told the user so.
+const a2Tool = a2Msgs.find((m) => m.role === "tool" && m.tool_call_id === "tu_consult_1");
+check("A4: the advice returns as a tool result, not as assistant text",
+  a2Tool?.content, "<advisor_guidance>\nship it, the tests cover the regression\n</advisor_guidance>");
+check("A4: no assistant message claims the advice as its own words",
+  a2Msgs.some((m) => m.role === "assistant" && String(m.content).includes("<advisor_guidance>")), false);
+check("A4: the consult is restored as a real tool call the model made",
+  a2Msgs.some((m) => m.role === "assistant" && m.tool_calls?.some((c) => c.id === "tu_consult_1" && c.function.name === "consult_advisor")), true);
+// Position matters: the consult sat between the announcement and the continuation it produced, so
+// the reconstructed call/result pair has to sit there too or the turn reads out of order.
+const a2Order = a2Msgs.map((m) => String(m.content ?? "") + JSON.stringify(m.tool_calls ?? ""));
+const idxCall = a2Order.findIndex((s) => s.includes("tu_consult_1") && s.includes(anchorText));
+const idxResult = a2Msgs.findIndex((m) => m.role === "tool" && m.tool_call_id === "tu_consult_1");
+const idxAfter = a2Order.findIndex((s) => s.includes("The advisor agrees."));
+check("A4: the call sits with the announcement and the result before the continuation",
+  idxCall >= 0 && idxCall < idxResult && idxResult < idxAfter, true);
+// Stability is the A1 prefix-cache requirement: the same history must translate byte-identically
+// on every later turn, or the cached prefix grows and Corti\x27s automatic cache collapses.
+const afterRecord2 = await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2" });
+check("A4: re-insertion is byte-stable across turns",
+  JSON.stringify(afterRecord2.request.messages), JSON.stringify(afterRecord.request.messages));
+// Session isolation: another session must not inherit this session\x27s advice.
+const otherSession = await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2-other" });
+check("A4: another session gets no re-insertion",
+  otherSession.request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
+// A rewind past the consult drops the anchor from history, so nothing is re-inserted — the advice
+// is not smuggled back into a turn the user rewound away from.
+const rewound = await translateRequest({
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [{ role: "user", content: "should I ship this?" }],
+}, { skipAdvisor: true, parentSessionId: "sess-a2" });
+check("A4: a rewind past the anchor re-inserts nothing",
+  rewound.request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
+// A repeated anchor inserts once, not once per occurrence.
+const dupTurn = {
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [
+    { role: "assistant", content: [{ type: "text", text: anchorText }] },
+    { role: "user", content: "and?" },
+    { role: "assistant", content: [{ type: "text", text: anchorText }] },
+  ],
+};
+const dup = await translateRequest(dupTurn, { skipAdvisor: true, parentSessionId: "sess-a2" });
+check("A4: a repeated anchor re-inserts only once",
+  (JSON.stringify(dup.request.messages).match(/advisor_guidance/g) || []).length, 2); // one open + one close tag
+// No session id: no store key, so no re-insertion (same rule as the dedup cache).
+const noSess = await translateRequest(collapsedTurn(), { skipAdvisor: true });
+check("A4: no session id re-inserts nothing",
+  noSess.request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
+recordAdvisorGuidance(undefined, { text: anchorText }, "should not be stored", "tu_x");
+recordAdvisorGuidance("sess-a2-empty", { text: "" }, "should not be stored", "tu_x");
+recordAdvisorGuidance("sess-a2-empty", null, "should not be stored", "tu_x");
+recordAdvisorGuidance("sess-a2-empty", { text: anchorText }, "should not be stored");
+check("A4: an empty anchor is not recorded",
+  (await translateRequest(collapsedTurn(), { skipAdvisor: true, parentSessionId: "sess-a2-empty" }))
+    .request.messages.some((m) => String(m.content).includes("<advisor_guidance>")), false);
+
+// A consult the model followed straight with a tool call has no prose on either side. The tool_use
+// id anchors it — ids round-trip because tool_result pairing depends on them — and the advice
+// belongs *before* that call, since that is where the consult ran.
+_resetAdvisorGuidance();
+const toolTurn = () => ({
+  model: "corti-s1", max_tokens: 16, system: "agent",
+  messages: [
+    { role: "user", content: "check this" },
+    { role: "assistant", content: [{ type: "tool_use", id: "tu_after_advice", name: "run_bash", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_after_advice", content: "done" }] },
+  ],
+});
+recordAdvisorGuidance("sess-a4-tool", { toolUseId: "tu_after_advice", before: true }, "read the file first", "tu_consult_2");
+const toolAnchored = await translateRequest(toolTurn(), { skipAdvisor: true, parentSessionId: "sess-a4-tool" });
+const a4Msgs = toolAnchored.request.messages;
+check("A4: a tool_use id anchors a consult with no prose around it",
+  a4Msgs.find((m) => m.role === "tool" && m.tool_call_id === "tu_consult_2")?.content,
+  "<advisor_guidance>\nread the file first\n</advisor_guidance>");
+// The consult ran before the tool call it advised, so its pair must be resolved before that call
+// is issued — a tool_call left open across another call is an invalid history.
+const a4CallIdx = a4Msgs.findIndex((m) => m.tool_calls?.some((c) => c.id === "tu_consult_2"));
+const a4ResIdx = a4Msgs.findIndex((m) => m.role === "tool" && m.tool_call_id === "tu_consult_2");
+const a4AdvisedIdx = a4Msgs.findIndex((m) => m.tool_calls?.some((c) => c.id === "tu_after_advice"));
+check("A4: the consult resolves before the call it advised",
+  a4CallIdx >= 0 && a4CallIdx < a4ResIdx && a4ResIdx < a4AdvisedIdx, true);
+check("A4: the tool call it advised still round-trips",
+  a4Msgs[a4AdvisedIdx]?.tool_calls?.[0]?.id, "tu_after_advice");
+check("A4: every tool_call still has its result (no dangling pair)",
+  (toolAnchored.dropped || []).some((d) => d.includes("dangling") || d.includes("placeholder")), false);
+// The restored pair looks exactly like a consult awaiting a rewrite, so it must never reach
+// interceptConsultAdvisor: buildToolUseMap runs inside applyIntercepts, and the hold-and-continue
+// path never fills advisorProcessedBySession, so the dedup cache would not catch the re-spawn.
+// This holds only because restoreAdvisorGuidance runs after applyIntercepts — keep that order.
+let restoreSpawns = 0;
+_resetAdvisorProcessed();
+recordAdvisorGuidance("sess-a4-spawn", { text: "Consulting." }, "prior advice", "tu_consult_3");
+await translateRequest({
+  model: "corti-s1", max_tokens: 16, system: "agent", tools: [ANYTOOL()],
+  messages: [{ role: "assistant", content: [{ type: "text", text: "Consulting." }] }, { role: "user", content: "go on" }],
+}, { mode: "openai", parentSessionId: "sess-a4-spawn", runAdvisor: async () => { restoreSpawns++; return "fresh"; } });
+check("A4: a restored consult does not spawn the advisor again", restoreSpawns, 0);
+
+// Block G5 — the advisor intercept skips a request with no tools. Those are the harness one-shot
+// side calls (summarise a fetched page, title a chat); they cannot act on advice, and in one
+// measured session 6 of 7 consults came from them, spending 50s of Opus-tier advisor time.
+let toollessCalls = 0;
+const toollessStub = async () => { toollessCalls++; return "advice"; };
+const toollessBody = () => ({
+  model: "corti-s1", max_tokens: 16, system: "summarise this",
+  messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "tl1", name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tl1", content: "Unknown tool", is_error: true }] },
+  ],
+});
+const noTools = toollessBody();
+await applyIntercepts(noTools, { runAdvisor: toollessStub, mode: "openai" });
+check("G5: a request with no tools does not spawn the advisor", toollessCalls, 0);
+check("G5: and gets no tool def injected", Boolean(noTools.tools?.length), false);
+check("G5: and its system prompt is untouched", noTools.system, "summarise this");
+const emptyTools = { ...toollessBody(), tools: [] };
+await applyIntercepts(emptyTools, { runAdvisor: toollessStub, mode: "openai" });
+check("G5: an empty tools array counts as no tools", toollessCalls, 0);
+const withTools = { ...toollessBody(), tools: [ANYTOOL()] };
+await applyIntercepts(withTools, { runAdvisor: toollessStub, mode: "openai" });
+check("G5: one real tool is enough to reach the advisor", toollessCalls, 1);
+
+// The stream translator\x27s lastText is the gateway\x27s anchor source: it must hold the newest text
+// block verbatim, and reset at each new block so a consult anchors on its own announcement.
+const ltEvents = [];
+const lt = createStreamTranslator({}, (e, d) => ltEvents.push([e, d]));
+lt.feed({ choices: [{ index: 0, delta: { content: "first " } }] });
+lt.feed({ choices: [{ index: 0, delta: { content: "block" } }] });
+check("A4: lastText accumulates a text block", lt.lastText, "first block");
+lt.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "t1", type: "function", function: { name: "run_bash", arguments: "{}" } }] } }] });
+lt.feed({ choices: [{ index: 0, delta: { content: "second" } }] });
+check("A4: lastText resets on a new text block", lt.lastText, "second");
+check("A4: firstBlock keeps the first block, not the newest", JSON.stringify({ ...lt.firstBlock, index: undefined }), JSON.stringify({ type: "text", index: undefined, text: "first block" }));
+// A continuation that opens on a tool call exposes that id as the anchor.
+const lt2 = createStreamTranslator({}, () => {});
+lt2.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "tu_first", type: "function", function: { name: "run_bash", arguments: "{}" } }] } }] });
+lt2.feed({ choices: [{ index: 0, delta: { content: "after the call" } }] });
+check("A4: firstBlock reports a leading tool call by id", JSON.stringify(lt2.firstBlock), JSON.stringify({ type: "tool", id: "tu_first" }));
 
 // Block H — C6: prior-turn advisor advice round-trips into history instead of being dropped.
 // advisor_tool_result is NOT in SERVER_BLOCK_TYPES (only server_tool_use is); before the fix it
@@ -383,7 +603,7 @@ check("advisor C2: no advisorEffort leaves adaptive→medium untouched", noOverr
 // consult_advisor tool_use, so injection is the only observable: tools.some(name match).
 // applyIntercepts mutates the body in place and returns diagnostics, so run it on a fresh
 // body and read tools off the body, not the return value.
-const gateBody = () => ({ model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }] });
+const gateBody = () => ({ model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }], tools: [ANYTOOL()] });
 const injected = (b) => Boolean(b.tools?.some((t) => t?.name === "consult_advisor"));
 const runGate = async (opts) => { const b = gateBody(); await applyIntercepts(b, opts); return b; };
 

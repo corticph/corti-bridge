@@ -370,6 +370,18 @@ _d_check_gateway() {
                     ;;
             esac
         fi
+        # The gateway holds its source in memory from boot, so a pulled update is not live until
+        # something restarts it. build_id comes from the wrapper, which sources this file.
+        if command -v build_id >/dev/null 2>&1; then
+            case "$_d_health" in
+                *"\"buildId\":\"$(build_id)\""*) ;;
+                *)
+                    _d_report WARN gateway "running an older build than the clone on disk" \
+                        "A corti-bridge launch will auto-restart it. $_d_sub"
+                    return 0
+                    ;;
+            esac
+        fi
         _d_report OK gateway "healthy on :$_d_PORT ($_d_sub)" \
             "Clone not confirmed from health alone (see proxy-dir + process checks)."
     fi
@@ -378,6 +390,45 @@ _d_check_gateway() {
 # Check 15 — THE DUAL-CLONE CHECK: wrapper's baked PROXY_DIR vs running
 # gateway's clone. Mismatch = warn. Cannot catch CORTI_PROXY_DIR runtime overrides
 # or hand-started gateways (stated in the limits footer).
+# Check 14b - newer commits on origin/main. Passive: reports what the last background fetch
+# already pulled down, and never reaches the network itself, so `doctor` stays offline-safe.
+_d_check_update() {
+    if [ ! -d "$PROXY_DIR/.git" ]; then
+        _d_report OK update "not a git clone - update check does not apply"
+        return 0
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        _d_report OK update "git not on PATH - update check disabled"
+        return 0
+    fi
+    _d_branch="$(git -C "$PROXY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+    # An empty read means git could not answer at all; reporting OK for it would print
+    # "on branch ''" and pass, which reads like a real branch on a healthy clone.
+    if [ -z "$_d_branch" ]; then
+        _d_report WARN update "could not read the git branch - update check skipped" \
+            "Check the clone: git -C \"$PROXY_DIR\" status"
+        return 0
+    fi
+    if [ "$_d_branch" != main ]; then
+        _d_report OK update "on branch '$_d_branch' - not compared against origin/main"
+        return 0
+    fi
+    _d_behind="$(git -C "$PROXY_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo '')"
+    case "$_d_behind" in
+        ''|*[!0-9]*)
+            _d_report WARN update "no origin/main ref yet - nothing fetched to compare against" \
+                "Run: git -C \"$PROXY_DIR\" fetch origin main"
+            return 0
+            ;;
+    esac
+    if [ "$_d_behind" -gt 0 ]; then
+        _d_report WARN update "$_d_behind commit(s) behind origin/main" \
+            "Update: cd \"$PROXY_DIR\" && git pull && ./setup.sh"
+    else
+        _d_report OK update "up to date with the last fetch of origin/main"
+    fi
+}
+
 _d_check_dual_clone() {
     if [ -n "$_d_baked" ] && [ -n "$_d_run_clone" ]; then
         if [ "$_d_baked" = "$_d_run_clone" ]; then
@@ -566,6 +617,7 @@ EOF
     _d_check_profile_env
     _d_check_pid_file
     _d_check_gateway
+    _d_check_update
     _d_check_dual_clone
     _d_check_processes
     _d_check_pid_files

@@ -23,6 +23,28 @@ const SERVER_BLOCK_TYPES = new Set([
 
 const WEBSEARCH_TOOL_NAMES = new Set(["web_search", "WebSearch"]);
 
+/** Per-session cache: WebSearch tool_use id -> formatted results. A past turn's tool_result is
+ *  what the model already reasoned about, so it must not change: re-running the search each turn
+ *  rewrote history bytes mid-conversation and collapsed Corti's prefix cache (A1). No session id →
+ *  throwaway map, same rule as the advisor dedup. */
+const WEBSEARCH_CACHE_CAP = 64;
+const WEBSEARCH_CACHE_PER_SESSION = 128;
+const webSearchBySession = new Map();
+
+function webSearchCacheMap(sessionId) {
+  if (!sessionId) return new Map();
+  let map = webSearchBySession.get(sessionId);
+  if (!map) {
+    if (webSearchBySession.size >= WEBSEARCH_CACHE_CAP)
+      webSearchBySession.delete(webSearchBySession.keys().next().value);
+    map = new Map();
+    webSearchBySession.set(sessionId, map);
+  }
+  return map;
+}
+
+export function _resetWebSearchCache() { webSearchBySession.clear(); }
+
 export class TranslateRejection extends Error {
   constructor(status, envelope) {
     super(envelope.error.message);
@@ -263,6 +285,92 @@ function advisorProcessedMap(sessionId) {
 }
 
 export function _resetAdvisorProcessed() { advisorProcessedBySession.clear(); }
+
+/** Per-session record of answered consults, keyed by a block that survives beside each one. The
+ *  harness renders the server_tool_use / advisor_tool_result pair but never replays it, so without
+ *  this the model reads its own "calling the advisor now" as a promise it never kept. */
+const ADVISOR_GUIDANCE_CAP = 64;
+const ADVISOR_GUIDANCE_PER_SESSION = 32;
+const advisorGuidanceBySession = new Map();
+
+// Anchor is `{ text }` or `{ toolUseId }` (ids round-trip because tool_result pairing needs them,
+// so they cover a consult followed straight by a tool call); `before` says which side it sat on.
+export function recordAdvisorGuidance(sessionId, anchor, advice, consultId) {
+  const key = anchor?.toolUseId ? `u:${anchor.toolUseId}`
+    : anchor?.text ? `t:${anchor.text}`
+    : "";
+  if (!sessionId || !key || !advice || !consultId) return;
+  let map = advisorGuidanceBySession.get(sessionId);
+  if (!map) {
+    if (advisorGuidanceBySession.size >= ADVISOR_GUIDANCE_CAP)
+      advisorGuidanceBySession.delete(advisorGuidanceBySession.keys().next().value);
+    map = new Map();
+    advisorGuidanceBySession.set(sessionId, map);
+  }
+  if (map.size >= ADVISOR_GUIDANCE_PER_SESSION) map.delete(map.keys().next().value);
+  map.set(key, { advice, before: !!anchor.before, consultId });
+}
+
+// Put a session's consults back where the harness excised them. Both readers go through this: an
+// advisor shown the excised history corroborates the executor's false "I never called it".
+export function restoreAdvisorGuidance(sessionId, messages) {
+  if (!Array.isArray(messages)) return messages ?? [];
+  const store = sessionId ? advisorGuidanceBySession.get(sessionId) : null;
+  if (!store?.size) return messages;
+  // One insertion per recorded consult, even if its anchor repeats in the history.
+  const used = new Set();
+  const out = [];
+  for (const msg of messages) {
+    if (msg?.role !== "assistant") {
+      out.push(msg);
+      continue;
+    }
+    let acc = [];
+    let split = false;
+    // Close the assistant message on the consult's own tool_use and answer it with a tool_result,
+    // which is the shape the continuation already sends. Rendering the advice as assistant text
+    // instead made the model read advice it had no memory of writing as its own fabrication, and
+    // tell the user it had faked the consult.
+    const emitConsult = (rec) => {
+      acc.push({ type: "tool_use", id: rec.consultId, name: ADVISOR_TOOL_NAME, input: {} });
+      out.push({ ...msg, content: acc });
+      out.push({
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: rec.consultId,
+          content: advisorGuidanceText(rec.advice),
+        }],
+      });
+      acc = [];
+      split = true;
+    };
+    for (const b of blocksOf(msg.content)) {
+      const key = b?.type === "text" && typeof b.text === "string" ? `t:${b.text}`
+        : b?.type === "tool_use" && typeof b.id === "string" ? `u:${b.id}`
+        : null;
+      const rec = key && !used.has(key) ? store.get(key) : null;
+      if (!rec) {
+        acc.push(b);
+        continue;
+      }
+      used.add(key);
+      if (rec.before) {
+        emitConsult(rec);
+        acc.push(b);
+      } else {
+        acc.push(b);
+        emitConsult(rec);
+      }
+    }
+    if (acc.length) out.push({ ...msg, content: acc });
+    else if (!split) out.push(msg);
+  }
+  return out;
+}
+
+export function _resetAdvisorGuidance() { advisorGuidanceBySession.clear(); }
+
 // Empty input_schema: the executor signals *timing only*. Letting it write a query loses
 // exactly the detail the advisor is there to catch — the harness forwards the full transcript
 // automatically (see serializeAdvisorInput). `additionalProperties: false` matters: models
@@ -401,6 +509,10 @@ export function runAdvisor(text, opts = {}) {
 // `runAdvisor` param that shadows the export, so this alias is how the fallback reaches it.
 const defaultRunAdvisor = runAdvisor;
 
+// Unshadowed reference for interceptWebSearch, which takes an injectable `webSearch` so tests
+// stay offline.
+const defaultWebSearch = webSearch;
+
 // The executor-side timing + advice-weight block, read once from disk and cached. Prepended to
 // the executor's system prompt whenever the advisor tool is injected, so the executor calls at
 // the official cadence (before substantive work, before declaring done). From
@@ -494,18 +606,27 @@ async function interceptModelMapping(body) {
   return [`model mapped: ${orig} → ${mapped}`];
 }
 
-async function interceptWebSearch(body, { toolUseMap }) {
+async function interceptWebSearch(body, { toolUseMap, parentSessionId, webSearch, webSearchCache } = {}) {
   const diagnostics = [];
+  const search = webSearch || defaultWebSearch;
+  const cached = webSearchCache ?? webSearchCacheMap(parentSessionId);
   for (const msg of body.messages ?? []) {
     if (msg?.role !== "user" || !Array.isArray(msg.content)) continue;
     for (const b of msg.content) {
       if (b?.type !== "tool_result") continue;
       const toolUse = toolUseMap.get(b.tool_use_id);
       if (!toolUse || !WEBSEARCH_TOOL_NAMES.has(toolUse.name) || !toolUse.input?.query) continue;
-      const results = await webSearch(toolUse.input.query);
+      const hit = cached.get(b.tool_use_id);
+      if (hit !== undefined) {
+        b.content = hit;
+        continue;
+      }
+      const results = await search(toolUse.input.query);
       const formatted = formatSearchResults(toolUse.input.query, results);
       if (formatted) {
         b.content = formatted;
+        if (cached.size >= WEBSEARCH_CACHE_PER_SESSION) cached.delete(cached.keys().next().value);
+        cached.set(b.tool_use_id, formatted);
         diagnostics.push(`web_search intercepted: "${toolUse.input.query.slice(0, 60)}" → ${results.length} results`);
       }
     }
@@ -548,6 +669,9 @@ function advisorWanted(mode, skipAdvisor) {
 // dependency is injectable via ctx so tests stay hermetic (no child_process spawn).
 async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor, mode, parentSessionId, advisorProcessed } = {}) {
   if (!advisorWanted(mode, skipAdvisor)) return [];
+  // No tools means no next action to steer — a one-shot side call (summarise a page, title a
+  // chat), not an agent loop. Measured: 6 of 7 consults in one session, 50s of Opus time wasted.
+  if (!Array.isArray(body.tools) || body.tools.length === 0) return [];
   const diagnostics = [];
 
   // (a) inject the tool def so the model sees it (idempotent — don't push if present)
@@ -587,7 +711,12 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
         diagnostics.push(`advisor cached: id=${b.tool_use_id} (no re-spawn)`);
         continue;
       }
-      const { text, elidedCount } = serializeAdvisorInput(body, { maxTokens: advisorMaxTokens() });
+      // Restored history: see restoreAdvisorGuidance — an advisor shown the excised version
+      // corroborates the false confession instead of correcting it.
+      const { text, elidedCount } = serializeAdvisorInput(
+        { ...body, messages: restoreAdvisorGuidance(parentSessionId, body.messages) },
+        { maxTokens: advisorMaxTokens() },
+      );
       const out = await call(text, { parentSessionId });
       // A bare string is a test stub (backward compat) — treat as success.
       const res = typeof out === "string" ? { ok: true, text: out } : out;
@@ -722,6 +851,8 @@ export async function translateRequest(body, opts) {
 
   const messages = [];
   let pendingCalls = [];
+  // Consults this session already made, put back before anything walks the history.
+  const history = restoreAdvisorGuidance(opts?.parentSessionId, body.messages);
 
   const flushPending = () => {
     for (const id of pendingCalls) {
@@ -735,7 +866,7 @@ export async function translateRequest(body, opts) {
     pendingCalls = [];
   };
 
-  for (const msg of body.messages) {
+  for (const msg of history) {
     if (!msg || typeof msg !== "object") continue;
 
     // Mid-conversation role:system messages are harness-injected reminders (task-tool nudges,
@@ -912,7 +1043,9 @@ export async function translateRequest(body, opts) {
   );
 
   // Convert WebSearch to a function tool so the call is schemaed; the proxy
-  // intercepts the tool_result next turn to inject real search results.
+  // intercepts the tool_result next turn to inject real search results. Only when the client's own
+  // WebSearch was schemaless and got filtered out above — this harness sends a schemaed one, and
+  // pushing ours alongside it put two tools of the same name in the upstream array.
   const hasWebSearch = allTools.some(
     (t) =>
       t &&
@@ -920,7 +1053,7 @@ export async function translateRequest(body, opts) {
       (WEBSEARCH_TOOL_NAMES.has(t.name) ||
         (typeof t.type === "string" && t.type.startsWith("web_search"))),
   );
-  if (hasWebSearch) {
+  if (hasWebSearch && !tools.some((t) => WEBSEARCH_TOOL_NAMES.has(t.name))) {
     tools.push({
       name: "WebSearch",
       description: "Search the web for current information.",
@@ -1182,6 +1315,9 @@ function anthropicUsage(usage) {
 }
 
 export function translateCompletion(completion, ctx) {
+  // The only place upstream's own prompt_tokens surfaces off the streaming path; the gateway
+  // calibrates the estimate it reports for the session's next turn against it.
+  ctx?.onPromptTokens?.(completion?.usage?.prompt_tokens);
   const choice = completion?.choices?.[0] ?? {};
   const message = choice.message ?? {};
   const reasoning = message.reasoning ?? message.reasoning_content;
@@ -1239,6 +1375,9 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
   let terminated = false;
   let latestUsage = null;
   let outputChars = 0;
+  // Anchor sources for a consult's advice; must match the client's history byte for byte.
+  let lastText = "";
+  let firstBlock = null; // { type:"text", text } | { type:"tool", id }
   let advisorToolUse = null; // { id, name, args } when the turn ends on a consult_advisor tool_use
 
   const closeOpen = () => {
@@ -1308,8 +1447,14 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
 
   const textDelta = (text) => {
     if (!text) return;
-    if (open?.kind !== "text") openBlock("text", { type: "text", text: "" });
+    if (open?.kind !== "text") {
+      openBlock("text", { type: "text", text: "" });
+      lastText = "";
+      if (!firstBlock) firstBlock = { type: "text", index: open.index, text: "" };
+    }
     outputChars += text.length;
+    lastText += text;
+    if (firstBlock?.type === "text" && firstBlock.index === open.index) firstBlock.text += text;
     emit("content_block_delta", {
       type: "content_block_delta",
       index: open.index,
@@ -1337,6 +1482,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
           toolBlocks.set(idx, { blockIndex: -1, closed: true, name, id, args: "" });
         } else {
           openBlock("tool", { type: "tool_use", id, name, input: {} });
+          if (!firstBlock) firstBlock = { type: "tool", id };
           toolBlocks.set(idx, { blockIndex: open.index, closed: false, name, id, args: "" });
         }
       }
@@ -1390,6 +1536,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
 
   const usageEvent = (usage) => {
     latestUsage = usage;
+    ctx.onPromptTokens?.(usage?.prompt_tokens);
   };
 
   const emitDeltaEvent = () => {
@@ -1470,6 +1617,13 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
     },
     get nextBlockIndex() {
       return nextBlockIndex;
+    },
+    // Anchors for re-inserting a consult's advice into later turns (see recordAdvisorGuidance).
+    get lastText() {
+      return lastText;
+    },
+    get firstBlock() {
+      return firstBlock;
     },
     // Close whatever block is still open (emitting the thinking signature first, when that is
     // what is open) so a caller can append its own block at nextBlockIndex without nesting.

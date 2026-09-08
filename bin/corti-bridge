@@ -73,6 +73,16 @@ gateway_stop() {
     return 0
 }
 
+# Fingerprint of the source the gateway actually loads: the two entry modules, every lib module
+# they import, and the advisor prompt files (read at runtime and cached, so a change needs a
+# restart too). Deliberately a shade broader than the import graph — an extra restart costs a
+# second, a missed one serves stale code. cksum is POSIX; the value is opaque and only ever
+# compared against itself, so the algorithm doesn't matter as long as one side owns it.
+build_id() {
+    cat "$PROXY_DIR/gateway.mjs" "$PROXY_DIR/translate.mjs" \
+        "$PROXY_DIR"/lib/*.mjs "$PROXY_DIR"/lib/*.txt 2>/dev/null | cksum | cut -d' ' -f1
+}
+
 # Start the gateway and wait for it to answer health. Caller has already confirmed creds.
 gateway_start() {
     # An uninstalled wrapper still holds the placeholder path; say so instead of polling for 20s.
@@ -81,7 +91,7 @@ gateway_start() {
         echo "corti-bridge: run ./setup.sh from your clone to install the wrapper, or set CORTI_PROXY_DIR to the clone path" >&2
         exit 1
     fi
-    nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 &
+    CORTI_BUILD_ID="$(build_id)" nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 &
     # Temp-then-move so a concurrent reader never sees a half-written pid.
     printf '%s' "$!" > "$PID_FILE.tmp" && mv "$PID_FILE.tmp" "$PID_FILE"
     i=1
@@ -91,6 +101,81 @@ gateway_start() {
         i=$((i + 1))
     done
     return 1
+}
+
+# Update check. A clone is the only documented install and setup.sh bakes its path into
+# PROXY_DIR, so "is there a newer version" is a local git question: no API token, no rate limit,
+# and it follows a fork instead of hardcoding one upstream. There are no tags, so the honest unit
+# is commits-behind-main.
+UPDATE_STAMP_FILE="$CORTI_DIR/update.checked"
+UPDATE_INTERVAL_S="${CORTI_UPDATE_INTERVAL_S:-86400}"
+
+# True for a `-p`/`--print` run, whose output belongs to whoever called it — the advisor child's
+# is parsed as its answer. Such a run gets no notice and triggers no fetch.
+update_is_print_mode() {
+    for _u_arg in "$@"; do
+        case "$_u_arg" in
+            -p|--print) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Off for the advisor child (CORTI_NO_MANAGE_GATEWAY), print runs, and any install that isn't a
+# git clone — there is nothing to compare against and nothing to pull. Also off anywhere but
+# main: "behind origin/main" is not a statement about someone's working branch, and a developer
+# in their own clone should never be told to pull.
+update_enabled() {
+    if [ "${CORTI_NO_UPDATE_CHECK:-}" = 1 ]; then return 1; fi
+    if [ "${CORTI_NO_MANAGE_GATEWAY:-}" = 1 ]; then return 1; fi
+    if update_is_print_mode "$@"; then return 1; fi
+    if [ ! -d "$PROXY_DIR/.git" ]; then return 1; fi
+    if ! command -v git >/dev/null 2>&1; then return 1; fi
+    if [ "$(git -C "$PROXY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')" != main ]; then
+        return 1
+    fi
+    return 0
+}
+
+# Refresh in the background and never on the launch path's clock — what it fetches is read on the
+# NEXT launch. Stamped before the fetch so a failing network backs off too.
+update_refresh() {
+    if ! update_enabled "$@"; then return 0; fi
+    _u_now="$(date +%s 2>/dev/null || echo 0)"
+    case "$_u_now" in ''|*[!0-9]*|0) return 0 ;; esac
+    _u_last=0
+    if [ -f "$UPDATE_STAMP_FILE" ]; then
+        _u_last="$(cat "$UPDATE_STAMP_FILE" 2>/dev/null || echo 0)"
+        case "$_u_last" in ''|*[!0-9]*) _u_last=0 ;; esac
+    fi
+    if [ $((_u_now - _u_last)) -lt "$UPDATE_INTERVAL_S" ]; then return 0; fi
+    printf '%s' "$_u_now" > "$UPDATE_STAMP_FILE" 2>/dev/null || true
+    git -C "$PROXY_DIR" fetch --quiet origin main >/dev/null 2>&1 &
+}
+
+# Commits between the checkout and the last-fetched origin/main. Counted here rather than cached
+# by the fetch: it reads local refs only, so it costs nothing on the launch path and — the reason
+# it matters — it drops to zero the moment the user pulls, instead of nagging with a stale count
+# until the next background refresh. Returns 1 when there is nothing to say.
+update_behind() {
+    if ! update_enabled "$@"; then return 1; fi
+    _u_n="$(git -C "$PROXY_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo '')"
+    case "$_u_n" in ''|*[!0-9]*) return 1 ;; esac
+    if [ "$_u_n" -le 0 ]; then return 1; fi
+    printf '%s' "$_u_n"
+}
+
+# Printed after the session rather than before it: the wrapper hands the terminal to Claude Code,
+# which repaints it, so a notice written on the way in is gone before anyone can read it. No
+# `corti-bridge restart` in the command — pulling changes the build fingerprint, so the next
+# launch restarts the gateway on its own.
+update_notice() {
+    if [ -z "${1:-}" ]; then return 0; fi
+    _u_s=s
+    if [ "$1" = 1 ]; then _u_s=""; fi
+    echo "" >&2
+    echo "corti-bridge: $1 new commit$_u_s on main." >&2
+    echo "  cd \"$PROXY_DIR\" && git pull && ./setup.sh" >&2
 }
 
 # --stop / --restart bypass the credential and claude-installed guards: --stop needs
@@ -322,6 +407,16 @@ if [ -n "$health" ]; then
         *'"upstream":'*)
             if [ -z "$restart_reason" ]; then restart_reason="CORTI_BASE_URL changed"; fi ;;
     esac
+    # The gateway loads its source once, at boot, so after a `git pull` it keeps serving the old
+    # code until something restarts it — the update looks applied but isn't. A null buildId is a
+    # gateway this wrapper didn't start (hand-run, or one predating this check); restarting it is
+    # the same call the missing-gatewayVersion branch above makes. Hand-started gateways that
+    # should survive a launch already have CORTI_NO_MANAGE_GATEWAY=1.
+    case "$health" in
+        *"\"buildId\":\"$(build_id)\""*) ;;
+        *)
+            if [ -z "$restart_reason" ]; then restart_reason="gateway is running an older build"; fi ;;
+    esac
     if [ -n "$restart_reason" ]; then
         echo "corti-bridge: $restart_reason — restarting gateway..." >&2
         if ! gateway_stop; then
@@ -339,6 +434,8 @@ if ! gateway_is_ours "$(gateway_health)"; then
 fi
 
 fi  # CORTI_NO_MANAGE_GATEWAY
+
+update_refresh "$@"
 
 if [ "$want_debug" = 1 ]; then
     log_path="$(gateway_health | sed -n 's/.*"debug":"\([^"]*\)".*/\1/p')"
@@ -404,4 +501,13 @@ export CLAUDE_CODE_DISABLE_1M_CONTEXT=1
 export CLAUDE_CODE_DISABLE_ARTIFACT=1
 unset CLAUDE_CODE_ENABLE_DESIGN_SYNC
 
+# exec is the normal path: the wrapper's job is done and it should get out of the way. It is
+# given up only when a notice is waiting, because printing one means outliving the session.
+_u_behind="$(update_behind "$@" || true)"
+if [ -n "$_u_behind" ]; then
+    _u_status=0
+    CLAUDE_CONFIG_DIR="$profile_dir" claude "$@" || _u_status=$?
+    update_notice "$_u_behind"
+    exit "$_u_status"
+fi
 CLAUDE_CONFIG_DIR="$profile_dir" exec claude "$@"

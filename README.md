@@ -48,7 +48,22 @@ corti-bridge help            # full reference
 corti-bridge --anthropic     # pass-through mode (escape hatch; some features unavailable)
 ```
 
-The gateway runs on `127.0.0.1:4192` and outlives any single session; the wrapper auto-restarts it when stale (moved base URL, old build).
+The gateway runs on `127.0.0.1:4192` and outlives any single session; the wrapper auto-restarts it when stale (moved base URL, changed source).
+
+&nbsp;
+
+## Staying up to date
+
+`corti-bridge` checks once a day whether `main` has moved, and tells you at the end of a session:
+
+```
+corti-bridge: 3 new commits on main.
+  cd ~/corti-bridge && git pull && ./setup.sh
+```
+
+There is no restart step — pulling changes the gateway's source, and the next launch picks it up automatically. `corti-bridge doctor` reports the same thing on demand.
+
+The check is a `git fetch` against the clone's own origin — no account, no telemetry, nothing sent anywhere. Set `CORTI_NO_UPDATE_CHECK=1` to turn it off; it is already off on any branch but `main`.
 
 &nbsp;
 
