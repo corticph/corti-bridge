@@ -1016,7 +1016,9 @@ export async function translateRequest(body, opts) {
   );
 
   // Convert WebSearch to a function tool so the call is schemaed; the proxy
-  // intercepts the tool_result next turn to inject real search results.
+  // intercepts the tool_result next turn to inject real search results. Only when the client's own
+  // WebSearch was schemaless and got filtered out above — this harness sends a schemaed one, and
+  // pushing ours alongside it put two tools of the same name in the upstream array.
   const hasWebSearch = allTools.some(
     (t) =>
       t &&
@@ -1024,7 +1026,7 @@ export async function translateRequest(body, opts) {
       (WEBSEARCH_TOOL_NAMES.has(t.name) ||
         (typeof t.type === "string" && t.type.startsWith("web_search"))),
   );
-  if (hasWebSearch) {
+  if (hasWebSearch && !tools.some((t) => WEBSEARCH_TOOL_NAMES.has(t.name))) {
     tools.push({
       name: "WebSearch",
       description: "Search the web for current information.",

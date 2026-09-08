@@ -62,6 +62,20 @@ const wsTools = (await translateRequest({
 })).request.tools;
 check("websearch: converted to function tool", wsTools?.length === 1 && wsTools[0]?.function?.name === "WebSearch", true);
 
+// The harness sends a schemaed WebSearch of its own alongside the server-side one. That survives
+// the filter, so pushing the synthetic replacement too put two tools of the same name upstream.
+const wsBoth = (await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }],
+  tools: [
+    { type: "web_search_20250305", name: "web_search", max_uses: 5 },
+    { name: "WebSearch", description: "harness own", input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
+  ],
+})).request.tools;
+check("websearch: the harness own tool is not duplicated",
+  wsBoth.filter((t) => t.function?.name === "WebSearch").length, 1);
+check("websearch: and it is the harness description that survives",
+  wsBoth.find((t) => t.function?.name === "WebSearch")?.function?.description, "harness own");
+
 // A past turn\x27s tool_result is what the model already reasoned about, so it must not change.
 // Re-running the search every turn rewrote history bytes mid-conversation and collapsed the
 // prefix cache: measured 4 collapses and 2 watchdog kills in one session, 132 searches for 2
