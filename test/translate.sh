@@ -8,7 +8,7 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
-import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache } from "'"$REPO"'/translate.mjs";
+import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache, _resetImageCache } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 
 let failed = 0;
@@ -793,6 +793,170 @@ const d1pres = translateCompletion({
   usage: { prompt_tokens: 1, completion_tokens: 1 },
 }, d1ctx);
 check("D1: present tool_call id preserved", d1pres.content[0].id, "call_abc");
+
+// --- Image intercept: a non-multimodal primary (corti-s1) gets image blocks replaced with a
+// text description from a sighted side model, so Corti doesn\x27t 400 "not a multimodal model" and
+// kill the session. Capability-driven: a sighted model passes images through untouched. Cached
+// per image so the description is byte-identical across turns (A1 prefix cache stability).
+_resetImageCache();
+let describeCalls = 0;
+const describeStub = async (block) => { describeCalls++; return { ok: true, text: "a red square on white" }; };
+const imgFailStub = async (block) => { describeCalls++; return { ok: false, code: "timeout" }; };
+const blind = new Set(); // empty → no model is sighted → all described
+const sighted = new Set(["corti-s1-mini", "corti-s1-mini-instant"]);
+
+const imgTurn = (model) => ({
+  model, max_tokens: 16, messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "r1", name: "Read", input: { file_path: "x.png" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "r1", content: [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBOR" } },
+    ] }] },
+  ],
+});
+
+// Blind model: image block replaced with described text, describe called once.
+const b1 = imgTurn("corti-s1");
+describeCalls = 0;
+await applyIntercepts(b1, { describeImage: describeStub, imageModels: blind, parentSessionId: "s1" });
+check("image: blind model describes the image", describeCalls, 1);
+check("image: blind model replaces image block with text", b1.messages[1].content[0].content[0].type, "text");
+check("image: described text carries the complete-description prefix", b1.messages[1].content[0].content[0].text.startsWith("[complete visual description of the image"), true);
+check("image: described text tells the model to work from it", b1.messages[1].content[0].content[0].text.includes("work from this"), true);
+check("image: described text notes a re-read returns the same description", b1.messages[1].content[0].content[0].text.includes("re-reading the file returns this same description"), true);
+
+// Sighted model: passthrough, describe NOT called, image block untouched.
+const s1 = imgTurn("corti-s1-mini");
+describeCalls = 0;
+await applyIntercepts(s1, { describeImage: describeStub, imageModels: sighted, parentSessionId: "s2" });
+check("image: sighted model does not describe", describeCalls, 0);
+check("image: sighted model keeps the image block", s1.messages[1].content[0].content[0].type, "image");
+
+// Cache: same image across two turns (same session) → describe once, byte-identical.
+const c1 = imgTurn("corti-s1");
+const c2 = imgTurn("corti-s1");
+describeCalls = 0;
+await applyIntercepts(c1, { describeImage: describeStub, imageModels: blind, parentSessionId: "sc" });
+const firstDesc = c1.messages[1].content[0].content[0].text;
+await applyIntercepts(c2, { describeImage: describeStub, imageModels: blind, parentSessionId: "sc" });
+check("image: a historical image is described once, not once per turn", describeCalls, 1);
+check("image: the description is byte-identical across turns", c2.messages[1].content[0].content[0].text, firstDesc);
+
+// Session isolation: another session re-describes (no cross-session cache).
+const c3 = imgTurn("corti-s1");
+await applyIntercepts(c3, { describeImage: describeStub, imageModels: blind, parentSessionId: "other" });
+check("image: another session does not read this one\x27s cache", describeCalls, 2);
+
+// Two images in one tool_result: each gets its own description (the cache key must include the
+// data hash, not just the shared tool_use_id — else the second would get the first\x27s description).
+let multiCall = 0;
+const multiStub = async (block) => { multiCall++; return { ok: true, text: `desc ${block.source.data}` }; };
+const multi = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "m1", name: "Read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "m1", content: [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "BBBB" } },
+    ] }] },
+  ],
+};
+await applyIntercepts(multi, { describeImage: multiStub, imageModels: blind, parentSessionId: "sm" });
+check("image: two images in one tool_result are both described", multiCall, 2);
+check("image: first image gets its own description", multi.messages[1].content[0].content[0].text.includes("desc AAAA"), true);
+check("image: second image gets its own description", multi.messages[1].content[0].content[1].text.includes("desc BBBB"), true);
+
+// Sidecall failure → graceful placeholder, no crash, image block still replaced with text.
+const f1 = imgTurn("corti-s1");
+describeCalls = 0;
+await applyIntercepts(f1, { describeImage: imgFailStub, imageModels: blind, parentSessionId: "sf" });
+check("image: failed describe still replaces the image block", f1.messages[1].content[0].content[0].type, "text");
+check("image: failed describe leaves a placeholder", f1.messages[1].content[0].content[0].text.startsWith("[image could not be described"), true);
+check("image: failed describe notes a re-read returns the same note", f1.messages[1].content[0].content[0].text.includes("re-reading the file returns this same note"), true);
+check("image: failed describe tells the model to work without it", f1.messages[1].content[0].content[0].text.includes("work without it"), true);
+
+// skipImages recursion guard: a sidecall\x27s own request is never re-described.
+const sk1 = imgTurn("corti-s1");
+describeCalls = 0;
+await applyIntercepts(sk1, { describeImage: describeStub, imageModels: blind, skipImages: true, parentSessionId: "sk" });
+check("image: skipImages guard prevents describing", describeCalls, 0);
+check("image: skipImages guard leaves the image block", sk1.messages[1].content[0].content[0].type, "image");
+
+// No describeImage injected → inert (a non-image-bearing request pays nothing).
+const n1 = imgTurn("corti-s1");
+await applyIntercepts(n1, { imageModels: blind, parentSessionId: "none" });
+check("image: no describeImage injected leaves the image block", n1.messages[1].content[0].content[0].type, "image");
+
+// User-message image (no tool_result) → described, swapped to text in place.
+const u1 = { model: "corti-s1", max_tokens: 16, messages: [
+  { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "qRS=" } }] },
+] };
+describeCalls = 0;
+await applyIntercepts(u1, { describeImage: describeStub, imageModels: blind, parentSessionId: "su" });
+check("image: user-message image is described", describeCalls, 1);
+check("image: user-message image swapped to text in place", u1.messages[0].content[0].type, "text");
+check("image: user-message image no longer carries a source", u1.messages[0].content[0].source, undefined);
+
+// End-to-end through translateRequest: a blind model\x27s translated upstream request has no
+// image_url part — the description is text instead.
+const e2e = await translateRequest({
+  model: "corti-s1", max_tokens: 16,
+  messages: [
+    { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "e2E=" } }] },
+  ],
+}, { describeImage: describeStub, imageModels: blind, parentSessionId: "e2e" });
+const e2eJson = JSON.stringify(e2e.request);
+check("image: translated request has no image_url", e2eJson.includes("image_url"), false);
+check("image: translated request carries the description as text", e2e.request.messages.some((m) => typeof m.content === "string" && m.content.includes("complete visual description of the image")), true);
+
+// response_format passthrough: the vision sidecall asks for JSON object mode (Corti honors it),
+// so translateRequest must forward it to the upstream OpenAI request verbatim.
+const rfPresent = (await translateRequest({
+  model: "corti-s1", max_tokens: 16, response_format: { type: "json_object" },
+  messages: [{ role: "user", content: "hi" }],
+})).request.response_format;
+check("response_format: json_object forwarded upstream", JSON.stringify(rfPresent), JSON.stringify({ type: "json_object" }));
+const rfAbsent = (await translateRequest({
+  model: "corti-s1", max_tokens: 16,
+  messages: [{ role: "user", content: "hi" }],
+})).request.response_format;
+check("response_format: omitted when not requested", rfAbsent, undefined);
+
+// Context threading: the user\x27s question is passed to describeImage so the vision model can focus
+// on what\x27s actually being asked, not a generic summary. The cache key stays the image hash only,
+// so a second turn with the same image reuses the first description (context isn\x27t re-evaluated).
+let capturedCtx = null;
+const ctxStub = async (block, context) => { capturedCtx = context; return { ok: true, text: "ctx desc" }; };
+const ctxBody = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: [{ type: "text", text: "what is wrong with the Open details section on the page?" }] },
+    { role: "assistant", content: [{ type: "text", text: "Let me look at the screenshot." }] },
+    { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "ctx=" } }] },
+  ],
+};
+await applyIntercepts(ctxBody, { describeImage: ctxStub, imageModels: blind, parentSessionId: "sctx" });
+check("image: user question is passed to describeImage as context", capturedCtx && capturedCtx.includes("Open details section"), true);
+
+// No user text, only an assistant intent → context falls back to the model\x27s stated intent.
+let asstCtx = null;
+const asstStub = async (block, context) => { asstCtx = context; return { ok: true, text: "asst desc" }; };
+const asstBody = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "assistant", content: [{ type: "text", text: "I will inspect the layout now." }] },
+    { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "ai=" } }] },
+  ],
+};
+await applyIntercepts(asstBody, { describeImage: asstStub, imageModels: blind, parentSessionId: "sasst" });
+check("image: falls back to assistant intent when no user text", asstCtx && asstCtx.includes("inspect the layout"), true);
+
+// No text at all in history → context is null (the vision model gets the generic multi-angle prompt).
+let nullCtx = "sentinel";
+const nullStub = async (block, context) => { nullCtx = context; return { ok: true, text: "n desc" }; };
+const nullBody = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "nl=" } }] },
+  ],
+};
+await applyIntercepts(nullBody, { describeImage: nullStub, imageModels: blind, parentSessionId: "snull" });
+check("image: no surrounding text yields null context", nullCtx, null);
 
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }

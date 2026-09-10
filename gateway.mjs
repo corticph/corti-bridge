@@ -261,10 +261,13 @@ async function handlePassthrough(req, res, reqPath) {
   if (!isCountTokens && req.method === "POST" && reqPath === "/v1/messages") {
     try {
       const parsed = JSON.parse(body.toString());
+      const imageOpts = await imageInterceptOpts(parsed, parsed?.skipImages);
       await applyIntercepts(parsed, {
         skipAdvisor: wantsNoAdvisor(req),
         mode: "anthropic",
         parentSessionId: req.headers["x-claude-code-session-id"],
+        skipImages: parsed?.skipImages,
+        ...imageOpts,
       });
       body = Buffer.from(JSON.stringify(parsed));
     } catch {
@@ -366,6 +369,178 @@ function countTokens(body) {
       },
     };
   }
+}
+
+/** The set of model ids that accept image input, fetched lazily from the catalog on the first
+ *  image-bearing request and cached for the process lifetime. Drives interceptImages: a blind
+ *  model gets its images described; a sighted model (a future multimodal corti-s1) passes images
+ *  through untouched. null while unknown or after a fetch failure — interceptImages then treats
+ *  every model as blind (describe), which is safer than passing an image to a model that 400s. */
+let imageModels = null;
+let imageModelsLoading = null;
+
+function fetchImageModels() {
+  if (imageModelsLoading) return imageModelsLoading;
+  imageModelsLoading = new Promise((resolve) => {
+    const proxyReq = https.request(
+      new URL(`${UPSTREAM_OPENAI}/models`),
+      { agent, method: "GET", headers: { authorization: `Bearer ${BEARER}` } },
+      (upstream) => {
+        const chunks = [];
+        upstream.on("data", (c) => chunks.push(c));
+        upstream.on("end", () => {
+          try {
+            const list = JSON.parse(Buffer.concat(chunks).toString());
+            const sighted = new Set();
+            for (const m of Array.isArray(list?.data) ? list.data : [])
+              if (m && typeof m.id === "string" && m.capabilities?.image_input === true)
+                sighted.add(m.id);
+            imageModels = sighted;
+          } catch {
+            imageModels = null;
+          }
+          imageModelsLoading = null;
+          resolve();
+        });
+      },
+    );
+    proxyReq.on("error", () => { imageModels = null; imageModelsLoading = null; resolve(); });
+    proxyReq.end();
+  });
+  return imageModelsLoading;
+}
+
+/** The vision model used to describe images for a blind primary. Defaults to the instant
+ *  sonnet tier (corti-s1-mini-instant): multimodal and non-reasoning, so no thinking cap is needed
+ *  and latency is low — describing is perception, not reasoning. CORTI_VISION_MODEL overrides;
+ *  point it at a reasoning model (corti-s1-mini) when the question needs chart arithmetic. Must
+ *  itself be multimodal — if it's blind, the skipImages recursion guard stops re-describing and
+ *  the upstream 400 surfaces as a graceful placeholder, not a crash. */
+function visionModel() {
+  return process.env.CORTI_VISION_MODEL || process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL || "corti-s1-mini-instant";
+}
+
+/** The system prompt for the vision sidecall. Fixed across every call so it prefix-caches. Asks
+ *  for a JSON object with typed fields (adapted from the vision-describer prompt pack): a verbatim
+ *  text_content transcription, a structural description, an answer to the caller's question when
+ *  one is present, and an uncertainties list so the lossiness is a machine-readable signal. */
+const DESCRIBE_SYSTEM =
+  "You are the vision component of a pipeline. You receive an image and usually a request from " +
+  "a calling agent. Your output is consumed by a text-only agent that will never see the image — " +
+  "it is the only record of it that survives.\n\n" +
+  "Return a single JSON object with exactly these fields:\n" +
+  "{\"image_type\": \"photo|screenshot|chart|diagram|document|slide|map|artwork|UI mockup|other\",\n" +
+  " \"summary\": \"1-2 sentences: what this image is\",\n" +
+  " \"description\": \"layout and spatial relations first, then subjects, then attributes " +
+  "(colour, material, count, size, state), then background. Length follows content density — do " +
+  "not pad, do not compress a dense image. UI/screenshots: every visible element, its label, and " +
+  "its state (enabled/selected/focused/error). Give positions (top-left, third row) where " +
+  "placement matters. Separate observation from inference; inferences carry appears-to-be/likely.\",\n" +
+  " \"text_content\": \"verbatim transcription of ALL legible text, in reading order, labels " +
+  "bound to what they label. Mark unreadable spans [illegible]. Empty string if none. Never " +
+  "summarise.\",\n" +
+  " \"answer\": \"response to the request, grounded only in what is visible. Empty string if " +
+  "no request was given. If the request cannot be resolved from the image, say what is missing.\",\n" +
+  " \"uncertainties\": \"list every blurred, cropped, occluded or ambiguous element and any " +
+  "character you guessed at. Empty array if none.\"}\n\n" +
+  "Never invent detail to complete a pattern. An acknowledged gap is more useful downstream than " +
+  "a plausible fabrication.";
+
+/** The user turn for the describe sidecall. Without context, ask for a full description; with
+ *  context (the user's question / the model's intent), pass it so the answer field targets it. */
+function describeUserPrompt(context) {
+  return context
+    ? `Request from the calling agent: ${context}\n\nDescribe the image and answer the request above.`
+    : "Describe this image completely.";
+}
+
+/** Describes one image block by re-entering this gateway's own openai endpoint with an Anthropic
+ *  Messages body carrying the image and the vision model. Re-entry reuses the gateway's full
+ *  translation + retry machinery; the openai path doesn't validate incoming client auth, so a bare
+ *  POST is clean. skipImages on the body is the recursion guard: interceptImages checks it first.
+ *  Resolves { ok, text } on success or { ok:false, code, detail } on failure — interceptImages turns
+ *  a failure into a graceful placeholder rather than letting a blind model receive the image.
+ *  context (optional) is the surrounding user question / model intent, extracted by interceptImages
+ *  so the vision model can focus on what's actually being asked rather than a generic summary. */
+/** Assembles the parsed JSON fields into the text block the blind primary reads as the image's
+ *  record. Each section is labeled so the consumer can find transcription, description, and answer
+ *  independently; omitted/empty fields are skipped rather than emitting empty headers. */
+function formatImageDescription(f) {
+  const parts = [];
+  if (f.image_type) parts.push(`[image type]: ${f.image_type}`);
+  if (f.summary) parts.push(`[summary]: ${f.summary}`);
+  if (f.description) parts.push(`[description]: ${f.description}`);
+  if (f.text_content) parts.push(`[text content]: ${f.text_content}`);
+  if (f.answer) parts.push(`[answer]: ${f.answer}`);
+  if (Array.isArray(f.uncertainties) && f.uncertainties.length)
+    parts.push(`[uncertainties]: ${f.uncertainties.join("; ")}`);
+  return parts.length ? parts.join("\n\n") : JSON.stringify(f);
+}
+
+function runDescribeImage(block, context) {
+  return new Promise((resolve) => {
+    const reqBody = JSON.stringify({
+      model: visionModel(),
+      max_tokens: 4096,
+      response_format: { type: "json_object" },
+      skipImages: true,
+      system: DESCRIBE_SYSTEM,
+      messages: [{ role: "user", content: [
+        { type: "text", text: describeUserPrompt(context) },
+        block,
+      ] }],
+    });
+    const req = http.request(
+      `http://${HOST}:${PORT}/v1/messages`,
+      { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(reqBody) } },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          if (res.statusCode !== 200)
+            return resolve({ ok: false, code: "describe_http_" + res.statusCode, detail: Buffer.concat(chunks).toString().slice(0, 200) });
+          try {
+            const msg = JSON.parse(Buffer.concat(chunks).toString());
+            const raw = (msg?.content || []).filter((b) => b?.type === "text").map((b) => b.text).join("\n").trim();
+            if (!raw) return resolve({ ok: false, code: "empty", detail: "vision model returned no text" });
+            // Parse the typed JSON fields; a parse failure degrades to the raw text — still usable.
+            let fields;
+            try { fields = JSON.parse(raw); } catch { fields = null; }
+            const text = fields ? formatImageDescription(fields) : raw;
+            return resolve({ ok: true, text });
+          } catch (e) {
+            return resolve({ ok: false, code: "unparseable", detail: String(e.message || e).slice(0, 200) });
+          }
+        });
+      },
+    );
+    req.on("error", (err) => resolve({ ok: false, code: err.code || "unavailable", detail: String(err.message || err).slice(0, 200) }));
+    req.setTimeout(Number(process.env.CORTI_VISION_TIMEOUT_MS) || 60_000, () => req.destroy(new Error("vision describe timeout")));
+    req.end(reqBody);
+  });
+}
+
+/** True if any user message carries an image block — directly or inside a tool_result. Cheap
+ *  pre-check so the capability fetch + describe wiring only runs for image-bearing requests. */
+function bodyHasImage(body) {
+  for (const msg of body?.messages ?? []) {
+    if (msg?.role !== "user" || !Array.isArray(msg.content)) continue;
+    for (const b of msg.content) {
+      if (b?.type === "image") return true;
+      if (b?.type === "tool_result" && Array.isArray(b.content) && b.content.some((c) => c?.type === "image")) return true;
+    }
+  }
+  return false;
+}
+
+/** Opts for interceptImages, built only for image-bearing requests: ensures the capability set is
+ *  loaded (lazy, once per process) then wires the describe sidecall. Returns {} when the body
+ *  carries no image, so non-image requests pay nothing. The capability fetch is awaited so the
+ *  first image-bearing request blocks on it; later requests reuse the cached set. */
+async function imageInterceptOpts(body, skipImages) {
+  if (skipImages || !bodyHasImage(body)) return {};
+  if (imageModels === null) await fetchImageModels();
+  return { describeImage: runDescribeImage, imageModels };
 }
 
 function handleModels(res) {
@@ -585,7 +760,11 @@ async function handleMessages(req, res, body) {
     : undefined;
   let translated;
   try {
-    const out = await translateRequest(anthropicBody, { skipAdvisor: noAdvisor, mode: "openai", advisorEffort, parentSessionId });
+    const imageOpts = await imageInterceptOpts(anthropicBody, anthropicBody?.skipImages);
+    const out = await translateRequest(anthropicBody, {
+      skipAdvisor: noAdvisor, mode: "openai", advisorEffort, parentSessionId,
+      skipImages: anthropicBody?.skipImages, ...imageOpts,
+    });
     translated = out.request;
     diagnostics.push(...out.dropped.map((d) => `dropped: ${d}`));
   } catch (err) {
@@ -843,7 +1022,7 @@ async function handleMessages(req, res, body) {
       // client request, so the advisor intercept must not touch it.
       // parentSessionId only re-inserts *prior* consults, so the continuation reads the history
       // the first call did; this turn's own consult is not recorded until the continuation settles.
-      translateRequest(contAnthropic, { skipAdvisor: true, parentSessionId })
+      translateRequest(contAnthropic, { skipAdvisor: true, skipImages: true, parentSessionId })
         .then((out) => {
           const contTranslated = out.request;
           diagnostics.push(...out.dropped.map((d) => `continuation dropped: ${d}`));
