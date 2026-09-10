@@ -1239,25 +1239,33 @@ export async function translateRequest(body, opts) {
     }
   }
 
+  // Corti's effort vocabulary is {high, max}; the picker's six levels collapse at the
+  // midpoint. Off-vocabulary values (medium/low) floor somewhere unknown upstream.
+  const mapEffort = (e) => {
+    if (typeof e !== "string") return undefined;
+    const v = e.toLowerCase();
+    if (["low", "medium", "high"].includes(v)) return "high";
+    if (["xhigh", "max", "ultracode"].includes(v)) return "max";
+    return undefined;
+  };
+
+  // effort (depth) and thinking (whether) are separate axes. reasoning_effort is gated on
+  // body.thinking: a request with no thinking block is not reasoning-capable and 400s on effort.
   const th = body.thinking;
   if (th && typeof th === "object") {
-    const budget = th.budget_tokens;
-    if (th.type === "enabled") {
-      req.reasoning_effort =
-        typeof budget === "number" && budget < 4096 ? "low"
-        : typeof budget === "number" && budget < 16384 ? "medium"
-        : "high";
-      if (typeof budget === "number" && budget > 0) req.thinking_token_budget = budget;
-    } else if (th.type === "adaptive") {
-      req.reasoning_effort = "medium";
-    }
+    const effort = mapEffort(body.output_config?.effort);
+    // output_config.effort (the picker) wins over the legacy budget mapping; adaptive enables only.
+    const budgetEffort =
+      th.type === "enabled" && typeof th.budget_tokens === "number"
+        ? mapEffort(th.budget_tokens < 4096 ? "low" : th.budget_tokens < 16384 ? "medium" : "high")
+        : undefined;
+    req.reasoning_effort = effort ?? budgetEffort ?? "high";
+    if (th.type === "enabled" && typeof th.budget_tokens === "number" && th.budget_tokens > 0)
+      req.thinking_token_budget = th.budget_tokens;
   }
 
-  // C2: the advisor child should reason at high (the official default), not the medium that
-  // adaptive thinking maps to above. The gateway sets advisorEffort for the advisor child
-  // (detected via the -noadvisor- token); it overrides whatever the thinking block produced,
-  // including the adaptive→medium mapping. A model that rejects this effort level will 400 at
-  // upstream — that surfaces a real capability gap rather than silently reasoning shallow.
+  // C2: the advisor child reasons at CORTI_ADVISOR_EFFORT (high by default), overriding the
+  // resolved effort above. A model that rejects the level 400s — surfacing a capability gap.
   if (opts?.advisorEffort) req.reasoning_effort = opts.advisorEffort;
 
   return { request: req, dropped };

@@ -21,19 +21,46 @@ const effort = async (model, thinking) =>
   (await translateRequest({ model, max_tokens: 16, thinking, messages: [{ role: "user", content: "hi" }] }))
     .request.reasoning_effort;
 
+const effortCfg = async (model, thinking, output_config) =>
+  (await translateRequest({ model, max_tokens: 16, thinking, output_config, messages: [{ role: "user", content: "hi" }] }))
+    .request.reasoning_effort;
+
 const ENABLED = (n) => ({ type: "enabled", budget_tokens: n });
+const ADAPTIVE = { type: "adaptive" };
 
 // The advisor intercept skips a request with no tools (a one-shot side call cannot act on advice),
 // so every fixture that must reach the advisor carries one.
 const ANYTOOL = () => ({ name: "run_bash", description: "Run a bash command", input_schema: { type: "object" } });
 
-// Effort is budget-derived and model-independent.
+// Corti effort vocabulary is {high, max}. The picker six levels collapse at the midpoint;
+// budget mapping routes through the same collapse, so medium/low never reach upstream.
 for (const m of ["corti-s1", "corti-s1-mini", "corti-s1-ultra-beta", "corti-s1-ultra-instant-beta"]) {
-  check(`${m}: adaptive is medium`, await effort(m, { type: "adaptive" }), "medium");
-  check(`${m}: mid budget is medium`, await effort(m, ENABLED(8000)), "medium");
-  check(`${m}: low budget is low`, await effort(m, ENABLED(1000)), "low");
+  check(`${m}: adaptive (no effort) defaults to high`, await effort(m, ADAPTIVE), "high");
+  check(`${m}: mid budget collapses to high`, await effort(m, ENABLED(8000)), "high");
+  check(`${m}: low budget collapses to high`, await effort(m, ENABLED(1000)), "high");
   check(`${m}: high budget is high`, await effort(m, ENABLED(32000)), "high");
 }
+
+// output_config.effort (the picker) maps the six levels onto Corti two, with thinking adaptive.
+for (const lvl of ["low", "medium", "high"]) {
+  const got = await effortCfg("corti-s1", ADAPTIVE, { effort: lvl });
+  check(`output_config.effort=${lvl} → high`, got, "high");
+}
+for (const lvl of ["xhigh", "max", "ultracode"]) {
+  const got = await effortCfg("corti-s1", ADAPTIVE, { effort: lvl });
+  check(`output_config.effort=${lvl} → max`, got, "max");
+}
+
+// output_config.effort (the picker) wins over a conflicting thinking.enabled budget.
+const pickerWins = await effortCfg("corti-s1", ENABLED(1000), { effort: "max" });
+check("output_config.effort overrides budget mapping", pickerWins, "max");
+
+// Non-reasoning guard: no thinking block → no reasoning_effort, even with output_config.effort.
+const noThinking = (await translateRequest({
+  model: "corti-s1-mini-instant", max_tokens: 16, output_config: { effort: "max" },
+  messages: [{ role: "user", content: "hi" }],
+})).request.reasoning_effort;
+check("no thinking block omits reasoning_effort (non-reasoning guard)", noThinking, undefined);
 
 // Model name mapping: claude-* model names should map to configured Corti models via env vars.
 process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = "corti-s1";
@@ -583,17 +610,17 @@ const advSerErrText = serializeAdvisorInput(advSerErrBody).text;
 check("advisor C6 advisor-side: prior error surfaces as unavailable note",
   advSerErrText.includes("advisor unavailable (overloaded)"), true);
 
-// Block I — C2: advisorEffort overrides reasoning_effort (the advisor child reasons at high,
-// not the medium adaptive maps to). The gateway passes advisorEffort for the advisor child.
+// Block I — C2: advisorEffort overrides reasoning_effort (the advisor child reasons at high).
+// The gateway passes advisorEffort for the advisor child.
 const noThink = await translateRequest({ model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }, { advisorEffort: "high" });
 check("advisor C2: advisorEffort=high overrides even with no thinking block", noThink.request.reasoning_effort, "high");
 const adaptiveMed = await translateRequest({ model: "corti-s1", max_tokens: 16, thinking: { type: "adaptive" }, messages: [{ role: "user", content: "hi" }] }, { advisorEffort: "high" });
-check("advisor C2: advisorEffort=high overrides adaptive→medium", adaptiveMed.request.reasoning_effort, "high");
+check("advisor C2: advisorEffort=high overrides adaptive effort", adaptiveMed.request.reasoning_effort, "high");
 const budgetLow = await translateRequest({ model: "corti-s1", max_tokens: 16, thinking: { type: "enabled", budget_tokens: 1024 }, messages: [{ role: "user", content: "hi" }] }, { advisorEffort: "high" });
 check("advisor C2: advisorEffort=high overrides low budget mapping", budgetLow.request.reasoning_effort, "high");
-// Without advisorEffort, the thinking mapping is untouched (regression guard).
+// Without advisorEffort, adaptive resolves to the high default (regression guard).
 const noOverride = await translateRequest({ model: "corti-s1", max_tokens: 16, thinking: { type: "adaptive" }, messages: [{ role: "user", content: "hi" }] });
-check("advisor C2: no advisorEffort leaves adaptive→medium untouched", noOverride.request.reasoning_effort, "medium");
+check("advisor C2: no advisorEffort leaves adaptive at high default", noOverride.request.reasoning_effort, "high");
 // CORTI_ADVISOR_EFFORT overrides the default — read at call time by the gateway (not tested here
 // at the translate level, which only honors the explicit opt).
 

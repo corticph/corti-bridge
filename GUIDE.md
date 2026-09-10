@@ -25,7 +25,7 @@ This is a reference, not a tutorial. For install and run, see the [README](READM
 - **tools** — mapped to function tools; WebSearch is converted from a server-side tool to a function tool and its results intercepted via the Tavily API (with a keyless DuckDuckGo scrape fallback when `TAVILY_API_KEY` is unset or Tavily fails/rate-limits). Other server-side tools (web_fetch etc.) are stripped with no replacement.
 - **model names** — mapped to configured Corti models (e.g. `claude-opus-5` → `corti-s1`)
 - **tool_use / tool_result** — pairing repaired for re-wound histories; parallel tool calls round-trip byte-exact via index-keyed streaming
-- **thinking config** — Anthropic `thinking` maps to upstream `reasoning_effort` + `thinking_token_budget`; upstream reasoning streams back as Anthropic thinking blocks. History thinking blocks are stripped on re-entry (signatures are synthetic, see below).
+- **thinking config** — Anthropic `thinking` and `output_config.effort` map to upstream `reasoning_effort` + `thinking_token_budget`; upstream reasoning streams back as Anthropic thinking blocks. History thinking blocks are stripped on re-entry (signatures are synthetic, see below). Effort (depth) and thinking (whether) are separate axes: the harness picker sends `output_config.effort` (six levels: low→ultracode), which collapses onto Corti's two real levels — at-or-below `high` → `high`, above → `max`. `thinking.type: "adaptive"` enables thinking only and contributes no depth; `output_config.effort` wins over the legacy `thinking.enabled` budget mapping. `reasoning_effort` is gated on a `thinking` block being present, so a non-reasoning request (no thinking) gets no effort level. The advisor child overrides both with `CORTI_ADVISOR_EFFORT`.
 - **images** — converted to `image_url` parts, including images inside tool results, which are attached as a following user message
 - **auth** — whatever token the client sends is discarded; the real `CORTI_BEARER` is injected
 - **`/v1/messages/count_tokens`** — handled locally (estimator: chars/4 + tools schema + per-image flat count). The same estimator seeds `message_start.usage.input_tokens`, but there it is first scaled by the last real/estimate ratio observed for that session and model, so a turn that dies before upstream reports usage does not record less context than the turn before it. `count_tokens` itself and the local overflow guard stay on the raw estimate.
@@ -82,7 +82,7 @@ The `_SUPPORTED_CAPABILITIES` lines tell Claude Code what each model can actuall
 - `temperature` → `temperature`
 - `mid_conversation_system` is always offered
 
-A capability is omitted only when the catalog explicitly says `false` — absence keeps it, because Corti's metadata has understated capabilities before. `xhigh` is never offered (no Corti model honours it, so acceptance doesn't prove support), and `interleaved_thinking` is omitted since the proxy strips thinking blocks from history on re-entry.
+A capability is omitted only when the catalog explicitly says `false` — absence keeps it, because Corti's metadata has understated capabilities before. `xhigh` is never offered in the capabilities string (no Corti model honours it, so acceptance wouldn't prove support) — but the harness picker still sends `output_config.effort: "xhigh"`, which the proxy accepts and maps to `max` (see thinking config above). `interleaved_thinking` is omitted since the proxy strips thinking blocks from history on re-entry.
 
 ### Channels and context window
 
@@ -213,7 +213,7 @@ Read directly from the shell — no local secrets file.
 | `CORTI_PORT` | no | Proxy bind port, default `4192` |
 | `CORTI_NO_UPDATE_CHECK` | no | `1` disables the update check entirely — no background `git fetch`, no notice. Already off for print runs, advisor children, non-clone installs, and any branch but `main` |
 | `CORTI_UPDATE_INTERVAL_S` | no | Seconds between background update fetches, default `86400` (once a day). The commits-behind count itself is read from local refs on every launch and costs no network |
-| `CORTI_REASONING_MODE` | no | `thinking` (default: reasoning becomes Anthropic thinking blocks), `text` (fold into reply text), `drop` |
+| `CORTI_REASONING_MODE` | no | `thinking` (default: reasoning becomes Anthropic thinking blocks), `text` (fold into reply text), `drop`. Controls reasoning *visibility* on the response side; the request-side depth comes from `output_config.effort` → `reasoning_effort` (see thinking config in [Translation surface](#translation-surface)) |
 | `TAVILY_API_KEY` | no | Enables Tavily as the primary WebSearch backend; when unset (or when Tavily fails/rate-limits) the keyless DuckDuckGo scrape is used instead |
 | `CORTI_SEARCH_DEPTH` | no | Tavily search depth: `basic` (default, 1 credit) or `advanced` (2 credits, richer snippets); ignored without `TAVILY_API_KEY` |
 | `CORTI_HEADERS_TIMEOUT_MS` | no | How long to wait for upstream response headers before giving up, default `60000`; `0` falls back to the 120s mid-stream idle timeout |
