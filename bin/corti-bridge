@@ -499,6 +499,10 @@ export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 export CLAUDE_CODE_DISABLE_1M_CONTEXT=1
 # Unreachable through the proxy — need a claude.ai login the gateway doesn't carry.
 export CLAUDE_CODE_DISABLE_ARTIFACT=1
+# Background calls bypass ANTHROPIC_BASE_URL and reach api.anthropic.com directly.
+# The umbrella switch cuts all of it — bootstrap, registry, telemetry, crash reports,
+# plugins, Projects, /bug, /feedback — not just the usage-analytics POST.
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 unset CLAUDE_CODE_ENABLE_DESIGN_SYNC
 
 # exec is the normal path: the wrapper's job is done and it should get out of the way. It is
