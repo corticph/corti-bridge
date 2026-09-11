@@ -73,7 +73,7 @@ _d_report() {
         *)    _d_glyph="[$1]"; _d_n_ok=$((_d_n_ok + 1)) ;;
     esac
     printf '%-6s %-16s %s\n' "$_d_glyph" "$2" "$3"
-    if [ -n "$4" ]; then
+    if [ -n "${4:-}" ]; then
         printf '      %s\n' "$4"
     fi
 }
