@@ -75,7 +75,7 @@ Sorting rather than scanning keeps every pick independent of the order the API r
 
 ### Capability derivation
 
-The `_SUPPORTED_CAPABILITIES` lines tell Claude Code what each model can actually do. Without them it infers capabilities from the model name — a heuristic written for `claude-*` IDs that credits every Corti model with reasoning. The installer derives them from the catalog's per-model `capabilities` and `effort` metadata instead:
+The `_SUPPORTED_CAPABILITIES` lines declare each model's capabilities from the catalog's per-model `capabilities` and `effort` metadata. They are inert behind `ANTHROPIC_BASE_URL`: per the gateway-compat docs, the harness reads them only under provider configs (Bedrock/Vertex/Foundry/Mantle), not a base-url gateway, so it falls back to inferring from the tier's model id and the effort picker shows all levels regardless. They're emitted anyway as correct catalog-driven values that would take effect under a provider config; the picker and send-time effort are shaped in `translate.mjs` (`mapEffort`). The derivation:
 
 - `reasoning` → `thinking,adaptive_thinking`
 - `effort.supported` → `effort,max_effort`

@@ -452,7 +452,9 @@ if [ -f "$CORTI_DIR/models.env" ]; then
     . "$CORTI_DIR/models.env"
     export ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
     export CLAUDE_CODE_MAX_CONTEXT_TOKENS
-    # Capabilities are optional; Claude Code infers by name when they're absent.
+    # Capabilities are optional; Claude Code infers by name when they're absent. Inert behind
+    # ANTHROPIC_BASE_URL — the harness only reads these under provider configs (Bedrock/Vertex/
+    # Foundry/Mantle), not a base-url gateway.
     for _cap in OPUS SONNET HAIKU; do
         eval "[ -n \"\${ANTHROPIC_DEFAULT_${_cap}_MODEL_SUPPORTED_CAPABILITIES:-}\" ]" &&
             export "ANTHROPIC_DEFAULT_${_cap}_MODEL_SUPPORTED_CAPABILITIES"
