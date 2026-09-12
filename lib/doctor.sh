@@ -60,7 +60,7 @@ _d_n_fail=0
 _d_baked=''
 _d_run_clone=''
 
-# One check row. $1 glyph word (OK/WARN/FAIL), $2 check name, $3 value, $4 fix.
+# One check row. $1 glyph word (OK/WARN/FAIL), $2 check name, $3 value, $4 fix (optional).
 # The glyph is padded to 6 via %-6s so [OK] aligns with [WARN]/[FAIL]. Fix text
 # is indented on following lines when non-empty. Color is a TTY-only accent on
 # the glyph; the glyph word always carries the signal (never color-only).
@@ -394,11 +394,11 @@ _d_check_gateway() {
 # already pulled down, and never reaches the network itself, so `doctor` stays offline-safe.
 _d_check_update() {
     if [ ! -d "$PROXY_DIR/.git" ]; then
-        _d_report OK update "not a git clone - update check does not apply"
+        _d_report OK update "not a git clone - update check does not apply" ""
         return 0
     fi
     if ! command -v git >/dev/null 2>&1; then
-        _d_report OK update "git not on PATH - update check disabled"
+        _d_report OK update "git not on PATH - update check disabled" ""
         return 0
     fi
     _d_branch="$(git -C "$PROXY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
@@ -410,7 +410,7 @@ _d_check_update() {
         return 0
     fi
     if [ "$_d_branch" != main ]; then
-        _d_report OK update "on branch '$_d_branch' - not compared against origin/main"
+        _d_report OK update "on branch '$_d_branch' - not compared against origin/main" ""
         return 0
     fi
     _d_behind="$(git -C "$PROXY_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo '')"
@@ -425,7 +425,7 @@ _d_check_update() {
         _d_report WARN update "$_d_behind commit(s) behind origin/main" \
             "Update: cd \"$PROXY_DIR\" && git pull && ./setup.sh"
     else
-        _d_report OK update "up to date with the last fetch of origin/main"
+        _d_report OK update "up to date with the last fetch of origin/main" ""
     fi
 }
 
