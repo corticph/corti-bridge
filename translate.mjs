@@ -48,7 +48,7 @@ export function _resetWebSearchCache() { webSearchBySession.clear(); }
 
 /** Per-session cache: image key -> text description. A described image must produce the same
  *  bytes every turn, else the prefix cache collapses (A1) — same failure mode as WebSearch. Key is
- *  the tool_use_id for tool-result images, or a SHA-256 of the base64 for user-message images. No
+ *  a SHA-256 of the image data, however the image arrived (paste or tool result). No
  *  session id → throwaway map, same rule as the advisor dedup and WebSearch. */
 const IMAGE_CACHE_CAP = 64;
 const IMAGE_CACHE_PER_SESSION = 64;
@@ -68,16 +68,15 @@ function imageCacheMap(sessionId) {
 
 export function _resetImageCache() { imageCacheBySession.clear(); }
 
-/** Stable key for an image block. Always includes a hash of the image data: a tool_use_id is
- *  stable per call but not per image, so two images in one tool_result would otherwise share a key
- *  and the second would get the first's description. Prefixing with tool_use_id (when present)
- *  keeps the key stable across turns (A1) and scoped to its call. */
+/** Stable key for an image block: the hash of its data, however it arrived. A re-Read of a pasted
+ *  image carries a fresh tool_use_id, so scoping the key to the call missed the cache and
+ *  re-described identical bytes — three reads of one image gave three palettes, and the model
+ *  trusted the last. tool_use_id is only the fallback when there is no data to hash. */
 function imageCacheKey(block, toolUseId) {
   const src = block?.source;
   const data = src?.type === "base64" ? src.data : src?.url;
   if (!data) return toolUseId || null;
-  const hash = createHash("sha256").update(String(data)).digest("hex").slice(0, 32);
-  return toolUseId ? `${toolUseId}:${hash}` : hash;
+  return createHash("sha256").update(String(data)).digest("hex").slice(0, 32);
 }
 
 /** Wraps a vision description as the model's visual access to an image. The prefix frames it as

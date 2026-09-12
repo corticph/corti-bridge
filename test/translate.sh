@@ -891,6 +891,25 @@ check("image: two images in one tool_result are both described", multiCall, 2);
 check("image: first image gets its own description", multi.messages[1].content[0].content[0].text.includes("desc AAAA"), true);
 check("image: second image gets its own description", multi.messages[1].content[0].content[1].text.includes("desc BBBB"), true);
 
+// The same bytes pasted by the user and later re-Read by the model (fresh tool_use_id each time)
+// must reuse one description; re-describing gave three different palettes for one image.
+let rereadCalls = 0;
+const rereadStub = async () => { rereadCalls++; return { ok: true, text: `desc call ${rereadCalls}` }; };
+const pasted = { type: "image", source: { type: "base64", media_type: "image/png", data: "SAME" } };
+const rereadBody = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: [structuredClone(pasted), { type: "text", text: "build this" }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "rr1", name: "Read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "rr1", content: [structuredClone(pasted)] }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "rr2", name: "Read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "rr2", content: [structuredClone(pasted)] }] },
+  ],
+};
+await applyIntercepts(rereadBody, { describeImage: rereadStub, imageModels: blind, parentSessionId: "srr" });
+check("image: a re-Read of a pasted image is described once", rereadCalls, 1);
+check("image: every re-Read gets the pasted image\x27s description",
+  rereadBody.messages[4].content[0].content[0].text, rereadBody.messages[0].content[0].text);
+
 // Sidecall failure → graceful placeholder, no crash, image block still replaced with text.
 const f1 = imgTurn("corti-s1");
 describeCalls = 0;
