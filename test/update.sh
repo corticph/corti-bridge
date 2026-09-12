@@ -142,11 +142,23 @@ check "a clone on a feature branch is not nagged" "$(launch_count 'new commit')"
 git -C "$CLONE" checkout -q main
 
 # --- doctor ------------------------------------------------------------------------------
+# No 2>/dev/null: doctor is a stdout report, so anything on stderr is a defect.
 check "doctor reports the clone is behind" \
-    "$(sh "$BRIDGE" doctor 2>/dev/null | grep -c 'commit(s) behind origin/main')" "1"
+    "$(sh "$BRIDGE" doctor | grep -c 'commit(s) behind origin/main')" "1"
 git -C "$CLONE" pull -q origin main
 check "doctor reports up to date after a pull" \
-    "$(sh "$BRIDGE" doctor 2>/dev/null | grep -c 'up to date with the last fetch')" "1"
+    "$(sh "$BRIDGE" doctor | grep -c 'up to date with the last fetch')" "1"
+
+# An abort mid-report still prints every earlier row and can still exit 1, so only the tail
+# proves the run finished. Both _d_check_update branch paths have their own early return.
+check "doctor completes its report when up to date" \
+    "$(sh "$BRIDGE" doctor | grep -c '^Summary:')" "1"
+check "doctor writes nothing to stderr" \
+    "$(sh "$BRIDGE" doctor 2>&1 >/dev/null | wc -l | tr -d ' ')" "0"
+git -C "$CLONE" checkout -q wip
+check "doctor completes its report on a feature branch" \
+    "$(sh "$BRIDGE" doctor | grep -c '^Summary:')" "1"
+git -C "$CLONE" checkout -q main
 
 if [ "$FAILED" -gt 0 ]; then
     printf '\n%s check(s) failed\n' "$FAILED"
