@@ -500,6 +500,15 @@ export CLAUDE_CODE_DISABLE_1M_CONTEXT=1
 # Unreachable through the proxy — need a claude.ai login the gateway doesn't carry.
 export CLAUDE_CODE_DISABLE_ARTIFACT=1
 unset CLAUDE_CODE_ENABLE_DESIGN_SYNC
+# The gateway doesn't serve /bootstrap, so the tengu_native_cursor feature flag never arrives and
+# the TUI falls back to a software-drawn cursor (static white block) instead of the terminal's
+# native one. Native is the default against the real API, so default it on here to match: it
+# blinks and is colored by the terminal (Ghostty's bluish cursor) rather than drawn by the TUI.
+# Unlike the functional exports above this is purely cosmetic, so an explicit user value wins:
+# `: ${VAR:=default}` assigns only when unset, so `CLAUDE_CODE_NATIVE_CURSOR=0 corti-bridge`
+# keeps the software cursor if that's what the user's terminal renders better.
+: "${CLAUDE_CODE_NATIVE_CURSOR:=1}"
+export CLAUDE_CODE_NATIVE_CURSOR
 
 # exec is the normal path: the wrapper's job is done and it should get out of the way. It is
 # given up only when a notice is waiting, because printing one means outliving the session.
