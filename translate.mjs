@@ -694,10 +694,16 @@ async function interceptWebSearch(body, { toolUseMap, parentSessionId, webSearch
  *  Recursion guard: the sidecall re-enters this gateway with skipImages set, checked first so a
  *  misconfigured catalog (the vision model reported blind too) can't recurse. describeImage is
  *  injectable via ctx so tests stay hermetic (no HTTP). */
+// Reminders share the image's user message and dwarf it — a measured 3656-char CLAUDE.md replay
+// ahead of a 117-char question — so the vision model read the reminder as the request.
+const REMINDER_SPAN = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+// The harness's provenance marker for a pasted image, not something the user asked about.
+const IMAGE_SOURCE_MARKER = /^\[Image:\s*source:[^\]]*\]$/;
+
 /** The most recent user text (the question) and assistant text (the model's intent) before the
- *  image, so the vision model can focus on what's actually being asked. Used as context for the
- *  describe sidecall. Capped to keep the sidecall small; the cache key stays the image hash only,
- *  so the description is computed once on the turn the image first appears with its question. */
+ *  image, so the vision model can focus on what's actually being asked. The caps are a backstop
+ *  against a pathological paste, not a payload concern — the sidecall body is ~350KB of base64
+ *  image, so the context is a rounding error beside it. */
 function describeContext(body) {
   let userText = "";
   let asstText = "";
@@ -705,11 +711,14 @@ function describeContext(body) {
     if (!msg || !Array.isArray(msg.content)) continue;
     const text = msg.content
       .filter((b) => b?.type === "text" && typeof b.text === "string" && b.text.trim())
-      .map((b) => b.text.trim())
-      .join(" ");
+      .map((b) => b.text.replace(REMINDER_SPAN, " ").trim())
+      .filter((t) => t && !IMAGE_SOURCE_MARKER.test(t))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
     if (!text) continue;
-    if (msg.role === "user") userText = text.slice(0, 400);
-    else if (msg.role === "assistant") asstText = text.slice(0, 200);
+    if (msg.role === "user") userText = text.slice(0, 2000);
+    else if (msg.role === "assistant") asstText = text.slice(0, 1000);
   }
   // Prefer the user's question; fall back to the model's stated intent if there's no user text.
   const ctx = userText || asstText;

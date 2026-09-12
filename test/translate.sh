@@ -947,6 +947,24 @@ const rfAbsent = (await translateRequest({
 })).request.response_format;
 check("response_format: omitted when not requested", rfAbsent, undefined);
 
+// The sidecall puts the image part first (VLM training-data ordering) and pins decoding; both
+// have to survive translation to reach upstream.
+const sidecall = (await translateRequest({
+  model: "corti-s1-mini-instant", max_tokens: 16, temperature: 0.1, top_p: 0.9,
+  skipImages: true,
+  messages: [{ role: "user", content: [
+    { type: "image", source: { type: "base64", media_type: "image/png", data: "ord=" } },
+    { type: "text", text: "Describe the image." },
+  ] }],
+}, { skipImages: true })).request;
+check("sidecall: temperature survives translation", sidecall.temperature, 0.1);
+check("sidecall: top_p survives translation", sidecall.top_p, 0.9);
+const sidecallParts = (sidecall.messages.find((m) => m.role === "user") || {}).content;
+check("sidecall: image part is sent before the text part",
+  Array.isArray(sidecallParts) && sidecallParts[0]?.type, "image_url");
+check("sidecall: the text part still follows it",
+  Array.isArray(sidecallParts) && sidecallParts[1]?.type, "text");
+
 // Context threading: the user\x27s question is passed to describeImage so the vision model can focus
 // on what\x27s actually being asked, not a generic summary. The cache key stays the image hash only,
 // so a second turn with the same image reuses the first description (context isn\x27t re-evaluated).
@@ -984,6 +1002,39 @@ const nullBody = {
 };
 await applyIntercepts(nullBody, { describeImage: nullStub, imageModels: blind, parentSessionId: "snull" });
 check("image: no surrounding text yields null context", nullCtx, null);
+
+// A CLAUDE.md replay sits ahead of the real question in the SAME user message, and joined verbatim
+// it buried the question past the old 400-char cap.
+let remCtx = null;
+const remStub = async (block, context) => { remCtx = context; return { ok: true, text: "rem desc" }; };
+const bigReminder = "<system-reminder>\n" + "Codebase and user instructions. ".repeat(200) + "\n</system-reminder>";
+const remBody = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: [
+      { type: "text", text: bigReminder },
+      { type: "text", text: "recreate this page as close to the original as possible" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "rem=" } },
+      { type: "text", text: "[Image: source: /Users/x/.claude/image-cache/s/1.png]" },
+    ] },
+  ],
+};
+await applyIntercepts(remBody, { describeImage: remStub, imageModels: blind, parentSessionId: "srem" });
+check("image: system-reminder is stripped from describe context", /system-reminder|Codebase and user instructions/.test(remCtx), false);
+check("image: the real question survives a leading reminder", remCtx, "recreate this page as close to the original as possible");
+
+// The provenance marker is the harness telling itself where the paste came from, never a question.
+let markerCtx = null;
+const markerStub = async (block, context) => { markerCtx = context; return { ok: true, text: "m desc" }; };
+const markerBody = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "mk=" } },
+      { type: "text", text: "[Image: source: /Users/x/.claude/image-cache/s/2.png]" },
+    ] },
+  ],
+};
+await applyIntercepts(markerBody, { describeImage: markerStub, imageModels: blind, parentSessionId: "smark" });
+check("image: lone provenance marker yields null context", markerCtx, null);
 
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }
