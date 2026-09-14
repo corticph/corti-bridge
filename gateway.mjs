@@ -389,8 +389,12 @@ function fetchImageModels() {
       (upstream) => {
         const chunks = [];
         upstream.on("data", (c) => chunks.push(c));
+        /** A non-200 (503, 401) can carry valid JSON with no list.data → an empty Set, not null,
+         *  so imageInterceptOpts never retries. Treat it as a fetch failure so a transient /models
+         *  outage self-heals on the next image request. */
         upstream.on("end", () => {
           try {
+            if (upstream.statusCode !== 200) { imageModels = null; imageModelsLoading = null; return resolve(); }
             const list = JSON.parse(Buffer.concat(chunks).toString());
             const sighted = new Set();
             for (const m of Array.isArray(list?.data) ? list.data : [])
@@ -406,6 +410,13 @@ function fetchImageModels() {
       },
     );
     proxyReq.on("error", () => { imageModels = null; imageModelsLoading = null; resolve(); });
+    /** A TCP hang (connection accepted, no response) parks imageModelsLoading forever; every
+     *  image request joins the same pending promise with no fallback. Timeout mirrors the error
+     *  handler so a hung /models self-heals. destroy() re-fires that error handler — both set the
+     *  same null state, so the double-resolve is harmless; keep them aligned if either changes. */
+    proxyReq.setTimeout(30_000, () => {
+      imageModels = null; imageModelsLoading = null; resolve(); proxyReq.destroy();
+    });
     proxyReq.end();
   });
   return imageModelsLoading;
@@ -762,10 +773,8 @@ async function handleMessages(req, res, body) {
 
   /* ---- request translation ---- */
 
-  // The advisor child (wantsNoAdvisor) reasons at high effort by default — the official advisor
-  // default — rather than the medium that adaptive thinking maps to. CORTI_ADVISOR_EFFORT
-  // overrides (e.g. "medium" to keep consults cheap). Read at call time so a change takes effect
-  // on the next consult without a gateway restart.
+  // The advisor child reasons at high effort by default. CORTI_ADVISOR_EFFORT overrides, passed
+  // verbatim — Corti's vocabulary is {high, max}; use only those. Read at call time (no restart).
   const noAdvisor = wantsNoAdvisor(req);
   const advisorEffort = noAdvisor
     ? (process.env.CORTI_ADVISOR_EFFORT || "high")

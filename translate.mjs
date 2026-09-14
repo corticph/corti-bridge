@@ -51,7 +51,7 @@ export function _resetWebSearchCache() { webSearchBySession.clear(); }
  *  a SHA-256 of the image data, however the image arrived (paste or tool result). No
  *  session id → throwaway map, same rule as the advisor dedup and WebSearch. */
 const IMAGE_CACHE_CAP = 64;
-const IMAGE_CACHE_PER_SESSION = 64;
+const IMAGE_CACHE_PER_SESSION = 128;
 const imageCacheBySession = new Map();
 
 function imageCacheMap(sessionId) {
@@ -122,6 +122,16 @@ function mapModel(model) {
   if (/fable/i.test(model)) return process.env.ANTHROPIC_DEFAULT_FABLE_MODEL || model;
   return model;
 }
+
+// Corti's effort vocabulary is {high, max}; the picker's six levels collapse at the midpoint.
+// Off-vocabulary values (medium/low) floor somewhere unknown upstream.
+const mapEffort = (e) => {
+  if (typeof e !== "string") return undefined;
+  const v = e.toLowerCase();
+  if (["low", "medium", "high"].includes(v)) return "high";
+  if (["xhigh", "max", "ultracode"].includes(v)) return "max";
+  return undefined;
+};
 
 /* ------------------------------------------------------------------ */
 /* web search: Tavily API (primary), DuckDuckGo HTML (keyless fallback)*/
@@ -686,8 +696,8 @@ async function interceptWebSearch(body, { toolUseMap, parentSessionId, webSearch
 /** Describes images for a non-multimodal model. corti-s1 (the opus tier) is blind: a Read on a
  *  .png returns a base64 image block the model can't process and Corti rejects the whole turn
  *  with `400 "…is not a multimodal model"`, killing the session. Here we replace each image block
- *  with a text description from a sighted side model (corti-s1-mini), so the blind primary never
- *  receives an image. Capability-driven: when a future model reports image_input:true the
+ *  with a text description from a sighted side model (corti-s1-mini-instant), so the blind primary
+ *  never receives an image. Capability-driven: when a future model reports image_input:true the
  *  intercept is a no-op and images pass through untouched (no code change).
  *
  *  Recursion guard: the sidecall re-enters this gateway with skipImages set, checked first so a
@@ -1246,16 +1256,6 @@ export async function translateRequest(body, opts) {
         req.parallel_tool_calls = false;
     }
   }
-
-  // Corti's effort vocabulary is {high, max}; the picker's six levels collapse at the
-  // midpoint. Off-vocabulary values (medium/low) floor somewhere unknown upstream.
-  const mapEffort = (e) => {
-    if (typeof e !== "string") return undefined;
-    const v = e.toLowerCase();
-    if (["low", "medium", "high"].includes(v)) return "high";
-    if (["xhigh", "max", "ultracode"].includes(v)) return "max";
-    return undefined;
-  };
 
   // effort (depth) and thinking (whether) are separate axes. reasoning_effort is gated on
   // body.thinking: a request with no thinking block is not reasoning-capable and 400s on effort.
