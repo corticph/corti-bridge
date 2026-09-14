@@ -774,7 +774,7 @@ async function handleMessages(req, res, body) {
   /* ---- request translation ---- */
 
   // The advisor child reasons at high effort by default. CORTI_ADVISOR_EFFORT overrides, passed
-  // verbatim — Corti's vocabulary is {high, max}; use only those. Read at call time (no restart).
+  // verbatim (Corti's vocabulary is {high, max}); set at launch, so a change needs a restart.
   const noAdvisor = wantsNoAdvisor(req);
   const advisorEffort = noAdvisor
     ? (process.env.CORTI_ADVISOR_EFFORT || "high")
