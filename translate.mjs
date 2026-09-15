@@ -4,6 +4,7 @@ import https from "node:https";
 import path from "node:path";
 import fs from "node:fs";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { serializeAdvisorInput } from "./lib/advisor-transcript.mjs";
 
@@ -45,6 +46,54 @@ function webSearchCacheMap(sessionId) {
 
 export function _resetWebSearchCache() { webSearchBySession.clear(); }
 
+/** Per-session cache: image key -> text description. A described image must produce the same
+ *  bytes every turn, else the prefix cache collapses (A1) — same failure mode as WebSearch. Key is
+ *  a SHA-256 of the image data, however the image arrived (paste or tool result). No
+ *  session id → throwaway map, same rule as the advisor dedup and WebSearch. */
+const IMAGE_CACHE_CAP = 64;
+const IMAGE_CACHE_PER_SESSION = 128;
+const imageCacheBySession = new Map();
+
+function imageCacheMap(sessionId) {
+  if (!sessionId) return new Map();
+  let map = imageCacheBySession.get(sessionId);
+  if (!map) {
+    if (imageCacheBySession.size >= IMAGE_CACHE_CAP)
+      imageCacheBySession.delete(imageCacheBySession.keys().next().value);
+    map = new Map();
+    imageCacheBySession.set(sessionId, map);
+  }
+  return map;
+}
+
+export function _resetImageCache() { imageCacheBySession.clear(); }
+
+/** Stable key for an image block: the hash of its data, however it arrived. A re-Read of a pasted
+ *  image carries a fresh tool_use_id, so scoping the key to the call missed the cache and
+ *  re-described identical bytes — three reads of one image gave three palettes, and the model
+ *  trusted the last. tool_use_id is only the fallback when there is no data to hash. */
+function imageCacheKey(block, toolUseId) {
+  const src = block?.source;
+  const data = src?.type === "base64" ? src.data : src?.url;
+  if (!data) return toolUseId || null;
+  return createHash("sha256").update(String(data)).digest("hex").slice(0, 32);
+}
+
+/** Wraps a vision description as the model's visual access to an image. The prefix frames it as
+ *  authoritative, not a handicap: loss-emphasising wording drove re-Reads "to verify" and long doubt
+ *  spirals. Fixed prefix keeps cached descriptions byte-identical across turns (A1). */
+function imageDescriptionText(description) {
+  return "[complete visual description of the image — work from this; re-reading the file returns " +
+    "this same description]:\n" + description;
+}
+
+/** Placeholder when the describe sidecall failed: keeps the model working instead of 400-ing on an
+ *  image it can't process. Same authoritative framing so a failure doesn't prompt a re-Read attempt. */
+function imageDescriptionFallback(reason) {
+  return "[image could not be described — re-reading the file returns this same note, not the " +
+    `image; work without it: ${String(reason).slice(0, 120)}]`;
+}
+
 export class TranslateRejection extends Error {
   constructor(status, envelope) {
     super(envelope.error.message);
@@ -73,6 +122,16 @@ function mapModel(model) {
   if (/fable/i.test(model)) return process.env.ANTHROPIC_DEFAULT_FABLE_MODEL || model;
   return model;
 }
+
+// Corti's effort vocabulary is {high, max}; the picker's six levels collapse at the midpoint.
+// Off-vocabulary values (medium/low) floor somewhere unknown upstream.
+const mapEffort = (e) => {
+  if (typeof e !== "string") return undefined;
+  const v = e.toLowerCase();
+  if (["low", "medium", "high"].includes(v)) return "high";
+  if (["xhigh", "max", "ultracode"].includes(v)) return "max";
+  return undefined;
+};
 
 /* ------------------------------------------------------------------ */
 /* web search: Tavily API (primary), DuckDuckGo HTML (keyless fallback)*/
@@ -634,6 +693,107 @@ async function interceptWebSearch(body, { toolUseMap, parentSessionId, webSearch
   return diagnostics;
 }
 
+/** Describes images for a non-multimodal model. corti-s1 (the opus tier) is blind: a Read on a
+ *  .png returns a base64 image block the model can't process and Corti rejects the whole turn
+ *  with `400 "…is not a multimodal model"`, killing the session. Here we replace each image block
+ *  with a text description from a sighted side model (corti-s1-mini-instant), so the blind primary
+ *  never receives an image. Capability-driven: when a future model reports image_input:true the
+ *  intercept is a no-op and images pass through untouched (no code change).
+ *
+ *  Recursion guard: the sidecall re-enters this gateway with skipImages set, checked first so a
+ *  misconfigured catalog (the vision model reported blind too) can't recurse. describeImage is
+ *  injectable via ctx so tests stay hermetic (no HTTP). */
+// Reminders share the image's user message and dwarf it — a measured 3656-char CLAUDE.md replay
+// ahead of a 117-char question — so the vision model read the reminder as the request.
+const REMINDER_SPAN = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+// The harness's provenance marker for a pasted image, not something the user asked about.
+const IMAGE_SOURCE_MARKER = /^\[Image:\s*source:[^\]]*\]$/;
+
+/** The most recent user text (the question) and assistant text (the model's intent) before the
+ *  image, so the vision model can focus on what's actually being asked. The caps are a backstop
+ *  against a pathological paste, not a payload concern — the sidecall body is ~350KB of base64
+ *  image, so the context is a rounding error beside it. */
+function describeContext(body) {
+  let userText = "";
+  let asstText = "";
+  for (const msg of body.messages ?? []) {
+    if (!msg || !Array.isArray(msg.content)) continue;
+    const text = msg.content
+      .filter((b) => b?.type === "text" && typeof b.text === "string" && b.text.trim())
+      .map((b) => b.text.replace(REMINDER_SPAN, " ").trim())
+      .filter((t) => t && !IMAGE_SOURCE_MARKER.test(t))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text) continue;
+    if (msg.role === "user") userText = text.slice(0, 2000);
+    else if (msg.role === "assistant") asstText = text.slice(0, 1000);
+  }
+  // Prefer the user's question; fall back to the model's stated intent if there's no user text.
+  const ctx = userText || asstText;
+  return ctx || null;
+}
+
+async function interceptImages(body, {
+  toolUseMap, parentSessionId, describeImage, imageModels, skipImages,
+} = {}) {
+  // A sidecall's own request carries skipImages — never re-describe it (recursion guard).
+  if (skipImages) return [];
+  // No describeImage injected (gateway didn't wire it, or a no-image test request) → inert.
+  if (typeof describeImage !== "function") return [];
+  const diagnostics = [];
+  // Resolved model id (interceptModelMapping runs before this in the chain). Unknown capability
+  // → treat as blind: a redundant description still works, a missed image crashes the turn.
+  const model = body.model;
+  const sighted = imageModels instanceof Set ? imageModels.has(model) : false;
+  if (sighted) return [];
+  const cache = imageCacheMap(parentSessionId);
+  // Same context for every image in this request — the question/intent that accompanies them.
+  const context = describeContext(body);
+
+  for (const msg of body.messages ?? []) {
+    if (msg?.role !== "user" || !Array.isArray(msg.content)) continue;
+    for (const b of msg.content) {
+      if (b?.type === "tool_result" && Array.isArray(b.content)) {
+        for (let i = 0; i < b.content.length; i++) {
+          const img = b.content[i];
+          if (img?.type !== "image") continue;
+          const key = imageCacheKey(img, b.tool_use_id);
+          let desc = key ? cache.get(key) : undefined;
+          if (desc === undefined) {
+            const got = await describeImage(img, context);
+            desc = got?.ok ? imageDescriptionText(got.text) : imageDescriptionFallback(got?.code || got?.detail || "unavailable");
+            if (key) {
+              if (cache.size >= IMAGE_CACHE_PER_SESSION) cache.delete(cache.keys().next().value);
+              cache.set(key, desc);
+            }
+            diagnostics.push(`image described (tool_result ${b.tool_use_id || "?"}): ${got?.ok ? "ok" : got?.code || "failed"}`);
+          }
+          b.content[i] = { type: "text", text: desc };
+        }
+      } else if (b?.type === "image") {
+        const key = imageCacheKey(b, null);
+        let desc = key ? cache.get(key) : undefined;
+        if (desc === undefined) {
+          const got = await describeImage(b, context);
+          desc = got?.ok ? imageDescriptionText(got.text) : imageDescriptionFallback(got?.code || got?.detail || "unavailable");
+          if (key) {
+            if (cache.size >= IMAGE_CACHE_PER_SESSION) cache.delete(cache.keys().next().value);
+            cache.set(key, desc);
+          }
+          diagnostics.push(`image described (user message): ${got?.ok ? "ok" : got?.code || "failed"}`);
+        }
+        // Swap to text in place: the user-message loop would otherwise rewrite a raw image block
+        // to an image_url part. A described image must become text, not an image_url.
+        b.type = "text";
+        b.text = desc;
+        delete b.source;
+      }
+    }
+  }
+  return diagnostics;
+}
+
 let warnedAdvisorVar = false;
 
 // One knob, mode-aware default. skipAdvisor (the -noadvisor- recursion guard) is
@@ -746,6 +906,7 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
 
 const intercepts = [
   interceptModelMapping,
+  interceptImages,
   interceptWebSearch,
   interceptConsultAdvisor,
 ];
@@ -1031,6 +1192,11 @@ export async function translateRequest(body, opts) {
   if (typeof body.temperature === "number") req.temperature = body.temperature;
   if (typeof body.top_p === "number") req.top_p = body.top_p;
 
+  // Structured JSON output (Corti honors response_format: { type: "json_object" }). Used by the
+  // vision describe sidecall so its typed fields parse cleanly; passed through verbatim.
+  if (body.response_format && typeof body.response_format === "object" && body.response_format.type === "json_object")
+    req.response_format = { type: "json_object" };
+
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) {
     req.stop = body.stop_sequences.slice(0, 4).filter((s) => typeof s === "string");
     if (body.stop_sequences.length > 4) dropped.push("stop_sequences truncated to first 4");
@@ -1091,25 +1257,23 @@ export async function translateRequest(body, opts) {
     }
   }
 
+  // effort (depth) and thinking (whether) are separate axes. reasoning_effort is gated on
+  // body.thinking: a request with no thinking block is not reasoning-capable and 400s on effort.
   const th = body.thinking;
   if (th && typeof th === "object") {
-    const budget = th.budget_tokens;
-    if (th.type === "enabled") {
-      req.reasoning_effort =
-        typeof budget === "number" && budget < 4096 ? "low"
-        : typeof budget === "number" && budget < 16384 ? "medium"
-        : "high";
-      if (typeof budget === "number" && budget > 0) req.thinking_token_budget = budget;
-    } else if (th.type === "adaptive") {
-      req.reasoning_effort = "medium";
-    }
+    const effort = mapEffort(body.output_config?.effort);
+    // output_config.effort (the picker) wins over the legacy budget mapping; adaptive enables only.
+    const budgetEffort =
+      th.type === "enabled" && typeof th.budget_tokens === "number"
+        ? mapEffort(th.budget_tokens < 4096 ? "low" : th.budget_tokens < 16384 ? "medium" : "high")
+        : undefined;
+    req.reasoning_effort = effort ?? budgetEffort ?? "high";
+    if (th.type === "enabled" && typeof th.budget_tokens === "number" && th.budget_tokens > 0)
+      req.thinking_token_budget = th.budget_tokens;
   }
 
-  // C2: the advisor child should reason at high (the official default), not the medium that
-  // adaptive thinking maps to above. The gateway sets advisorEffort for the advisor child
-  // (detected via the -noadvisor- token); it overrides whatever the thinking block produced,
-  // including the adaptive→medium mapping. A model that rejects this effort level will 400 at
-  // upstream — that surfaces a real capability gap rather than silently reasoning shallow.
+  // C2: the advisor child reasons at CORTI_ADVISOR_EFFORT (high by default), overriding the
+  // resolved effort above. A model that rejects the level 400s — surfacing a capability gap.
   if (opts?.advisorEffort) req.reasoning_effort = opts.advisorEffort;
 
   return { request: req, dropped };

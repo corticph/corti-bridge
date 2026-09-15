@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
+import { fileURLToPath } from "node:url";
 import {
   TranslateRejection,
   advisorContinuationErrorCode,
@@ -261,10 +262,13 @@ async function handlePassthrough(req, res, reqPath) {
   if (!isCountTokens && req.method === "POST" && reqPath === "/v1/messages") {
     try {
       const parsed = JSON.parse(body.toString());
+      const imageOpts = await imageInterceptOpts(parsed, parsed?.skipImages);
       await applyIntercepts(parsed, {
         skipAdvisor: wantsNoAdvisor(req),
         mode: "anthropic",
         parentSessionId: req.headers["x-claude-code-session-id"],
+        skipImages: parsed?.skipImages,
+        ...imageOpts,
       });
       body = Buffer.from(JSON.stringify(parsed));
     } catch {
@@ -366,6 +370,200 @@ function countTokens(body) {
       },
     };
   }
+}
+
+/** The set of model ids that accept image input, fetched lazily from the catalog on the first
+ *  image-bearing request and cached for the process lifetime. Drives interceptImages: a blind
+ *  model gets its images described; a sighted model (a future multimodal corti-s1) passes images
+ *  through untouched. null while unknown or after a fetch failure — interceptImages then treats
+ *  every model as blind (describe), which is safer than passing an image to a model that 400s. */
+let imageModels = null;
+let imageModelsLoading = null;
+
+function fetchImageModels() {
+  if (imageModelsLoading) return imageModelsLoading;
+  imageModelsLoading = new Promise((resolve) => {
+    const proxyReq = https.request(
+      new URL(`${UPSTREAM_OPENAI}/models`),
+      { agent, method: "GET", headers: { authorization: `Bearer ${BEARER}` } },
+      (upstream) => {
+        const chunks = [];
+        upstream.on("data", (c) => chunks.push(c));
+        /** A non-200 (503, 401) can carry valid JSON with no list.data → an empty Set, not null,
+         *  so imageInterceptOpts never retries. Treat it as a fetch failure so a transient /models
+         *  outage self-heals on the next image request. */
+        upstream.on("end", () => {
+          try {
+            if (upstream.statusCode !== 200) { imageModels = null; imageModelsLoading = null; return resolve(); }
+            const list = JSON.parse(Buffer.concat(chunks).toString());
+            const sighted = new Set();
+            for (const m of Array.isArray(list?.data) ? list.data : [])
+              if (m && typeof m.id === "string" && m.capabilities?.image_input === true)
+                sighted.add(m.id);
+            imageModels = sighted;
+          } catch {
+            imageModels = null;
+          }
+          imageModelsLoading = null;
+          resolve();
+        });
+      },
+    );
+    proxyReq.on("error", () => { imageModels = null; imageModelsLoading = null; resolve(); });
+    /** A TCP hang (connection accepted, no response) parks imageModelsLoading forever; every
+     *  image request joins the same pending promise with no fallback. Timeout mirrors the error
+     *  handler so a hung /models self-heals. destroy() re-fires that error handler — both set the
+     *  same null state, so the double-resolve is harmless; keep them aligned if either changes. */
+    proxyReq.setTimeout(30_000, () => {
+      imageModels = null; imageModelsLoading = null; resolve(); proxyReq.destroy();
+    });
+    proxyReq.end();
+  });
+  return imageModelsLoading;
+}
+
+/** The vision model used to describe images for a blind primary. Defaults to the instant
+ *  sonnet tier (corti-s1-mini-instant): multimodal and non-reasoning, so no thinking cap is needed
+ *  and latency is low — describing is perception, not reasoning. CORTI_VISION_MODEL overrides;
+ *  point it at a reasoning model (corti-s1-mini) when the question needs chart arithmetic. Must
+ *  itself be multimodal — if it's blind, the skipImages recursion guard stops re-describing and
+ *  the upstream 400 surfaces as a graceful placeholder, not a crash. */
+function visionModel() {
+  return process.env.CORTI_VISION_MODEL || process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL || "corti-s1-mini-instant";
+}
+
+/** The system prompt for the vision sidecall, in lib/ so the per-type checklists stay readable.
+ *  Fixed across every call so it prefix-caches. Asks for a JSON object with typed fields (adapted
+ *  from the vision-describer prompt pack): a verbatim text_content transcription, a structural
+ *  description, a palette, and an uncertainties list so the lossiness is machine-readable. */
+const DESCRIBE_PROMPT_FILE = path.join(
+  path.dirname(fileURLToPath(import.meta.url)), "lib", "vision-describe-prompt.txt");
+
+// Read once and cached. An unreadable file degrades to no system prompt: the vision model then
+// returns prose instead of JSON, which runDescribeImage already passes through as raw text.
+let _describeSystemCache;
+function describeSystem() {
+  if (_describeSystemCache === undefined) {
+    try {
+      _describeSystemCache = fs.readFileSync(DESCRIBE_PROMPT_FILE, "utf8").trim();
+    } catch (err) {
+      console.error(`corti-proxy: cannot read ${DESCRIBE_PROMPT_FILE}: ${err.message}`);
+      _describeSystemCache = "";
+    }
+  }
+  return _describeSystemCache;
+}
+
+/** The user turn for the describe sidecall. The context steers what the description covers, never
+ *  what it answers: a task-shaped request ("build me this page") otherwise reads as addressed to
+ *  the vision model, which then replies as the calling agent instead of describing. */
+function describeUserPrompt(context) {
+  return context
+    ? `Request from the calling agent:\n<request>\n${context}\n</request>\n\nDescribe the image. The request tells you what to attend to; do not carry it out.`
+    : "Describe this image completely.";
+}
+
+/** Assembles the parsed JSON fields into the text block the blind primary reads as the image's
+ *  record. Each section is labeled so the consumer can find transcription, description and palette
+ *  independently; omitted/empty fields are skipped rather than emitting empty headers.
+ *
+ *  Every field here is a property of the image, never of the request. The cache key is the image
+ *  hash, so a request-dependent field would be computed from the first turn's question and then
+ *  replayed, stale, for every later one — which is why there is no answer field. */
+function formatImageDescription(f) {
+  const parts = [];
+  if (f.summary) parts.push(`[summary]: ${f.summary}`);
+  if (f.description) parts.push(`[description]: ${f.description}`);
+  if (f.text_content) parts.push(`[text content]: ${f.text_content}`);
+  if (Array.isArray(f.palette) && f.palette.length) parts.push(`[palette]: ${f.palette.join("; ")}`);
+  else if (typeof f.palette === "string" && f.palette.trim()) parts.push(`[palette]: ${f.palette.trim()}`);
+  if (Array.isArray(f.uncertainties) && f.uncertainties.length)
+    parts.push(`[uncertainties]: ${f.uncertainties.join("; ")}`);
+  return parts.length ? parts.join("\n\n") : JSON.stringify(f);
+}
+
+/** Describes one image block by re-entering this gateway's own openai endpoint with an Anthropic
+ *  Messages body carrying the image and the vision model. Re-entry reuses the gateway's full
+ *  translation + retry machinery; the openai path doesn't validate incoming client auth, so a bare
+ *  POST is clean. skipImages on the body is the recursion guard: interceptImages checks it first.
+ *  Resolves { ok, text } on success or { ok:false, code, detail } on failure — interceptImages turns
+ *  a failure into a graceful placeholder rather than letting a blind model receive the image.
+ *  context (optional) is the surrounding user question / model intent, extracted by interceptImages
+ *  so the vision model can focus on what's actually being asked rather than a generic summary. */
+function runDescribeImage(block, context) {
+  return new Promise((resolve) => {
+    const reqBody = JSON.stringify({
+      model: visionModel(),
+      max_tokens: 4096,
+      // Extraction, not composition — and unpinned decoding makes every prompt change unmeasurable.
+      temperature: 0.1,
+      top_p: 0.9,
+      response_format: { type: "json_object" },
+      skipImages: true,
+      system: describeSystem(),
+      // Image before text: matches VLM training-data ordering.
+      messages: [{ role: "user", content: [
+        block,
+        { type: "text", text: describeUserPrompt(context) },
+      ] }],
+    });
+    const req = http.request(
+      `http://${HOST}:${PORT}/v1/messages`,
+      { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(reqBody) } },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          if (res.statusCode !== 200)
+            return resolve({ ok: false, code: "describe_http_" + res.statusCode, detail: Buffer.concat(chunks).toString().slice(0, 200) });
+          try {
+            const msg = JSON.parse(Buffer.concat(chunks).toString());
+            const raw = (msg?.content || []).filter((b) => b?.type === "text").map((b) => b.text).join("\n").trim();
+            if (!raw) return resolve({ ok: false, code: "empty", detail: "vision model returned no text" });
+            // Parse the typed JSON fields; a parse failure degrades to the raw text — still usable.
+            let fields;
+            try { fields = JSON.parse(raw); } catch { fields = null; }
+            const text = fields ? formatImageDescription(fields) : raw;
+            return resolve({ ok: true, text });
+          } catch (e) {
+            return resolve({ ok: false, code: "unparseable", detail: String(e.message || e).slice(0, 200) });
+          }
+        });
+      },
+    );
+    req.on("error", (err) => resolve({ ok: false, code: err.code || "unavailable", detail: String(err.message || err).slice(0, 200) }));
+    // A bare Error reaches the error handler with no .code and collapses to "unavailable",
+    // reporting a timeout as an unknown failure.
+    req.setTimeout(Number(process.env.CORTI_VISION_TIMEOUT_MS) || 60_000, () => {
+      const err = new Error("vision describe timeout");
+      err.code = "timeout";
+      req.destroy(err);
+    });
+    req.end(reqBody);
+  });
+}
+
+/** True if any user message carries an image block — directly or inside a tool_result. Cheap
+ *  pre-check so the capability fetch + describe wiring only runs for image-bearing requests. */
+function bodyHasImage(body) {
+  for (const msg of body?.messages ?? []) {
+    if (msg?.role !== "user" || !Array.isArray(msg.content)) continue;
+    for (const b of msg.content) {
+      if (b?.type === "image") return true;
+      if (b?.type === "tool_result" && Array.isArray(b.content) && b.content.some((c) => c?.type === "image")) return true;
+    }
+  }
+  return false;
+}
+
+/** Opts for interceptImages, built only for image-bearing requests: ensures the capability set is
+ *  loaded (lazy, once per process) then wires the describe sidecall. Returns {} when the body
+ *  carries no image, so non-image requests pay nothing. The capability fetch is awaited so the
+ *  first image-bearing request blocks on it; later requests reuse the cached set. */
+async function imageInterceptOpts(body, skipImages) {
+  if (skipImages || !bodyHasImage(body)) return {};
+  if (imageModels === null) await fetchImageModels();
+  return { describeImage: runDescribeImage, imageModels };
 }
 
 function handleModels(res) {
@@ -575,17 +773,19 @@ async function handleMessages(req, res, body) {
 
   /* ---- request translation ---- */
 
-  // The advisor child (wantsNoAdvisor) reasons at high effort by default — the official advisor
-  // default — rather than the medium that adaptive thinking maps to. CORTI_ADVISOR_EFFORT
-  // overrides (e.g. "medium" to keep consults cheap). Read at call time so a change takes effect
-  // on the next consult without a gateway restart.
+  // The advisor child reasons at high effort by default. CORTI_ADVISOR_EFFORT overrides, passed
+  // verbatim (Corti's vocabulary is {high, max}); set at launch, so a change needs a restart.
   const noAdvisor = wantsNoAdvisor(req);
   const advisorEffort = noAdvisor
     ? (process.env.CORTI_ADVISOR_EFFORT || "high")
     : undefined;
   let translated;
   try {
-    const out = await translateRequest(anthropicBody, { skipAdvisor: noAdvisor, mode: "openai", advisorEffort, parentSessionId });
+    const imageOpts = await imageInterceptOpts(anthropicBody, anthropicBody?.skipImages);
+    const out = await translateRequest(anthropicBody, {
+      skipAdvisor: noAdvisor, mode: "openai", advisorEffort, parentSessionId,
+      skipImages: anthropicBody?.skipImages, ...imageOpts,
+    });
     translated = out.request;
     diagnostics.push(...out.dropped.map((d) => `dropped: ${d}`));
   } catch (err) {
@@ -843,7 +1043,7 @@ async function handleMessages(req, res, body) {
       // client request, so the advisor intercept must not touch it.
       // parentSessionId only re-inserts *prior* consults, so the continuation reads the history
       // the first call did; this turn's own consult is not recorded until the continuation settles.
-      translateRequest(contAnthropic, { skipAdvisor: true, parentSessionId })
+      translateRequest(contAnthropic, { skipAdvisor: true, skipImages: true, parentSessionId })
         .then((out) => {
           const contTranslated = out.request;
           diagnostics.push(...out.dropped.map((d) => `continuation dropped: ${d}`));

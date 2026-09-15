@@ -8,7 +8,7 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
-import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache } from "'"$REPO"'/translate.mjs";
+import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache, _resetImageCache } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 
 let failed = 0;
@@ -21,19 +21,46 @@ const effort = async (model, thinking) =>
   (await translateRequest({ model, max_tokens: 16, thinking, messages: [{ role: "user", content: "hi" }] }))
     .request.reasoning_effort;
 
+const effortCfg = async (model, thinking, output_config) =>
+  (await translateRequest({ model, max_tokens: 16, thinking, output_config, messages: [{ role: "user", content: "hi" }] }))
+    .request.reasoning_effort;
+
 const ENABLED = (n) => ({ type: "enabled", budget_tokens: n });
+const ADAPTIVE = { type: "adaptive" };
 
 // The advisor intercept skips a request with no tools (a one-shot side call cannot act on advice),
 // so every fixture that must reach the advisor carries one.
 const ANYTOOL = () => ({ name: "run_bash", description: "Run a bash command", input_schema: { type: "object" } });
 
-// Effort is budget-derived and model-independent.
+// Corti effort vocabulary is {high, max}. The picker six levels collapse at the midpoint;
+// budget mapping routes through the same collapse, so medium/low never reach upstream.
 for (const m of ["corti-s1", "corti-s1-mini", "corti-s1-ultra-beta", "corti-s1-ultra-instant-beta"]) {
-  check(`${m}: adaptive is medium`, await effort(m, { type: "adaptive" }), "medium");
-  check(`${m}: mid budget is medium`, await effort(m, ENABLED(8000)), "medium");
-  check(`${m}: low budget is low`, await effort(m, ENABLED(1000)), "low");
+  check(`${m}: adaptive (no effort) defaults to high`, await effort(m, ADAPTIVE), "high");
+  check(`${m}: mid budget collapses to high`, await effort(m, ENABLED(8000)), "high");
+  check(`${m}: low budget collapses to high`, await effort(m, ENABLED(1000)), "high");
   check(`${m}: high budget is high`, await effort(m, ENABLED(32000)), "high");
 }
+
+// output_config.effort (the picker) maps the six levels onto Corti two, with thinking adaptive.
+for (const lvl of ["low", "medium", "high"]) {
+  const got = await effortCfg("corti-s1", ADAPTIVE, { effort: lvl });
+  check(`output_config.effort=${lvl} → high`, got, "high");
+}
+for (const lvl of ["xhigh", "max", "ultracode"]) {
+  const got = await effortCfg("corti-s1", ADAPTIVE, { effort: lvl });
+  check(`output_config.effort=${lvl} → max`, got, "max");
+}
+
+// output_config.effort (the picker) wins over a conflicting thinking.enabled budget.
+const pickerWins = await effortCfg("corti-s1", ENABLED(1000), { effort: "max" });
+check("output_config.effort overrides budget mapping", pickerWins, "max");
+
+// Non-reasoning guard: no thinking block → no reasoning_effort, even with output_config.effort.
+const noThinking = (await translateRequest({
+  model: "corti-s1-mini-instant", max_tokens: 16, output_config: { effort: "max" },
+  messages: [{ role: "user", content: "hi" }],
+})).request.reasoning_effort;
+check("no thinking block omits reasoning_effort (non-reasoning guard)", noThinking, undefined);
 
 // Model name mapping: claude-* model names should map to configured Corti models via env vars.
 process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = "corti-s1";
@@ -583,17 +610,17 @@ const advSerErrText = serializeAdvisorInput(advSerErrBody).text;
 check("advisor C6 advisor-side: prior error surfaces as unavailable note",
   advSerErrText.includes("advisor unavailable (overloaded)"), true);
 
-// Block I — C2: advisorEffort overrides reasoning_effort (the advisor child reasons at high,
-// not the medium adaptive maps to). The gateway passes advisorEffort for the advisor child.
+// Block I — C2: advisorEffort overrides reasoning_effort (the advisor child reasons at high).
+// The gateway passes advisorEffort for the advisor child.
 const noThink = await translateRequest({ model: "corti-s1", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }, { advisorEffort: "high" });
 check("advisor C2: advisorEffort=high overrides even with no thinking block", noThink.request.reasoning_effort, "high");
 const adaptiveMed = await translateRequest({ model: "corti-s1", max_tokens: 16, thinking: { type: "adaptive" }, messages: [{ role: "user", content: "hi" }] }, { advisorEffort: "high" });
-check("advisor C2: advisorEffort=high overrides adaptive→medium", adaptiveMed.request.reasoning_effort, "high");
+check("advisor C2: advisorEffort=high overrides adaptive effort", adaptiveMed.request.reasoning_effort, "high");
 const budgetLow = await translateRequest({ model: "corti-s1", max_tokens: 16, thinking: { type: "enabled", budget_tokens: 1024 }, messages: [{ role: "user", content: "hi" }] }, { advisorEffort: "high" });
 check("advisor C2: advisorEffort=high overrides low budget mapping", budgetLow.request.reasoning_effort, "high");
-// Without advisorEffort, the thinking mapping is untouched (regression guard).
+// Without advisorEffort, adaptive resolves to the high default (regression guard).
 const noOverride = await translateRequest({ model: "corti-s1", max_tokens: 16, thinking: { type: "adaptive" }, messages: [{ role: "user", content: "hi" }] });
-check("advisor C2: no advisorEffort leaves adaptive→medium untouched", noOverride.request.reasoning_effort, "medium");
+check("advisor C2: no advisorEffort leaves adaptive at high default", noOverride.request.reasoning_effort, "high");
 // CORTI_ADVISOR_EFFORT overrides the default — read at call time by the gateway (not tested here
 // at the translate level, which only honors the explicit opt).
 
@@ -793,6 +820,240 @@ const d1pres = translateCompletion({
   usage: { prompt_tokens: 1, completion_tokens: 1 },
 }, d1ctx);
 check("D1: present tool_call id preserved", d1pres.content[0].id, "call_abc");
+
+// --- Image intercept: a non-multimodal primary (corti-s1) gets image blocks replaced with a
+// text description from a sighted side model, so Corti doesn\x27t 400 "not a multimodal model" and
+// kill the session. Capability-driven: a sighted model passes images through untouched. Cached
+// per image so the description is byte-identical across turns (A1 prefix cache stability).
+_resetImageCache();
+let describeCalls = 0;
+const describeStub = async (block) => { describeCalls++; return { ok: true, text: "a red square on white" }; };
+const imgFailStub = async (block) => { describeCalls++; return { ok: false, code: "timeout" }; };
+const blind = new Set(); // empty → no model is sighted → all described
+const sighted = new Set(["corti-s1-mini", "corti-s1-mini-instant"]);
+
+const imgTurn = (model) => ({
+  model, max_tokens: 16, messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "r1", name: "Read", input: { file_path: "x.png" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "r1", content: [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBOR" } },
+    ] }] },
+  ],
+});
+
+// Blind model: image block replaced with described text, describe called once.
+const b1 = imgTurn("corti-s1");
+describeCalls = 0;
+await applyIntercepts(b1, { describeImage: describeStub, imageModels: blind, parentSessionId: "s1" });
+check("image: blind model describes the image", describeCalls, 1);
+check("image: blind model replaces image block with text", b1.messages[1].content[0].content[0].type, "text");
+check("image: described text carries the complete-description prefix", b1.messages[1].content[0].content[0].text.startsWith("[complete visual description of the image"), true);
+check("image: described text tells the model to work from it", b1.messages[1].content[0].content[0].text.includes("work from this"), true);
+check("image: described text notes a re-read returns the same description", b1.messages[1].content[0].content[0].text.includes("re-reading the file returns this same description"), true);
+
+// Sighted model: passthrough, describe NOT called, image block untouched.
+const s1 = imgTurn("corti-s1-mini");
+describeCalls = 0;
+await applyIntercepts(s1, { describeImage: describeStub, imageModels: sighted, parentSessionId: "s2" });
+check("image: sighted model does not describe", describeCalls, 0);
+check("image: sighted model keeps the image block", s1.messages[1].content[0].content[0].type, "image");
+
+// Cache: same image across two turns (same session) → describe once, byte-identical.
+const c1 = imgTurn("corti-s1");
+const c2 = imgTurn("corti-s1");
+describeCalls = 0;
+await applyIntercepts(c1, { describeImage: describeStub, imageModels: blind, parentSessionId: "sc" });
+const firstDesc = c1.messages[1].content[0].content[0].text;
+await applyIntercepts(c2, { describeImage: describeStub, imageModels: blind, parentSessionId: "sc" });
+check("image: a historical image is described once, not once per turn", describeCalls, 1);
+check("image: the description is byte-identical across turns", c2.messages[1].content[0].content[0].text, firstDesc);
+
+// Session isolation: another session re-describes (no cross-session cache).
+const c3 = imgTurn("corti-s1");
+await applyIntercepts(c3, { describeImage: describeStub, imageModels: blind, parentSessionId: "other" });
+check("image: another session does not read this one\x27s cache", describeCalls, 2);
+
+// Two images in one tool_result: each gets its own description (the cache key must include the
+// data hash, not just the shared tool_use_id — else the second would get the first\x27s description).
+let multiCall = 0;
+const multiStub = async (block) => { multiCall++; return { ok: true, text: `desc ${block.source.data}` }; };
+const multi = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "m1", name: "Read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "m1", content: [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "BBBB" } },
+    ] }] },
+  ],
+};
+await applyIntercepts(multi, { describeImage: multiStub, imageModels: blind, parentSessionId: "sm" });
+check("image: two images in one tool_result are both described", multiCall, 2);
+check("image: first image gets its own description", multi.messages[1].content[0].content[0].text.includes("desc AAAA"), true);
+check("image: second image gets its own description", multi.messages[1].content[0].content[1].text.includes("desc BBBB"), true);
+
+// The same bytes pasted by the user and later re-Read by the model (fresh tool_use_id each time)
+// must reuse one description; re-describing gave three different palettes for one image.
+let rereadCalls = 0;
+const rereadStub = async () => { rereadCalls++; return { ok: true, text: `desc call ${rereadCalls}` }; };
+const pasted = { type: "image", source: { type: "base64", media_type: "image/png", data: "SAME" } };
+const rereadBody = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: [structuredClone(pasted), { type: "text", text: "build this" }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "rr1", name: "Read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "rr1", content: [structuredClone(pasted)] }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "rr2", name: "Read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "rr2", content: [structuredClone(pasted)] }] },
+  ],
+};
+await applyIntercepts(rereadBody, { describeImage: rereadStub, imageModels: blind, parentSessionId: "srr" });
+check("image: a re-Read of a pasted image is described once", rereadCalls, 1);
+check("image: every re-Read gets the pasted image\x27s description",
+  rereadBody.messages[4].content[0].content[0].text, rereadBody.messages[0].content[0].text);
+
+// Sidecall failure → graceful placeholder, no crash, image block still replaced with text.
+const f1 = imgTurn("corti-s1");
+describeCalls = 0;
+await applyIntercepts(f1, { describeImage: imgFailStub, imageModels: blind, parentSessionId: "sf" });
+check("image: failed describe still replaces the image block", f1.messages[1].content[0].content[0].type, "text");
+check("image: failed describe leaves a placeholder", f1.messages[1].content[0].content[0].text.startsWith("[image could not be described"), true);
+check("image: failed describe notes a re-read returns the same note", f1.messages[1].content[0].content[0].text.includes("re-reading the file returns this same note"), true);
+check("image: failed describe tells the model to work without it", f1.messages[1].content[0].content[0].text.includes("work without it"), true);
+
+// skipImages recursion guard: a sidecall\x27s own request is never re-described.
+const sk1 = imgTurn("corti-s1");
+describeCalls = 0;
+await applyIntercepts(sk1, { describeImage: describeStub, imageModels: blind, skipImages: true, parentSessionId: "sk" });
+check("image: skipImages guard prevents describing", describeCalls, 0);
+check("image: skipImages guard leaves the image block", sk1.messages[1].content[0].content[0].type, "image");
+
+// No describeImage injected → inert (a non-image-bearing request pays nothing).
+const n1 = imgTurn("corti-s1");
+await applyIntercepts(n1, { imageModels: blind, parentSessionId: "none" });
+check("image: no describeImage injected leaves the image block", n1.messages[1].content[0].content[0].type, "image");
+
+// User-message image (no tool_result) → described, swapped to text in place.
+const u1 = { model: "corti-s1", max_tokens: 16, messages: [
+  { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "qRS=" } }] },
+] };
+describeCalls = 0;
+await applyIntercepts(u1, { describeImage: describeStub, imageModels: blind, parentSessionId: "su" });
+check("image: user-message image is described", describeCalls, 1);
+check("image: user-message image swapped to text in place", u1.messages[0].content[0].type, "text");
+check("image: user-message image no longer carries a source", u1.messages[0].content[0].source, undefined);
+
+// End-to-end through translateRequest: a blind model\x27s translated upstream request has no
+// image_url part — the description is text instead.
+const e2e = await translateRequest({
+  model: "corti-s1", max_tokens: 16,
+  messages: [
+    { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "e2E=" } }] },
+  ],
+}, { describeImage: describeStub, imageModels: blind, parentSessionId: "e2e" });
+const e2eJson = JSON.stringify(e2e.request);
+check("image: translated request has no image_url", e2eJson.includes("image_url"), false);
+check("image: translated request carries the description as text", e2e.request.messages.some((m) => typeof m.content === "string" && m.content.includes("complete visual description of the image")), true);
+
+// response_format passthrough: the vision sidecall asks for JSON object mode (Corti honors it),
+// so translateRequest must forward it to the upstream OpenAI request verbatim.
+const rfPresent = (await translateRequest({
+  model: "corti-s1", max_tokens: 16, response_format: { type: "json_object" },
+  messages: [{ role: "user", content: "hi" }],
+})).request.response_format;
+check("response_format: json_object forwarded upstream", JSON.stringify(rfPresent), JSON.stringify({ type: "json_object" }));
+const rfAbsent = (await translateRequest({
+  model: "corti-s1", max_tokens: 16,
+  messages: [{ role: "user", content: "hi" }],
+})).request.response_format;
+check("response_format: omitted when not requested", rfAbsent, undefined);
+
+// The sidecall puts the image part first (VLM training-data ordering) and pins decoding; both
+// have to survive translation to reach upstream.
+const sidecall = (await translateRequest({
+  model: "corti-s1-mini-instant", max_tokens: 16, temperature: 0.1, top_p: 0.9,
+  skipImages: true,
+  messages: [{ role: "user", content: [
+    { type: "image", source: { type: "base64", media_type: "image/png", data: "ord=" } },
+    { type: "text", text: "Describe the image." },
+  ] }],
+}, { skipImages: true })).request;
+check("sidecall: temperature survives translation", sidecall.temperature, 0.1);
+check("sidecall: top_p survives translation", sidecall.top_p, 0.9);
+const sidecallParts = (sidecall.messages.find((m) => m.role === "user") || {}).content;
+check("sidecall: image part is sent before the text part",
+  Array.isArray(sidecallParts) && sidecallParts[0]?.type, "image_url");
+check("sidecall: the text part still follows it",
+  Array.isArray(sidecallParts) && sidecallParts[1]?.type, "text");
+
+// Context threading: the user\x27s question is passed to describeImage so the vision model can focus
+// on what\x27s actually being asked, not a generic summary. The cache key stays the image hash only,
+// so a second turn with the same image reuses the first description (context isn\x27t re-evaluated).
+let capturedCtx = null;
+const ctxStub = async (block, context) => { capturedCtx = context; return { ok: true, text: "ctx desc" }; };
+const ctxBody = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: [{ type: "text", text: "what is wrong with the Open details section on the page?" }] },
+    { role: "assistant", content: [{ type: "text", text: "Let me look at the screenshot." }] },
+    { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "ctx=" } }] },
+  ],
+};
+await applyIntercepts(ctxBody, { describeImage: ctxStub, imageModels: blind, parentSessionId: "sctx" });
+check("image: user question is passed to describeImage as context", capturedCtx && capturedCtx.includes("Open details section"), true);
+
+// No user text, only an assistant intent → context falls back to the model\x27s stated intent.
+let asstCtx = null;
+const asstStub = async (block, context) => { asstCtx = context; return { ok: true, text: "asst desc" }; };
+const asstBody = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "assistant", content: [{ type: "text", text: "I will inspect the layout now." }] },
+    { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "ai=" } }] },
+  ],
+};
+await applyIntercepts(asstBody, { describeImage: asstStub, imageModels: blind, parentSessionId: "sasst" });
+check("image: falls back to assistant intent when no user text", asstCtx && asstCtx.includes("inspect the layout"), true);
+
+// No text at all in history → context is null (the vision model gets the generic multi-angle prompt).
+let nullCtx = "sentinel";
+const nullStub = async (block, context) => { nullCtx = context; return { ok: true, text: "n desc" }; };
+const nullBody = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "nl=" } }] },
+  ],
+};
+await applyIntercepts(nullBody, { describeImage: nullStub, imageModels: blind, parentSessionId: "snull" });
+check("image: no surrounding text yields null context", nullCtx, null);
+
+// A CLAUDE.md replay sits ahead of the real question in the SAME user message, and joined verbatim
+// it buried the question past the old 400-char cap.
+let remCtx = null;
+const remStub = async (block, context) => { remCtx = context; return { ok: true, text: "rem desc" }; };
+const bigReminder = "<system-reminder>\n" + "Codebase and user instructions. ".repeat(200) + "\n</system-reminder>";
+const remBody = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: [
+      { type: "text", text: bigReminder },
+      { type: "text", text: "recreate this page as close to the original as possible" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "rem=" } },
+      { type: "text", text: "[Image: source: /Users/x/.claude/image-cache/s/1.png]" },
+    ] },
+  ],
+};
+await applyIntercepts(remBody, { describeImage: remStub, imageModels: blind, parentSessionId: "srem" });
+check("image: system-reminder is stripped from describe context", /system-reminder|Codebase and user instructions/.test(remCtx), false);
+check("image: the real question survives a leading reminder", remCtx, "recreate this page as close to the original as possible");
+
+// The provenance marker is the harness telling itself where the paste came from, never a question.
+let markerCtx = null;
+const markerStub = async (block, context) => { markerCtx = context; return { ok: true, text: "m desc" }; };
+const markerBody = {
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "mk=" } },
+      { type: "text", text: "[Image: source: /Users/x/.claude/image-cache/s/2.png]" },
+    ] },
+  ],
+};
+await applyIntercepts(markerBody, { describeImage: markerStub, imageModels: blind, parentSessionId: "smark" });
+check("image: lone provenance marker yields null context", markerCtx, null);
 
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }
