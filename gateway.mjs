@@ -101,6 +101,11 @@ const BYTE_CAP_BYTES = 8_000_000;
 const MEMORY_BREAKER_BYTES = 64_000_000;
 
 const DEBUG = isTruthy(process.env.CORTI_DEBUG);
+/** Opt-in from `setup.sh --experimental` / `corti-bridge models --experimental`, persisted in
+ *  models.env and exported by the wrapper. The image-capability lookup (fetchImageModels) then
+ *  queries /models?experimental=true so a pinned beta (e.g. multimodal corti-s1-beta) is recognized
+ *  as sighted; off → plain /models, betas invisible, images described as today. */
+const EXPERIMENTAL = isTruthy(process.env.CORTI_EXPERIMENTAL);
 const _debugMaxBody = Number(process.env.CORTI_DEBUG_MAX_BODY);
 // 0 stays 0 (the "unlimited" sentinel); NaN (a non-numeric env value) falls back to the default.
 const DEBUG_MAX_BODY = Number.isFinite(_debugMaxBody) ? _debugMaxBody : 2097152;
@@ -384,7 +389,7 @@ function fetchImageModels() {
   if (imageModelsLoading) return imageModelsLoading;
   imageModelsLoading = new Promise((resolve) => {
     const proxyReq = https.request(
-      new URL(`${UPSTREAM_OPENAI}/models`),
+      new URL(`${UPSTREAM_OPENAI}/models${EXPERIMENTAL ? "?experimental=true" : ""}`),
       { agent, method: "GET", headers: { authorization: `Bearer ${BEARER}` } },
       (upstream) => {
         const chunks = [];

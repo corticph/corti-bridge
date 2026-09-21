@@ -127,6 +127,23 @@ ANTHROPIC_DEFAULT_FABLE_MODEL_PIN=\"1\""
   printf '%s\n' "$_md_pin"
 }
 
+# Echoes the CORTI_EXPERIMENTAL line for models.env, or nothing. The gateway reads it at boot to
+# decide whether fetchImageModels queries /models?experimental=true (a pinned beta like the
+# multimodal corti-s1-beta is only in the experimental catalog). $1 = this run's --experimental
+# intent (1/0); $2 = the existing models.env path, so a --fresh refresh preserves an earlier opt-in
+# rather than silently dropping it. A run that didn't pass --experimental keeps what was there.
+models_experimental_line() {
+  if [ "${1:-0}" = 1 ]; then
+    printf 'CORTI_EXPERIMENTAL="1"\n'
+    return 0
+  fi
+  [ -n "$2" ] && [ -f "$2" ] || return 0
+  _md_exp_prev="$(models_env_get "$2" CORTI_EXPERIMENTAL || true)"
+  [ -n "$_md_exp_prev" ] || return 0
+  printf 'CORTI_EXPERIMENTAL="%s"\n' "$_md_exp_prev"
+  unset _md_exp_prev
+}
+
 # 0 = models.env present and current, 1 = not written (caller records it).
 # $1 state dir, $2 force (1 = --fresh: overwrite even if it exists),
 # $3 experimental (1 = fetch with ?experimental=true so betas compete for fable)
@@ -173,6 +190,10 @@ models_configure() {
   else
     _md_env="$(models_dedupe_fable "$_md_env")"
   fi
+
+  # The opt-in the gateway reads at boot. Read from $_md_file before overwrite so --fresh keeps an
+  # existing CORTI_EXPERIMENTAL; a fresh --experimental writes it anew.
+  _md_env="$(printf '%s\n%s' "$_md_env" "$(models_experimental_line "$_md_exp" "$_md_file")")"
 
   mkdir -p "$_md_dir"
   # Trailing newline: command substitution strips it, and the wrapper sources this file.
@@ -342,6 +363,10 @@ EOF
   esac
   [ "$_mp_fable_pinned" = 1 ] || _mp_env="$(models_dedupe_fable "$_mp_env")"
   unset _mp_fable_pinned
+
+  # The opt-in the gateway reads at boot: --experimental writes it; without the flag, preserve the
+  # existing value (read from $_mp_file before the temp-file swap below).
+  _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_experimental_line "$_mp_exp" "$_mp_file")")"
 
   mkdir -p "$_mp_dir"
   printf '%s\n' "$_mp_env" >"$_mp_file.tmp" && mv "$_mp_file.tmp" "$_mp_file"

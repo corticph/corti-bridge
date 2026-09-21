@@ -131,6 +131,10 @@ load_models_env() {
     if [ -n "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" ]; then
         export CORTI_VISION_MODEL="${CORTI_VISION_MODEL:-$ANTHROPIC_DEFAULT_HAIKU_MODEL}"
     fi
+    # The experimental opt-in (setup.sh --experimental / corti-bridge models --experimental). The
+    # gateway reads it at boot to decide whether fetchImageModels uses ?experimental=true, so a
+    # pinned beta like the multimodal corti-s1-beta is recognized as sighted. Absent → off.
+    [ -n "${CORTI_EXPERIMENTAL:-}" ] && export CORTI_EXPERIMENTAL
 }
 
 # Update check. A clone is the only documented install and setup.sh bakes its path into
