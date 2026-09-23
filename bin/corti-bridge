@@ -134,7 +134,9 @@ load_models_env() {
     # The experimental opt-in (setup.sh --experimental / corti-bridge models --experimental). The
     # gateway reads it at boot to decide whether fetchImageModels uses ?experimental=true, so a
     # pinned beta like the multimodal corti-s1-beta is recognized as sighted. Absent → off.
-    [ -n "${CORTI_EXPERIMENTAL:-}" ] && export CORTI_EXPERIMENTAL
+    if [ -n "${CORTI_EXPERIMENTAL:-}" ]; then
+        export CORTI_EXPERIMENTAL
+    fi
 }
 
 # Update check. A clone is the only documented install and setup.sh bakes its path into
@@ -351,7 +353,7 @@ Usage: corti-bridge [--anthropic] [args passed to claude]
   doctor --deep  Also probe Corti's /models endpoint (active; needs CORTI_BEARER)
   models       Interactively pick which Corti model backs each tier (needs creds)
   models --reset     Clear all pins and re-rank from scratch, no prompts
-  models --experimental  Include beta models in the lists
+  models --experimental  Include beta models in the lists; persists CORTI_EXPERIMENTAL
   theme        Print the lime-mascot TUI theme and install instructions (no writes)
   help         Show this
 EOF

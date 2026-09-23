@@ -139,9 +139,10 @@ models_experimental_line() {
   fi
   [ -n "$2" ] && [ -f "$2" ] || return 0
   _md_exp_prev="$(models_env_get "$2" CORTI_EXPERIMENTAL || true)"
-  [ -n "$_md_exp_prev" ] || return 0
-  printf 'CORTI_EXPERIMENTAL="%s"\n' "$_md_exp_prev"
-  unset _md_exp_prev
+  if [ -n "$_md_exp_prev" ]; then
+    printf 'CORTI_EXPERIMENTAL="%s"\n' "$_md_exp_prev"
+    unset _md_exp_prev
+  fi
 }
 
 # 0 = models.env present and current, 1 = not written (caller records it).
@@ -217,7 +218,7 @@ corti-bridge models - pick which Corti model backs each Claude Code tier.
 Usage: corti-bridge models [--experimental] [--reset]
 
   (default)        Interactively pick a model for each tier (needs CORTI_BEARER/CORTI_BASE_URL)
-  --experimental   Include beta models in the candidate lists
+  --experimental   Include beta models in the candidate lists; persists CORTI_EXPERIMENTAL
   --reset          Clear all pins and re-rank from scratch, no prompts
 
 A chosen model is pinned in models.env; pressing Enter keeps the auto-rank pick
@@ -245,6 +246,9 @@ EOF
 
   if [ "$_mp_reset" = 1 ]; then
     _mp_env="$(models_dedupe_fable "$_mp_auto")"
+    # The opt-in the gateway reads at boot: a reset clears pins, not the opt-in. Read from
+    # $_mp_file before the temp-file swap below, matching the write paths below.
+    _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_experimental_line "$_mp_exp" "$_mp_file")")"
     mkdir -p "$_mp_dir"
     printf '%s\n' "$_mp_env" >"$_mp_file.tmp" && mv "$_mp_file.tmp" "$_mp_file"
     ui_step "corti-bridge models --reset"

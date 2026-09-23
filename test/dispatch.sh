@@ -1094,7 +1094,7 @@ img_run() {
   fi
   _ir_pid=$!
   wait_banner "imggw_$1.out" || { echo "FAIL IMG gateway did not start (port $_ir_port)" >&2; FAILED=$((FAILED + 1)); }
-  curl -s -m 15 -H 'content-type: application/json' -d "$IMG_BODY" "http://127.0.0.1:$_ir_port/v1/messages" >/dev/null
+  curl -s -m 15 -H 'content-type: application/json' -d "$IMG_BODY" "http://127.0.0.1:$_ir_port/v1/messages" >/dev/null || :
   kill "$_ir_pid" 2>/dev/null || :; wait "$_ir_pid" 2>/dev/null || :
   unset _ir_port _ir_exp _ir_gw _ir_pid
 }
@@ -1110,10 +1110,14 @@ check "IMG: opted-in does not delegate to the vision sidecall" \
   "$(grep -c 'response_format' imgchat.log 2>/dev/null || :)" "0"
 
 # Not opted in: plain /models omits corti-s1-beta → treated as blind → the image is described via
-# the vision sidecall, which posts upstream with response_format+skipImages (a 2nd post).
+# the vision sidecall, which posts upstream with response_format+skipImages (a 2nd post). The
+# image_url in the log comes from that sidecall's own re-post, so 1 — the sidecall-only signature
+# is image_url *with* response_format.
 img_run 4302 ""
 check "IMG: not-opted-in delegates to the vision sidecall" \
   "$(grep -c 'response_format' imgchat.log 2>/dev/null || :)" "1"
+check "IMG: not-opted-in sidecall post carries image_url" \
+  "$(grep -c 'image_url' imgchat.log 2>/dev/null || :)" "1"
 
 kill "$IMGSTUB_PID" 2>/dev/null || :
 wait "$IMGSTUB_PID" 2>/dev/null || :
