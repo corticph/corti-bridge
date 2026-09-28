@@ -71,7 +71,7 @@ const ANTHROPIC_PREFIX = "/anthropic";
 
 // Probe-locked constants
 const PING_INTERVAL_MS = 15_000;
-const STREAM_IDLE_MS = 120_000;
+const STREAM_IDLE_MS = 300_000;
 // Silence before response headers means upstream never answered at all — a far stronger
 // death signal than a mid-generation pause, so it gets its own, shorter fuse. Set
 // CORTI_HEADERS_TIMEOUT_MS=0 to fall back to STREAM_IDLE_MS; raise it if upstream

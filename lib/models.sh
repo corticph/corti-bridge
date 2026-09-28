@@ -257,7 +257,7 @@ EOF
     return 0
   fi
 
-  _mp_cands="$(node "$_mp_js" --candidates "$_mp_catalog")" || return 1
+  _mp_cands="$(node "$_mp_js" --candidates ${_mp_exp:+"--experimental"} "$_mp_catalog")" || return 1
 
   ui_step "corti-bridge models"
   ui_detail "Fetching Corti's model catalog..."
@@ -283,12 +283,27 @@ EOF
     _mp_n=0
     _mp_menu=""
     _mp_default_n=1
-    for _mp_cand in $(printf '%s\n' "$_mp_cands" | grep "^$_mp_tier	" | cut -f2); do
+    _mp_tier_cands="$(printf '%s\n' "$_mp_cands" | grep "^$_mp_tier	")"
+    _mp_tier_tmp="$(mktemp)"
+    printf '%s\n' "$_mp_tier_cands" >"$_mp_tier_tmp"
+    _mp_fallback_sep=""
+    while IFS="$(printf '\t')" read -r _mp_c_tier _mp_c_id _mp_c_ctx _mp_c_flags; do
       _mp_n=$((_mp_n + 1))
-      _mp_menu="${_mp_menu}      ${_mp_n}) $_mp_cand\n"
-      [ "$_mp_cand" != "$_mp_auto_id" ] || _mp_default_n=$_mp_n
-    done
-    unset _mp_cand
+      _mp_label="$_mp_c_id"
+      case "$_mp_c_flags" in
+        *fallback*)
+          if [ -z "$_mp_fallback_sep" ]; then
+            _mp_menu="${_mp_menu}      $(printf -- '-%.0s' $(seq 1 40))\n"
+            _mp_fallback_sep=1
+          fi
+          _mp_label="$_mp_c_id *(shape mismatch)*"
+          ;;
+      esac
+      _mp_menu="${_mp_menu}      ${_mp_n}) $_mp_label\n"
+      [ "$_mp_c_id" != "$_mp_auto_id" ] || _mp_default_n=$_mp_n
+    done <"$_mp_tier_tmp"
+    rm -f "$_mp_tier_tmp"
+    unset _mp_c_tier _mp_c_id _mp_c_ctx _mp_c_flags _mp_fallback_sep _mp_tier_cands _mp_tier_tmp
 
     if [ "$_mp_n" = 0 ]; then
       [ "$_mp_tier" != fable ] || continue
