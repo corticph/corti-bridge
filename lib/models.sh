@@ -293,10 +293,10 @@ EOF
       case "$_mp_c_flags" in
         *fallback*)
           if [ -z "$_mp_fallback_sep" ]; then
-            _mp_menu="${_mp_menu}      $(printf -- '-%.0s' $(seq 1 40))\n"
+            _mp_menu="${_mp_menu}      Or:\n"
             _mp_fallback_sep=1
           fi
-          _mp_label="$_mp_c_id *(shape mismatch)*"
+          _mp_label="$_mp_c_id"
           ;;
       esac
       _mp_menu="${_mp_menu}      ${_mp_n}) $_mp_label\n"
