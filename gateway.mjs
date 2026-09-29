@@ -71,6 +71,7 @@ const ANTHROPIC_PREFIX = "/anthropic";
 
 // Probe-locked constants
 const PING_INTERVAL_MS = 15_000;
+// Corti goes silent for well over 120s mid-generation; 5 minutes absorbs the observed pauses.
 const STREAM_IDLE_MS = 300_000;
 // Silence before response headers means upstream never answered at all — a far stronger
 // death signal than a mid-generation pause, so it gets its own, shorter fuse. Set
@@ -632,7 +633,7 @@ async function handleMessages(req, res, body) {
   // which branch produced it.
   let contNextIndex = 0;
   // True while an advisor continuation (the 2nd upstream call after hold-and-continue) is in
-  // flight. Like the advisor phase itself it can legitimately run for minutes, so the 120s
+  // flight. Like the advisor phase itself it can legitimately run for minutes, so the 5-minute
   // stream-idle watchdog must stay its hand — the continuation's own deadline is the ceiling.
   let continuationActive = false;
   let interval = null;
@@ -933,9 +934,9 @@ async function handleMessages(req, res, body) {
       ? `<advisor_guidance>\n${advisorResult.text}\n</advisor_guidance>`
       : `<advisor_guidance>\nadvisor unavailable (${advisorResult.code})\n</advisor_guidance>`;
     // The advisor child is done; the continuation is a normal upstream request. Release the
-    // handoff (the advisor phase is over) but assert continuationActive so the 120s stream-idle
+    // handoff (the advisor phase is over) but assert continuationActive so the 5-minute stream-idle
     // watchdog stays suppressed — the continuation can legitimately run for minutes (the model
-    // reads the advice and answers), and a 120s silence kill would drop a live generation. The
+    // reads the advice and answers), and a 5-minute silence kill would drop a live generation. The
     // continuation's own req.setTimeout is the real ceiling. Reset the silence clock so any
     // watchdog that does apply measures from the continuation's start, not the advisor run.
     translator?.releaseAdvisor?.();
@@ -1328,13 +1329,13 @@ async function handleMessages(req, res, body) {
     // can legitimately run for minutes (see ADVISOR_TIMEOUT_MS). While it owns the turn the SSE
     // stream is idle by design — pings are suppressed (writePing, below) so they don't displace
     // the "Advising" indicator, and the stream-idle watchdog must stay its hand too. Without
-    // this guard a consult that exceeds STREAM_IDLE_MS (120s) would fire "upstream stalled"
+    // this guard a consult that exceeds STREAM_IDLE_MS (5m) would fire "upstream stalled"
     // mid-advisor and kill the turn before the advisor finishes. The advisor's own timeout
     // (ADVISOR_TIMEOUT_MS) is the real ceiling here.
     if (translator?.advisorHandoff) return; // hook owns the turn; ADVISOR_TIMEOUT_MS is the ceiling
     // An advisor child (wantsNoAdvisor) is its own handleMessages whose translator never sets
     // advisorHandoff, so the guard above doesn't cover it. The same ADVISOR_TIMEOUT_MS ceiling
-    // applies — applied at the child's execFile layer. Exempt the child from this 120s watchdog
+    // applies — applied at the child's execFile layer. Exempt the child from this 5-minute watchdog
     // too, or it kills a slow advisor generation mid-stream ("watchdog-timeout").
     if (noAdvisor) return;
     const silence = Date.now() - lastActivity;

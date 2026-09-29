@@ -283,7 +283,7 @@ EOF
     _mp_n=0
     _mp_menu=""
     _mp_default_n=1
-    _mp_tier_cands="$(printf '%s\n' "$_mp_cands" | grep "^$_mp_tier	")"
+    _mp_tier_cands="$(printf '%s\n' "$_mp_cands" | grep "^$_mp_tier	" || true)"
     _mp_tier_tmp="$(mktemp)"
     printf '%s\n' "$_mp_tier_cands" >"$_mp_tier_tmp"
     _mp_fallback_sep=""
