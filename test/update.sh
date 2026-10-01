@@ -142,9 +142,7 @@ check "a clone on a feature branch is not nagged" "$(launch_count 'new commit')"
 git -C "$CLONE" checkout -q main
 
 # --- K. the update verb ------------------------------------------------------------------
-# Runs through the real dispatcher baked into this sandbox. The clone's wrapper is run directly
-# elsewhere in this suite; the update verb's re-deploy path instead needs an *installed* copy
-# (the baked-path guard reads it), so bake one like setup.sh does.
+# The re-deploy path reads the *installed* wrapper, so bake one like setup.sh does.
 STATE="$HOME/.corti-bridge"
 mkdir -p "$STATE"
 [ -f "$STATE/models.env" ] || printf 'ANTHROPIC_DEFAULT_OPUS_MODEL=corti-s1\nCORTI_EXPERIMENTAL=1\n' > "$STATE/models.env"
@@ -152,9 +150,7 @@ mkdir -p "$STATE"
 sed "s|\${CORTI_PROXY_DIR:-/path/to/corti-bridge}|\${CORTI_PROXY_DIR:-$CLONE}|" \
     "$CLONE/bin/corti-bridge" > "$SCRATCH/bin/corti-bridge"
 chmod +x "$SCRATCH/bin/corti-bridge"
-# Deploy target and guard target both redirected to the scratch bin. Exit codes are
-# load-bearing (refusals exit 1); K_RC_FILE is a file because callers capture output with
-# $( ), which would lose a shell-variable rc to the subshell.
+# rc goes through a file: callers capture output with $( ), which loses vars to the subshell.
 K_RC_FILE="$SCRATCH/krc"
 update_run_in() {
     : > "$K_RC_FILE"
@@ -197,8 +193,7 @@ check "update: dry-run does not move HEAD" \
     "$(git -C "$CLONE" rev-parse HEAD)" "$K3_BASE"
 
 # K4: wrapper-only diff → the installed copy is re-deployed.
-# The sed+mv must keep the wrapper's exec bit — the commit propagates the tree's file mode and
-# a non-executable clone wrapper would make every later launch fail with Permission denied.
+# The commit propagates the file mode — keep +x.
 sed 's/corti-bridge update \[--dry-run\]/corti-bridge update [--dry-run] v2/' "$SCRATCH/up/bin/corti-bridge" > "$SCRATCH/up/bin/w"
 chmod +x "$SCRATCH/up/bin/w" && mv "$SCRATCH/up/bin/w" "$SCRATCH/up/bin/corti-bridge"
 git -C "$SCRATCH/up" commit -qam "wrapper v2"
@@ -249,13 +244,12 @@ check "update: feature branch refused in the verb" "$(up_ct "$K9" 'update only r
 check "update: feature branch exits 1 (rc)" "$(up_get_rc)" "1"
 git -C "$CLONE" checkout -q main
 
-# K10: the deployed/not-deployed discriminator — both states at the contract level. The real
-# setup.sh is stubbed to print one of the two line shapes; everything else is the real verb.
-# A wrapper-only diff each time drives the install class.
+# K10: the deployed/not-deployed discriminator — stub setup.sh to print one of the two
+# line shapes; a wrapper-only diff each time drives the install class.
 K10_SETUP="$CLONE/setup.sh"
 cp "$K10_SETUP" "$K10_SETUP.real"
 wrapper_diff_and_push() {
-    sed 's/Usage: corti-bridge/Usage: corti-bridge/' "$SCRATCH/up/bin/corti-bridge" > "$SCRATCH/up/bin/w"
+    printf '// t-%s\n' "$1" >> "$SCRATCH/up/bin/corti-bridge"
     chmod +x "$SCRATCH/up/bin/w"; mv "$SCRATCH/up/bin/w" "$SCRATCH/up/bin/corti-bridge"
     git -C "$SCRATCH/up" commit -qam "$1"
     git -C "$SCRATCH/up" push -q origin main

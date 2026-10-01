@@ -1,7 +1,5 @@
 # update verb: pull the clone, re-deploy the wrapper when bin/corti-bridge changed, say what
-# applies when. Reuses the wrapper's globals (PROXY_DIR, CORTI_DIR, UPDATE_STAMP_FILE).
-# Never restarts the gateway — the build fingerprint owns pickup; eager stop/start kills
-# an in-flight advisor consult.
+# applies when. Reuses the wrapper's globals. Never restarts the gateway.
 
 # Epoch seconds in update_refresh's exact format; a bad stamp just costs one extra fetch.
 _update_stamp() {
@@ -48,7 +46,7 @@ update_redeploy() {
         return 1
     fi
     # || keeps a failing setup reachable under set -eu. Benign and fatal both arrive as rc 1,
-    # so the signal lines below are the only deployed/not-deployed discriminator.
+    # so the signal lines below are the only discriminator.
     _ur_rc=0
     CORTI_PROXY_CONFIG_DIR="$CORTI_DIR" CORTI_PROXY_BIN_DIR="$_update_bin_dir" \
         "$PROXY_DIR/setup.sh" --yes --no-modify-path >"$_update_setup_out" 2>&1 || _ur_rc=$?
@@ -167,7 +165,7 @@ update_run() {
     _update_redeployed=not-needed
     case "$_update_classes" in
         *install*)
-            # The || survives a precondition refusal under set -eu; rc is irrelevant (see above).
+            # Precondition refusal must not kill the run (set -eu).
             _update_redeploy_res="$(update_redeploy)" || :
             case "${_update_redeploy_res:-}" in
                 deployed) _update_redeployed=deployed ;;

@@ -142,7 +142,7 @@ corti-bridge restart      # stop then start it (needs CORTI_BEARER/CORTI_BASE_UR
 
 `--stop` is a flag, not a bare command: `claude`'s own `stop|kill <id>` subcommand passes through the wrapper to stop a background session, and a bare `stop` would intercept it and silently kill the gateway instead. `restart` is safe as a bare command because `claude` uses `respawn`, not `restart`, for background sessions — no collision. The other subcommands (`doctor`, `models`, `theme`) shadow `claude`-verb equivalents that are low-value when proxied (`doctor` checks the Claude Code install, which the wrapper leaves healthy) or that don't exist (`models`, `theme`), so the proxy's command is the useful one.
 
-`update` and its `upgrade` alias claim what used to pass through to `claude update` — the Claude Code binary updater. The claim is deliberately a behavior change: inside the bridge, "update" means *the bridge* (pull origin/main, re-deploy the wrapper if it changed, advise what applies when — never restarting a running gateway). To update the Claude Code binary itself, run `claude update` directly, outside the bridge. The claim is positional-only: `corti-bridge --anthropic update` and `-p update` still pass the word through, since only `$1` enters the subcommand case. `update` needs neither credentials nor claude, sitting with `--stop`/`doctor`/`theme` in the no-creds part of the dispatcher.
+`update` (alias `upgrade`) claims what used to pass through to `claude update`, the Claude Code binary updater — inside the bridge, "update" means the bridge. To update the binary itself, run `claude update` outside the bridge. Positional-only: `--anthropic update` and `-p update` still pass through (only `$1` enters the subcommand case). The verb sits with `--stop`/`doctor`/`theme` in the no-creds part of the dispatcher.
 
 `--stop` needs nothing — not even credentials — so it works when something's wrong. `restart` checks credentials *before* stopping, so a typo'd `CORTI_BEARER` won't take down a working gateway. Stopping a gateway that's already stopped is not an error.
 
@@ -150,19 +150,16 @@ Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require 
 
 ### `corti-bridge update`
 
-Bundles what the end-of-session notice used to tell you to type by hand (`cd <clone> && git pull && ./setup.sh`). One run, in order:
+Bundles the end-of-session notice's manual recipe (`cd <clone> && git pull && ./setup.sh`) into one verb. In order:
 
-1. **Gates, fail-closed** — is this a clone, is it on `main`, can origin be reached (one bounded, prompt-proof synchronous fetch)? Answering no prints the manual recipe for exactly what's wrong and touches nothing. A failed behind-count is never reported as "already up to date".
-2. **Pull** `--ff-only` if behind. Already current exits 0. Divergent local commits, an unconcluded merge, and overwritten tracked files each print their own recipe.
-3. **Classify what changed**, and act only where action is possible:
-   - `bin/corti-bridge` changed (the only artifact setup.sh deploys) → re-run `./setup.sh --yes --no-modify-path`, but only if `models.env`/`profile.env` exist (update is not an installer — missing state would be silently created under `--yes` otherwise) and the installed wrapper's baked `PROXY_DIR` matches this clone (never re-point a foreign install). Success is judged by setup's own output ("installed"/"updated"/"up to date"), not its exit code: the only reachable post-deploy failure is an unknown-shell PATH note, benign.
-   - Gateway sources changed (`gateway.mjs`, `translate.mjs`, `lib/*.mjs`, `lib/*.txt` — the fingerprint set) → no action; the next launch auto-restarts a stale gateway, and `update` **never** restarts one itself (that's what protects an in-flight advisor consult).
-   - Anything else (`lib/*.sh`, docs, tests) → nothing; they're consumed live from the clone.
-4. Stamps the once-a-day fetch check on success, so the next launch doesn't repeat the fetch.
+- **Gates, fail-closed**: clone, on `main`, origin reachable (one bounded, prompt-proof fetch). A "no" prints the recipe for exactly what's wrong and touches nothing; a failed behind-count is never "already up to date".
+- **Pull** `--ff-only` if behind. Divergent-commits, mid-merge, and overwritten-files refusals each get their own recipe.
+- **Classify what changed**: `bin/corti-bridge` (setup's only deployed artifact) → re-run `setup.sh --yes --no-modify-path`, refused unless `models.env`/`profile.env` exist (update is not an installer) and the installed wrapper's baked `PROXY_DIR` matches this clone. Deploy success is judged by setup's output lines, not its exit code. Gateway-source changes take effect via the fingerprint on the next launch — `update` never restarts a running gateway. Everything else is consumed live from the clone.
+- Stamps the once-a-day fetch check on success.
 
-`--dry-run` reports the situation without the fetch or the pull (the fetch itself writes the remote-tracking ref): the count comes from the last fetch and the message says so.
+`--dry-run` skips the fetch too (it writes refs): the count comes from the last fetch, and the message says so.
 
-Two accepted edges: the setup re-run deploys the *working tree's* wrapper, so uncommitted local edits to `bin/corti-bridge` get deployed exactly as today's manual grammar would; and a session launched through a `CORTI_NO_MANAGE_GATEWAY` child (an advisor consult) keeps an old in-memory gateway until its next managed launch.
+Accepted edges: setup deploys the working-tree wrapper (uncommitted local edits deploy, as the manual grammar always did); a `CORTI_NO_MANAGE_GATEWAY` session (advisor child) keeps an old in-memory gateway until its next managed launch.
 
 ## Upstream failures and retries
 

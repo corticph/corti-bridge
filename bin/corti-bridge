@@ -131,9 +131,7 @@ load_models_env() {
     if [ -n "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" ]; then
         export CORTI_VISION_MODEL="${CORTI_VISION_MODEL:-$ANTHROPIC_DEFAULT_HAIKU_MODEL}"
     fi
-    # The experimental opt-in (setup.sh --experimental / corti-bridge models --experimental). The
-    # gateway reads it at boot to decide whether fetchImageModels uses ?experimental=true, so a
-    # pinned beta like the multimodal corti-s1-beta is recognized as sighted. Absent → off.
+    # Gateway boot flag: fetchImageModels uses the experimental catalog when set. Absent → off.
     if [ -n "${CORTI_EXPERIMENTAL:-}" ]; then
         export CORTI_EXPERIMENTAL
     fi
@@ -227,10 +225,8 @@ case "${1:-}" in
         exit 1
         ;;
     update|--update|upgrade)
-        # Pull + conditional wrapper re-deploy + advice about what takes effect when. Needs
-        # neither creds nor claude (its setup re-run inherits the wrapper env's own rules),
-        # so it sits with the other no-creds verbs. The verb claims what used to pass through
-        # to `exec claude update`; `claude update` in a plain shell is still the binary path.
+        # No creds, no claude. Claims what used to exec `claude update`; the binary
+        # updater stays reachable as a plain `claude update`.
         if [ -f "$PROXY_DIR/lib/update.sh" ]; then
             . "$PROXY_DIR/lib/update.sh"
             shift

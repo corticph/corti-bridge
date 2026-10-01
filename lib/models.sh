@@ -127,11 +127,10 @@ ANTHROPIC_DEFAULT_FABLE_MODEL_PIN=\"1\""
   printf '%s\n' "$_md_pin"
 }
 
-# Echoes the CORTI_EXPERIMENTAL line for models.env, or nothing. The gateway reads it at boot to
-# decide whether fetchImageModels queries /models?experimental=true (a pinned beta like the
-# multimodal corti-s1-beta is only in the experimental catalog). $1 = this run's --experimental
-# intent (1/0); $2 = the existing models.env path, so a --fresh refresh preserves an earlier opt-in
-# rather than silently dropping it. A run that didn't pass --experimental keeps what was there.
+# Echoes the CORTI_EXPERIMENTAL line for models.env, or nothing. When set, the gateway's
+# fetchImageModels queries /models?experimental=true (a pinned beta is only in that catalog).
+# $1 = this run's --experimental intent; $2 = the existing models.env path, so an unpassed
+# flag keeps the prior value.
 models_experimental_line() {
   if [ "${1:-0}" = 1 ]; then
     printf 'CORTI_EXPERIMENTAL="1"\n'
@@ -192,8 +191,7 @@ models_configure() {
     _md_env="$(models_dedupe_fable "$_md_env")"
   fi
 
-  # The opt-in the gateway reads at boot. Read from $_md_file before overwrite so --fresh keeps an
-  # existing CORTI_EXPERIMENTAL; a fresh --experimental writes it anew.
+  # Read before overwrite so --fresh keeps an existing CORTI_EXPERIMENTAL.
   _md_env="$(printf '%s\n%s' "$_md_env" "$(models_experimental_line "$_md_exp" "$_md_file")")"
 
   mkdir -p "$_md_dir"
@@ -246,8 +244,7 @@ EOF
 
   if [ "$_mp_reset" = 1 ]; then
     _mp_env="$(models_dedupe_fable "$_mp_auto")"
-    # The opt-in the gateway reads at boot: a reset clears pins, not the opt-in. Read from
-    # $_mp_file before the temp-file swap below, matching the write paths below.
+    # A reset clears pins, not the opt-in.
     _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_experimental_line "$_mp_exp" "$_mp_file")")"
     mkdir -p "$_mp_dir"
     printf '%s\n' "$_mp_env" >"$_mp_file.tmp" && mv "$_mp_file.tmp" "$_mp_file"
@@ -383,8 +380,7 @@ EOF
   [ "$_mp_fable_pinned" = 1 ] || _mp_env="$(models_dedupe_fable "$_mp_env")"
   unset _mp_fable_pinned
 
-  # The opt-in the gateway reads at boot: --experimental writes it; without the flag, preserve the
-  # existing value (read from $_mp_file before the temp-file swap below).
+  # Without --experimental, preserve the existing value.
   _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_experimental_line "$_mp_exp" "$_mp_file")")"
 
   mkdir -p "$_mp_dir"
