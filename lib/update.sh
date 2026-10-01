@@ -1,26 +1,15 @@
-# update verb for the corti-bridge wrapper: pull from the clone's own origin, re-deploy the
-# installed wrapper when (and only when) bin/corti-bridge changed, and print what takes effect
-# when. Replaces the manual `cd "$PROXY_DIR" && git pull && ./setup.sh` recipe the post-session
-# notice prints. Sourced by the dispatcher after the lifecycle functions (below them in the
-# wrapper), so it uses the wrapper's globals directly: PROXY_DIR, CORTI_DIR, UPDATE_STAMP_FILE.
-#
-# Fail-closed in every gate won't act on anything it is not sure about: a failed behind-count is
-# never reported as "already up to date" (update_behind returns 1 for both a clean zero and a
-# failed rev-list, so the verb needs its own count), a failed pull leaves HEAD unmoved, and the
-# re-deploy is refused rather than guessed when state is missing or foreign. The gateway is never
-# restarted here — the build fingerprint restarts it on the next launch; an eager stop/start
-# would kill an in-flight advisor consult.
+# update verb: pull the clone, re-deploy the wrapper when bin/corti-bridge changed, say what
+# applies when. Reuses the wrapper's globals (PROXY_DIR, CORTI_DIR, UPDATE_STAMP_FILE).
+# Never restarts the gateway — the build fingerprint owns pickup; eager stop/start kills
+# an in-flight advisor consult.
 
-# Epoch stamp in the exact format update_refresh writes and compares (decimal seconds via
-# date +%s). A non-integer stamp would degrade silently to one extra background fetch.
+# Epoch seconds in update_refresh's exact format; a bad stamp just costs one extra fetch.
 _update_stamp() {
     printf '%s' "$(date +%s 2>/dev/null || echo 0)" > "$UPDATE_STAMP_FILE" 2>/dev/null || true
 }
 
-# Classification of OLD..NEWTREE into the action sets. Echoes (space-separated): install gateway.
-# New path per entry: the deploy decision is about the working tree the setup re-run deploys
-# from, so renames list their new path and deletions list a path that will not matter (the set
-# match simply won't fire for a vanished file).
+# Echoes (space-separated) the action sets OLD..NEW touches: install gateway.
+# Renames list their new path; deletions match nothing and count as no-op.
 update_classify() {
     _uc_old="$1"
     _uc_new="$2"
@@ -45,38 +34,32 @@ EOF
     fi
 }
 
-# Run setup.sh unattended to re-deploy the wrapper. Preconditions first: update is not an
-# installer — under --yes a missing models.env/profile.env would be silently created, and a
-# wrapper baked for a different clone must not be re-pointed by this run.
+# Re-run setup to re-deploy the wrapper. Not an installer: missing state aborts (under --yes
+# it would be silently created); a foreign baked path is refused, never re-pointed.
 update_redeploy() {
     if [ ! -f "$CORTI_DIR/models.env" ] || [ ! -f "$CORTI_DIR/profile.env" ]; then
         echo "corti-bridge: $CORTI_DIR/models.env or profile.env is missing — run ./setup.sh in $PROXY_DIR first" >&2
         return 1
     fi
-    # Single-quoted on purpose: the sed program must see the literal \1 backreference and the
-    # ${...} text — shellcheck's "use double quotes" would break the extraction.
+    # Single-quoted sed: it must see the literal \1 and the ${...} text.
     _ur_baked="$(sed -n 's/^PROXY_DIR="\${CORTI_PROXY_DIR:-\([^}]*\)}".*/\1/p' "$_update_bin_dir/corti-bridge" 2>/dev/null | head -1)"
     if [ "$_ur_baked" != "$PROXY_DIR" ]; then
         echo "corti-bridge: the installed wrapper points at ${_ur_baked:-nowhere}, not $PROXY_DIR — run ./setup.sh manually from the right clone" >&2
         return 1
     fi
-    # || _ur_rc=$? keeps the benign post-deploy exit-1 (pathrc rc=2) reachable under the
-    # wrapper's set -eu: a bare failing simple command would exit the whole wrapper before
-    # the deployed/not-deployed discriminator below could run.
+    # || keeps a failing setup reachable under set -eu. Benign and fatal both arrive as rc 1,
+    # so the signal lines below are the only deployed/not-deployed discriminator.
     _ur_rc=0
     CORTI_PROXY_CONFIG_DIR="$CORTI_DIR" CORTI_PROXY_BIN_DIR="$_update_bin_dir" \
         "$PROXY_DIR/setup.sh" --yes --no-modify-path >"$_update_setup_out" 2>&1 || _ur_rc=$?
     cat "$_update_setup_out" >&2
-    # Deployed-vs-not from setup's own signal lines, not its exit code: the only reachable
-    # post-deploy exit-1 is benign (pathrc rc=2, unknown shell — _ur_rc=2), while setup's
-    # fatals leave the previous wrapper in place (_ur_rc on a thrown ui_fatal is 1). The
-    # installed copy is a sed-rewritten one, so the clone's file can never be cmp'd to it raw.
-    if printf '%s' "$(cat "$_update_setup_out" 2>/dev/null || true)" | grep -q "is up to date\|installed\|updated "; then
+    # ui_wrote's "-> updated <path>" / ui_detail's "<path> is up to date" are the success
+    # signals; ui_fatal's "Nothing was installed." must not match, hence the anchors.
+    if printf '%s' "$(cat "$_update_setup_out" 2>/dev/null || true)" | grep -Eq '^ *-> (updated|installed) |is up to date$'; then
         printf 'deployed'
     else
         printf 'not-deployed'
     fi
-    return "$_ur_rc"
 }
 
 # Main. $@: --dry-run. Exit codes: 0 updated/current, 1 refusal or failure.
@@ -85,7 +68,13 @@ update_run() {
     _update_setup_out="$(mktemp "${TMPDIR:-/tmp}/corti-update.XXXXXX")"
     _update_dry=0
     for _update_arg in "$@"; do
-        case "$_update_arg" in --dry-run) _update_dry=1 ;; esac
+        case "$_update_arg" in
+            --dry-run) _update_dry=1 ;;
+            # Refuse, don't silently ignore: --dryrun must not run a real mutating update.
+            *) echo "corti-bridge: update: unknown argument: $_update_arg (usage: update [--dry-run])" >&2
+               rm -f "$_update_setup_out"
+               return 1 ;;
+        esac
     done
     unset _update_arg
 
@@ -95,8 +84,7 @@ update_run() {
         rm -f "$_update_setup_out"
         return 1
     fi
-    # Gate on PROXY_DIR itself (baked at install time, possibly overridden by the env), not on
-    # the override var's presence: an unset override with a real baked path is a normal install.
+    # Gate on PROXY_DIR itself — an unset override with a real baked path is a normal install.
     if [ "${PROXY_DIR:-/path/to/corti-bridge}" = "/path/to/corti-bridge" ] || [ ! -d "$PROXY_DIR/.git" ]; then
         echo "corti-bridge: $PROXY_DIR is not a git clone — update needs a clone to pull" >&2
         rm -f "$_update_setup_out"
@@ -108,8 +96,7 @@ update_run() {
         rm -f "$_update_setup_out"
         return 1
     fi
-    # Dry-run: change nothing and fetch nothing — the fetch itself is a repo write (it moves
-    # refs/remotes/origin/main). Count from the last-fetched refs and say how stale they may be.
+    # Dry-run must fetch nothing — the fetch itself writes refs — so count from the last fetch.
     if [ "$_update_dry" = 1 ]; then
         _update_beyond="$(git -C "$PROXY_DIR" rev-list --count HEAD..origin/main 2>/dev/null)" || true
         case "${_update_beyond:-}" in
@@ -129,7 +116,7 @@ update_run() {
         return 0
     fi
 
-    # Bounded, prompt-proof fetch: no timeout(1) on macOS, so pin throughput and kill prompts.
+    # No timeout(1) on macOS: pin throughput, kill credential prompts.
     if ! GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" \
         git -C "$PROXY_DIR" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
         fetch --quiet origin main 2>/dev/null; then
@@ -152,8 +139,7 @@ update_run() {
             ;;
     esac
 
-    # Pull. Atomicity: --ff-only refuses (HEAD unmoved) on divergence and on tracked-file
-    # collisions; a stale MERGE_HEAD from a crashed manual pull needs its own recipe.
+    # A failed --ff-only leaves HEAD unmoved; three refusal shapes get their own recipes.
     _update_old="$(mktemp "${TMPDIR:-/tmp}/corti-old.XXXXXX")"
     _update_pull_err="$(mktemp "${TMPDIR:-/tmp}/corti-pullerr.XXXXXX")"
     git -C "$PROXY_DIR" rev-parse HEAD > "$_update_old" 2>/dev/null || true
@@ -168,23 +154,21 @@ update_run() {
         else
             echo "corti-bridge: git pull failed — run: cd \"$PROXY_DIR\" && git status" >&2
         fi
+        rm -f "$_update_pull_err"
         return 1
     fi
     rm -f "$_update_pull_err"
 
     _update_head="$(git -C "$PROXY_DIR" rev-parse HEAD 2>/dev/null || echo '')"
     _update_classes="$(update_classify "$(cat "$_update_old" 2>/dev/null || true)" "$_update_head")"
-    # update_classify removes both its args' files when they are paths; reaching here they were
-    # strings, so the temp could survive — remove it here for the string-arg form.
+    # update_classify rm's its args as paths; they were strings here, so do it.
     rm -f "$_update_old"
 
     _update_redeployed=not-needed
     case "$_update_classes" in
         *install*)
-            # || _update_redeploy_rc=1: a precondition refusal (return 1, no output) would
-            # otherwise kill the run under set -eu before the failed-case mapping fires.
-            _update_redeploy_rc=0
-            _update_redeploy_res="$(update_redeploy)" || _update_redeploy_rc=1
+            # The || survives a precondition refusal under set -eu; rc is irrelevant (see above).
+            _update_redeploy_res="$(update_redeploy)" || :
             case "${_update_redeploy_res:-}" in
                 deployed) _update_redeployed=deployed ;;
                 *) _update_redeployed=failed ;;
@@ -212,8 +196,7 @@ update_run() {
     rm -f "$_update_setup_out"
 
     if [ "${_update_rc:-0}" = 0 ]; then
-        # The dispatcher label sits before the launch path's mkdir -p "$CORTI_DIR"; a fresh
-        # state dir must exist before the stamp write, or it silently no-ops.
+        # The dispatcher label precedes the launch path's mkdir; the stamp must not no-op.
         mkdir -p "$CORTI_DIR"
         _update_stamp
         echo "corti-bridge: update complete" >&2

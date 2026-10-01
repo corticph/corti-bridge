@@ -152,10 +152,17 @@ mkdir -p "$STATE"
 sed "s|\${CORTI_PROXY_DIR:-/path/to/corti-bridge}|\${CORTI_PROXY_DIR:-$CLONE}|" \
     "$CLONE/bin/corti-bridge" > "$SCRATCH/bin/corti-bridge"
 chmod +x "$SCRATCH/bin/corti-bridge"
-# Deploy target and guard target both redirected to the scratch bin.
+# Deploy target and guard target both redirected to the scratch bin. Exit codes are
+# load-bearing (refusals exit 1); K_RC_FILE is a file because callers capture output with
+# $( ), which would lose a shell-variable rc to the subshell.
+K_RC_FILE="$SCRATCH/krc"
 update_run_in() {
-    CORTI_PROXY_BIN_DIR="$SCRATCH/bin" "$BRIDGE" "$@" 2>&1 || :
+    : > "$K_RC_FILE"
+    CORTI_PROXY_BIN_DIR="$SCRATCH/bin" "$BRIDGE" "$@" >"$SCRATCH/kout" 2>&1
+    printf '%s' "$?" > "$K_RC_FILE"
+    cat "$SCRATCH/kout"
 }
+up_get_rc() { cat "$K_RC_FILE"; }
 up_ct() {
     printf '%s' "$1" | grep -c "$2" || :
 }
@@ -168,6 +175,7 @@ git -C "$SCRATCH/up" commit -qam docs
 git -C "$SCRATCH/up" push -q origin main
 K1=$(update_run_in update)
 check "update: docs-only reports complete" "$(up_ct "$K1" 'update complete')" "1"
+check "update: docs-only exits 0" "$(up_get_rc)" "0"
 check "update: docs-only prints no restart" "$(up_ct "$K1" 'gateway restarted')" "0"
 check "update: docs-only leaves wrapper bytes" "$(up_ct "$K1" 'wrapper updated')" "0"
 check "update: stamps the checked file" "$([ -f "$STATE/update.checked" ] && echo yes || echo no)" "yes"
@@ -175,6 +183,7 @@ check "update: stamps the checked file" "$([ -f "$STATE/update.checked" ] && ech
 # K2: immediately current
 K2=$(update_run_in update)
 check "update: current reports it" "$(up_ct "$K2" 'already up to date')" "1"
+check "update: current exits 0" "$(up_get_rc)" "0"
 
 # K3: dry-run skips the fetch entirely — an unfetched push is invisible to it.
 # Capture the base AFTER K1's pull: that is the HEAD a no-op dry-run must preserve.
@@ -216,8 +225,10 @@ echo "divergent" >> "$SCRATCH/up/README.md"
 git -C "$SCRATCH/up" commit -qam "divergent-docs"
 git -C "$SCRATCH/up" push -q origin main
 K6=$(update_run_in update)
-check "update: divergence exits 1" "$(up_ct "$K6" 'local commits')" "1"
+check "update: divergence names local commits" "$(up_ct "$K6" 'local commits')" "1"
+check "update: divergence exits 1 (rc)" "$(up_get_rc)" "1"
 check "update: divergence leaves HEAD" "$(git -C "$CLONE" rev-parse HEAD)" "$BEHIND_HEAD"
+check "update: divergence leaves the stamp" "$([ -f "$STATE/update.checked" ] && echo still-there || echo gone)" "still-there"
 git -C "$CLONE" reset -q --hard "@{u}"
 
 # K7: offline refuses (origin renamed away, URL points nowhere).
@@ -225,10 +236,68 @@ git -C "$CLONE" remote set-url origin "$SCRATCH/origin-gone.git"
 K7=$(update_run_in update 2>&1 || :)
 check "update: offline refuses with the cannot-reach message" \
     "$(printf '%s' "$K7" | grep -c 'cannot reach origin' || :)" "1"
+check "update: offline exits 1 (rc)" "$(up_get_rc)" "1"
 git -C "$CLONE" remote set-url origin "$SCRATCH/origin.git"
 
 # K8: the verb is claimed — no longer falls through to claude.
 check "update: the verb does not reach claude" "$(printf '%s' "$(CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" update 2>&1 || :)" | grep -c 'STUB-CLAUDE\|stub-claude' || :)" "0"
+
+# K9: other branch refused (spec case v).
+git -C "$CLONE" checkout -q -b update-feature
+K9=$(update_run_in update)
+check "update: feature branch refused in the verb" "$(up_ct "$K9" 'update only runs on main')" "1"
+check "update: feature branch exits 1 (rc)" "$(up_get_rc)" "1"
+git -C "$CLONE" checkout -q main
+
+# K10: the deployed/not-deployed discriminator — both states at the contract level. The real
+# setup.sh is stubbed to print one of the two line shapes; everything else is the real verb.
+# A wrapper-only diff each time drives the install class.
+K10_SETUP="$CLONE/setup.sh"
+cp "$K10_SETUP" "$K10_SETUP.real"
+wrapper_diff_and_push() {
+    sed 's/Usage: corti-bridge/Usage: corti-bridge/' "$SCRATCH/up/bin/corti-bridge" > "$SCRATCH/up/bin/w"
+    chmod +x "$SCRATCH/up/bin/w"; mv "$SCRATCH/up/bin/w" "$SCRATCH/up/bin/corti-bridge"
+    git -C "$SCRATCH/up" commit -qam "$1"
+    git -C "$SCRATCH/up" push -q origin main
+}
+# (x) setup exit-1 WITH deployed wrapper: only the success signal, rc 1.
+printf '#!/bin/sh\nprintf "    -> updated %%s\\n" "$0"\nexit 1\n' > "$K10_SETUP"
+chmod +x "$K10_SETUP"
+wrapper_diff_and_push t10
+K10_A=$(update_run_in update)
+check "update: deployed signal from a setup rc=1 → success" "$(up_ct "$K10_A" 'wrapper updated')" "1"
+check "update: deployed-despite-exit-1 stamps and completes" "$(up_ct "$K10_A" 'update complete')" "1"
+# (xi) fatal shape: "Nothing was installed." must NOT read as deployed.
+printf '#!/bin/sh\nprintf "Nothing was installed.\\n"\nexit 1\n' > "$K10_SETUP"
+chmod +x "$K10_SETUP"
+wrapper_diff_and_push t10b
+K10_B=$(update_run_in update)
+check "update: fatal output reads not-deployed" "$(up_ct "$K10_B" 'could not be re-deployed')" "1"
+check "update: fatal output does not complete" "$(up_ct "$K10_B" 'update complete')" "0"
+check "update: fatal output exits 1 (rc)" "$(up_get_rc)" "1"
+# (xii) foreign baked path → refuse rather than re-point.
+printf '#!/bin/sh\nPROXY_DIR="${CORTI_PROXY_DIR:-/somewhere/else}"\n' > "$SCRATCH/bin/corti-bridge"
+chmod +x "$SCRATCH/bin/corti-bridge"
+K10_C=$(update_run_in update)
+wrapper_diff_and_push t10c
+K10_C=$(update_run_in update)
+check "update: foreign baked wrapper refused" "$(up_ct "$K10_C" 'points at /somewhere/else')" "1"
+check "update: foreign baked wrapper exits 1 (rc)" "$(up_get_rc)" "1"
+mv "$K10_SETUP.real" "$K10_SETUP"
+# restore the sandbox install target so the default state holds for later sections
+sed "s|\${CORTI_PROXY_DIR:-/path/to/coti-bridge}|\${CORTI_PROXY_DIR:-$CLONE}|" "$CLONE/bin/corti-bridge" > "$SCRATCH/bin/corti-bridge" 2>/dev/null || true
+sed "s|\${CORTI_PROXY_DIR:-/path/to/corti-bridge}|\${CORTI_PROXY_DIR:-$CLONE}|" \
+    "$CLONE/bin/corti-bridge" > "$SCRATCH/bin/corti-bridge"
+chmod +x "$SCRATCH/bin/corti-bridge"
+
+# K11: exactly-one-changed-file under the state dir on the healthy path (the triple
+# short-circuit must mean ONLY the stamp moves; models.env/profile.env bytes untouched).
+MODELS_BEFORE=$(cksum "$STATE/models.env" | cut -d' ' -f1)
+PROFILE_BEFORE=$(cksum "$STATE/profile.env" | cut -d' ' -f1)
+git -C "$CLONE" pull -q origin main 2>/dev/null || :
+update_run_in update > /dev/null
+check "update: healthy run leaves models.env bytes" "$(cksum "$STATE/models.env" | cut -d' ' -f1)" "$MODELS_BEFORE"
+check "update: healthy run leaves profile.env bytes" "$(cksum "$STATE/profile.env" | cut -d' ' -f1)" "$PROFILE_BEFORE"
 
 # --- doctor ------------------------------------------------------------------------------
 # K pulled the clone current; the doctor-behind check below needs an unfetched upstream commit.
