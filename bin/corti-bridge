@@ -226,6 +226,20 @@ case "${1:-}" in
         echo "corti-bridge: the gateway on $GATEWAY didn't stop — stop it manually (pkill -f gateway.mjs)" >&2
         exit 1
         ;;
+    update|--update|upgrade)
+        # Pull + conditional wrapper re-deploy + advice about what takes effect when. Needs
+        # neither creds nor claude (its setup re-run inherits the wrapper env's own rules),
+        # so it sits with the other no-creds verbs. The verb claims what used to pass through
+        # to `exec claude update`; `claude update` in a plain shell is still the binary path.
+        if [ -f "$PROXY_DIR/lib/update.sh" ]; then
+            . "$PROXY_DIR/lib/update.sh"
+            shift
+            update_run "$@"
+            exit $?
+        fi
+        echo "corti-bridge: update needs the full lib (run ./setup.sh from your clone first, or set CORTI_PROXY_DIR)" >&2
+        exit 1
+        ;;
     --restart|restart)
         mkdir -p "$CORTI_DIR"
         # Creds before kill: don't drop a working gateway for a missing token.
@@ -342,6 +356,7 @@ Usage: corti-bridge [--anthropic] [args passed to claude]
        corti-bridge restart
        corti-bridge doctor [--deep]
        corti-bridge models [--experimental] [--reset]
+       corti-bridge update [--dry-run]
        corti-bridge theme
        corti-bridge help
 
@@ -349,6 +364,9 @@ Usage: corti-bridge [--anthropic] [args passed to claude]
   --anthropic  Use Corti's /anthropic pass-through mode (default: openai translator)
   --stop       Stop the gateway and exit
   restart      Stop then start the gateway and exit (needs CORTI_BEARER/CORTI_BASE_URL)
+  update       Pull origin/main, re-deploy the wrapper if it changed, and say what
+               applies when (never restarts a running gateway; --dry-run just reports)
+  upgrade      Alias for update
   doctor       Run diagnostics on the install, gateway, and state (no creds needed)
   doctor --deep  Also probe Corti's /models endpoint (active; needs CORTI_BEARER)
   models       Interactively pick which Corti model backs each tier (needs creds)
