@@ -141,7 +141,103 @@ git -C "$CLONE" checkout -q -b wip
 check "a clone on a feature branch is not nagged" "$(launch_count 'new commit')" "0"
 git -C "$CLONE" checkout -q main
 
+# --- K. the update verb ------------------------------------------------------------------
+# Runs through the real dispatcher baked into this sandbox. The clone's wrapper is run directly
+# elsewhere in this suite; the update verb's re-deploy path instead needs an *installed* copy
+# (the baked-path guard reads it), so bake one like setup.sh does.
+STATE="$HOME/.corti-bridge"
+mkdir -p "$STATE"
+[ -f "$STATE/models.env" ] || printf 'ANTHROPIC_DEFAULT_OPUS_MODEL=corti-s1\nCORTI_EXPERIMENTAL=1\n' > "$STATE/models.env"
+[ -f "$STATE/profile.env" ] || printf 'CLAUDE_CONFIG_DIR=%s\n' "$STATE/profile" > "$STATE/profile.env"
+sed "s|\${CORTI_PROXY_DIR:-/path/to/corti-bridge}|\${CORTI_PROXY_DIR:-$CLONE}|" \
+    "$CLONE/bin/corti-bridge" > "$SCRATCH/bin/corti-bridge"
+chmod +x "$SCRATCH/bin/corti-bridge"
+# Deploy target and guard target both redirected to the scratch bin.
+update_run_in() {
+    CORTI_PROXY_BIN_DIR="$SCRATCH/bin" "$BRIDGE" "$@" 2>&1 || :
+}
+up_ct() {
+    printf '%s' "$1" | grep -c "$2" || :
+}
+
+# K1: docs-only — pull lands, no re-deploy advisory, stamped quiet.
+git -C "$CLONE" reset -q --hard origin/main 2>/dev/null || :
+git -C "$SCRATCH/up" pull -q origin main 2>/dev/null || :
+echo "docs change" >> "$SCRATCH/up/README.md"
+git -C "$SCRATCH/up" commit -qam docs
+git -C "$SCRATCH/up" push -q origin main
+K1=$(update_run_in update)
+check "update: docs-only reports complete" "$(up_ct "$K1" 'update complete')" "1"
+check "update: docs-only prints no restart" "$(up_ct "$K1" 'gateway restarted')" "0"
+check "update: docs-only leaves wrapper bytes" "$(up_ct "$K1" 'wrapper updated')" "0"
+check "update: stamps the checked file" "$([ -f "$STATE/update.checked" ] && echo yes || echo no)" "yes"
+
+# K2: immediately current
+K2=$(update_run_in update)
+check "update: current reports it" "$(up_ct "$K2" 'already up to date')" "1"
+
+# K3: dry-run skips the fetch entirely — an unfetched push is invisible to it.
+# Capture the base AFTER K1's pull: that is the HEAD a no-op dry-run must preserve.
+K3_BASE=$(git -C "$CLONE" rev-parse HEAD)
+echo "dry" >> "$SCRATCH/up/GUIDE.md"
+git -C "$SCRATCH/up" commit -qam dry
+git -C "$SCRATCH/up" push -q origin main
+K3=$(update_run_in update --dry-run)
+check "update: dry-run exits 0 with nothing written" "$(up_ct "$K3" 'dry run'"'"'; nothing written\|already up to date (as of the last fetch')" "1"
+check "update: dry-run does not move HEAD" \
+    "$(git -C "$CLONE" rev-parse HEAD)" "$K3_BASE"
+
+# K4: wrapper-only diff → the installed copy is re-deployed.
+# The sed+mv must keep the wrapper's exec bit — the commit propagates the tree's file mode and
+# a non-executable clone wrapper would make every later launch fail with Permission denied.
+sed 's/corti-bridge update \[--dry-run\]/corti-bridge update [--dry-run] v2/' "$SCRATCH/up/bin/corti-bridge" > "$SCRATCH/up/bin/w"
+chmod +x "$SCRATCH/up/bin/w" && mv "$SCRATCH/up/bin/w" "$SCRATCH/up/bin/corti-bridge"
+git -C "$SCRATCH/up" commit -qam "wrapper v2"
+git -C "$SCRATCH/up" push -q origin main
+K4=$(update_run_in update)
+check "update: wrapper-diff reports the re-deploy" "$(up_ct "$K4" 'wrapper updated')" "1"
+check "update: deployed wrapper carries the new content" \
+    "$(grep -c 'v2' "$SCRATCH/bin/corti-bridge")" "1"
+# bin/corti-bridge is not in the fingerprint set: a wrapper-only change must NOT restart.
+check "update: wrapper-only change does not restart the gateway" "$(up_ct "$K4" 'older build')" "0"
+
+# K5: gateway-source-only → advice, no explicit restart.
+echo "// g" >> "$SCRATCH/up/lib/retry.mjs"
+git -C "$SCRATCH/up" commit -qam "gateway v2"
+git -C "$SCRATCH/up" push -q origin main
+K5=$(update_run_in update)
+check "update: gateway-diff advises next-session pickup" "$(up_ct "$K5" 'next session start')" "1"
+check "update: gateway-diff restarts nothing itself" "$(up_ct "$K5" 'gateway restarted')" "0"
+
+# K6: divergence refuses with its own message, HEAD unmoved.
+git -C "$CLONE" commit -q --allow-empty -m local-divergent
+BEHIND_HEAD=$(git -C "$CLONE" rev-parse HEAD)
+echo "divergent" >> "$SCRATCH/up/README.md"
+git -C "$SCRATCH/up" commit -qam "divergent-docs"
+git -C "$SCRATCH/up" push -q origin main
+K6=$(update_run_in update)
+check "update: divergence exits 1" "$(up_ct "$K6" 'local commits')" "1"
+check "update: divergence leaves HEAD" "$(git -C "$CLONE" rev-parse HEAD)" "$BEHIND_HEAD"
+git -C "$CLONE" reset -q --hard @{u}
+
+# K7: offline refuses (origin renamed away, URL points nowhere).
+git -C "$CLONE" remote set-url origin "$SCRATCH/origin-gone.git"
+K7=$(update_run_in update 2>&1 || :)
+check "update: offline refuses with the cannot-reach message" \
+    "$(printf '%s' "$K7" | grep -c 'cannot reach origin' || :)" "1"
+git -C "$CLONE" remote set-url origin "$SCRATCH/origin.git"
+
+# K8: the verb is claimed — no longer falls through to claude.
+check "update: the verb does not reach claude" "$(printf '%s' "$(CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" update 2>&1 || :)" | grep -c 'STUB-CLAUDE\|stub-claude' || :)" "0"
+
 # --- doctor ------------------------------------------------------------------------------
+# K pulled the clone current; the doctor-behind check below needs an unfetched upstream commit.
+echo "// after-k" >> "$SCRATCH/up/gateway.mjs"
+git -C "$SCRATCH/up" commit -qam up4
+git -C "$SCRATCH/up" push -q origin main
+# Same reason the E-H section fetches directly: the launch-path fetch is throttled and
+# backgrounded; doctor's count reads local refs.
+git -C "$CLONE" fetch -q origin main
 # No 2>/dev/null: doctor is a stdout report, so anything on stderr is a defect.
 check "doctor reports the clone is behind" \
     "$(sh "$BRIDGE" doctor | grep -c 'commit(s) behind origin/main')" "1"
