@@ -114,7 +114,7 @@ git -C "$SCRATCH/up" push -q origin main
 git -C "$CLONE" fetch -q origin main
 
 check "notice names the number of new commits" "$(launch_count '2 new commits on main')" "1"
-check "notice carries the full update command" "$(launch_count 'git pull && ./setup.sh')" "1"
+check "notice carries the full update command" "$(launch_count 'corti-bridge update')" "1"
 check "print mode gets no notice" "$(launch_count 'new commits' -p hi)" "0"
 check "CORTI_NO_UPDATE_CHECK silences the notice" \
     "$(CORTI_NO_UPDATE_CHECK=1 launch_count 'new commits')" "0"
@@ -218,7 +218,7 @@ git -C "$SCRATCH/up" push -q origin main
 K6=$(update_run_in update)
 check "update: divergence exits 1" "$(up_ct "$K6" 'local commits')" "1"
 check "update: divergence leaves HEAD" "$(git -C "$CLONE" rev-parse HEAD)" "$BEHIND_HEAD"
-git -C "$CLONE" reset -q --hard @{u}
+git -C "$CLONE" reset -q --hard "@{u}"
 
 # K7: offline refuses (origin renamed away, URL points nowhere).
 git -C "$CLONE" remote set-url origin "$SCRATCH/origin-gone.git"

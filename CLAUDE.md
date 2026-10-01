@@ -59,12 +59,18 @@ the two can't drift. This is what makes a `git pull` take effect: the gateway ho
 memory from boot, so before this it kept serving the old code until an explicit `corti-bridge
 restart`.
 
+`corti-bridge update` (+ `upgrade`) makes the pull itself a verb: gated fail-closed (clone, on
+main, reachable origin), `--ff-only`, re-runs `setup.sh --yes --no-modify-path` only when
+`bin/corti-bridge` changed (update is not an installer), and never restarts a running gateway —
+the fingerprint owns pickup. Spec: `.context/projects/2026-10/11-bridge-self-update/plan.md`.
+
 Separately, the wrapper backgrounds a throttled `git fetch origin main` (once a day) and counts
 `HEAD..origin/main` from *local* refs at launch, so the count drops to zero the moment the user
 pulls rather than nagging until the next fetch. The notice prints **after** the session, not
 before: the wrapper hands the terminal to Claude Code, which repaints it. That is the one reason
 the launch path gives up `exec` — and only when there is something to print. Off for print runs,
-advisor children, non-clones, any branch but `main`, and `CORTI_NO_UPDATE_CHECK=1`.
+advisor children, non-clones, any branch but `main`, and `CORTI_NO_UPDATE_CHECK=1` (which does
+not block an explicit `update`).
 
 ### Mode dispatch
 

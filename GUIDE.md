@@ -140,9 +140,29 @@ corti-bridge --stop       # stop the gateway and exit
 corti-bridge restart      # stop then start it (needs CORTI_BEARER/CORTI_BASE_URL)
 ```
 
-`--stop` is a flag, not a bare command: `claude`'s own `stop|kill <id>` subcommand passes through the wrapper to stop a background session, and a bare `stop` would intercept it and silently kill the gateway instead. `restart` is safe as a bare command because `claude` uses `respawn`, not `restart`, for background sessions — no collision. The other subcommands (`doctor`, `models`, `theme`) shadow `claude`-verb equivalents that are low-value when proxied (`doctor` checks the Claude Code install, which the wrapper leaves healthy) or that don't exist (`models`, `theme`), so the proxy's command is the useful one. `--stop` needs nothing — not even credentials — so it works when something's wrong. `restart` checks credentials *before* stopping, so a typo'd `CORTI_BEARER` won't take down a working gateway. Stopping a gateway that's already stopped is not an error.
+`--stop` is a flag, not a bare command: `claude`'s own `stop|kill <id>` subcommand passes through the wrapper to stop a background session, and a bare `stop` would intercept it and silently kill the gateway instead. `restart` is safe as a bare command because `claude` uses `respawn`, not `restart`, for background sessions — no collision. The other subcommands (`doctor`, `models`, `theme`) shadow `claude`-verb equivalents that are low-value when proxied (`doctor` checks the Claude Code install, which the wrapper leaves healthy) or that don't exist (`models`, `theme`), so the proxy's command is the useful one.
+
+`update` and its `upgrade` alias claim what used to pass through to `claude update` — the Claude Code binary updater. The claim is deliberately a behavior change: inside the bridge, "update" means *the bridge* (pull origin/main, re-deploy the wrapper if it changed, advise what applies when — never restarting a running gateway). To update the Claude Code binary itself, run `claude update` directly, outside the bridge. The claim is positional-only: `corti-bridge --anthropic update` and `-p update` still pass the word through, since only `$1` enters the subcommand case. `update` needs neither credentials nor claude, sitting with `--stop`/`doctor`/`theme` in the no-creds part of the dispatcher.
+
+`--stop` needs nothing — not even credentials — so it works when something's wrong. `restart` checks credentials *before* stopping, so a typo'd `CORTI_BEARER` won't take down a working gateway. Stopping a gateway that's already stopped is not an error.
 
 Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require restarting the gateway: the gateway doesn't read `models.env` (the wrapper does, at launch), so a new mapping takes effect the next time you run `corti-bridge`. You only need `restart` if you've changed `CORTI_BASE_URL` — and even then, a normal `corti-bridge` run detects the staleness and restarts it for you. Switching `--anthropic` never needs one: both modes are always being served.
+
+### `corti-bridge update`
+
+Bundles what the end-of-session notice used to tell you to type by hand (`cd <clone> && git pull && ./setup.sh`). One run, in order:
+
+1. **Gates, fail-closed** — is this a clone, is it on `main`, can origin be reached (one bounded, prompt-proof synchronous fetch)? Answering no prints the manual recipe for exactly what's wrong and touches nothing. A failed behind-count is never reported as "already up to date".
+2. **Pull** `--ff-only` if behind. Already current exits 0. Divergent local commits, an unconcluded merge, and overwritten tracked files each print their own recipe.
+3. **Classify what changed**, and act only where action is possible:
+   - `bin/corti-bridge` changed (the only artifact setup.sh deploys) → re-run `./setup.sh --yes --no-modify-path`, but only if `models.env`/`profile.env` exist (update is not an installer — missing state would be silently created under `--yes` otherwise) and the installed wrapper's baked `PROXY_DIR` matches this clone (never re-point a foreign install). Success is judged by setup's own output ("installed"/"updated"/"up to date"), not its exit code: the only reachable post-deploy failure is an unknown-shell PATH note, benign.
+   - Gateway sources changed (`gateway.mjs`, `translate.mjs`, `lib/*.mjs`, `lib/*.txt` — the fingerprint set) → no action; the next launch auto-restarts a stale gateway, and `update` **never** restarts one itself (that's what protects an in-flight advisor consult).
+   - Anything else (`lib/*.sh`, docs, tests) → nothing; they're consumed live from the clone.
+4. Stamps the once-a-day fetch check on success, so the next launch doesn't repeat the fetch.
+
+`--dry-run` reports the situation without the fetch or the pull (the fetch itself writes the remote-tracking ref): the count comes from the last fetch and the message says so.
+
+Two accepted edges: the setup re-run deploys the *working tree's* wrapper, so uncommitted local edits to `bin/corti-bridge` get deployed exactly as today's manual grammar would; and a session launched through a `CORTI_NO_MANAGE_GATEWAY` child (an advisor consult) keeps an old in-memory gateway until its next managed launch.
 
 ## Upstream failures and retries
 
@@ -211,7 +231,7 @@ Read directly from the shell — no local secrets file.
 | `CORTI_BASE_URL` | yes | Must match `https://ai.<env>.corti.app/v1`; used as-is (OpenAI-compatible endpoints) |
 | `CORTI_HOST` | no | Proxy bind address, default `127.0.0.1` |
 | `CORTI_PORT` | no | Proxy bind port, default `4192` |
-| `CORTI_NO_UPDATE_CHECK` | no | `1` disables the update check entirely — no background `git fetch`, no notice. Already off for print runs, advisor children, non-clone installs, and any branch but `main` |
+| `CORTI_NO_UPDATE_CHECK` | no | `1` silences the automatic check — no background `git fetch`, no end-of-session notice. It does **not** block an explicit `corti-bridge update`, which is a deliberate action, not a check. Already off for print runs, advisor children, non-clone installs, and any branch but `main` |
 | `CORTI_UPDATE_INTERVAL_S` | no | Seconds between background update fetches, default `86400` (once a day). The commits-behind count itself is read from local refs on every launch and costs no network |
 | `CORTI_REASONING_MODE` | no | `thinking` (default: reasoning becomes Anthropic thinking blocks), `text` (fold into reply text), `drop`. Controls reasoning *visibility* on the response side; the request-side depth comes from `output_config.effort` → `reasoning_effort` (see thinking config in [Translation surface](#translation-surface)) |
 | `TAVILY_API_KEY` | no | Enables Tavily as the primary WebSearch backend; when unset (or when Tavily fails/rate-limits) the keyless DuckDuckGo scrape is used instead |

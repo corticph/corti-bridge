@@ -58,10 +58,10 @@ The gateway runs on `127.0.0.1:4192` and outlives any single session; the wrappe
 
 ```
 corti-bridge: 3 new commits on main.
-  cd ~/corti-bridge && git pull && ./setup.sh
+  corti-bridge update
 ```
 
-There is no restart step — pulling changes the gateway's source, and the next launch picks it up automatically. `corti-bridge doctor` reports the same thing on demand.
+Running it pulls `main`, re-deploys the wrapper if the wrapper itself changed, and says what takes effect when — a running gateway is never restarted by it; the next launch picks up gateway changes automatically. `corti-bridge update --dry-run` checks without pulling. `corti-bridge doctor` reports the same commits-behind count on demand.
 
 The check is a `git fetch` against the clone's own origin — no account, no telemetry, nothing sent anywhere. Set `CORTI_NO_UPDATE_CHECK=1` to turn it off; it is already off on any branch but `main`.
 
@@ -115,10 +115,10 @@ Read directly from the shell — no local secrets file.
 
 ## Upgrading
 
-1. `git pull`
-2. `./setup.sh` — refreshes the wrapper, reports what's already current, re-asks nothing you've already answered
-3. `corti-bridge` — the wrapper auto-restarts a stale gateway
-4. `./setup.sh --fresh` if Corti has changed what it serves since you last ran it
+```bash
+corti-bridge update      # pull + re-deploy the wrapper if it changed; refuses if anything needs a hand
+./setup.sh --fresh       # additionally: re-detect models when Corti's catalog changed (interactive)
+```
 
 `./setup.sh --uninstall` removes the wrapper and the PATH block it added. It leaves `~/.corti-bridge` alone (your model mapping and profile choice) and prints the path so you can delete it yourself.
 
