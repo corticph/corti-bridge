@@ -60,19 +60,23 @@ update_redeploy() {
         echo "corti-bridge: the installed wrapper points at ${_ur_baked:-nowhere}, not $PROXY_DIR — run ./setup.sh manually from the right clone" >&2
         return 1
     fi
+    # || _ur_rc=$? keeps the benign post-deploy exit-1 (pathrc rc=2) reachable under the
+    # wrapper's set -eu: a bare failing simple command would exit the whole wrapper before
+    # the deployed/not-deployed discriminator below could run.
+    _ur_rc=0
     CORTI_PROXY_CONFIG_DIR="$CORTI_DIR" CORTI_PROXY_BIN_DIR="$_update_bin_dir" \
-        "$PROXY_DIR/setup.sh" --yes --no-modify-path >"$_update_setup_out" 2>&1
-    _ur_rc=$?
+        "$PROXY_DIR/setup.sh" --yes --no-modify-path >"$_update_setup_out" 2>&1 || _ur_rc=$?
     cat "$_update_setup_out" >&2
     # Deployed-vs-not from setup's own signal lines, not its exit code: the only reachable
-    # post-deploy exit-1 is benign (pathrc rc=2, unknown shell), while setup's fatals leave the
-    # previous wrapper in place. The installed copy is a sed-rewritten one, so the clone's file
-    # can never be compared to it raw.
+    # post-deploy exit-1 is benign (pathrc rc=2, unknown shell — _ur_rc=2), while setup's
+    # fatals leave the previous wrapper in place (_ur_rc on a thrown ui_fatal is 1). The
+    # installed copy is a sed-rewritten one, so the clone's file can never be cmp'd to it raw.
     if printf '%s' "$(cat "$_update_setup_out" 2>/dev/null || true)" | grep -q "is up to date\|installed\|updated "; then
         printf 'deployed'
     else
         printf 'not-deployed'
     fi
+    return "$_ur_rc"
 }
 
 # Main. $@: --dry-run. Exit codes: 0 updated/current, 1 refusal or failure.
@@ -91,7 +95,9 @@ update_run() {
         rm -f "$_update_setup_out"
         return 1
     fi
-    if [ "${CORTI_PROXY_DIR:-/path/to/corti-bridge}" = "/path/to/corti-bridge" ] || [ ! -d "$PROXY_DIR/.git" ]; then
+    # Gate on PROXY_DIR itself (baked at install time, possibly overridden by the env), not on
+    # the override var's presence: an unset override with a real baked path is a normal install.
+    if [ "${PROXY_DIR:-/path/to/corti-bridge}" = "/path/to/corti-bridge" ] || [ ! -d "$PROXY_DIR/.git" ]; then
         echo "corti-bridge: $PROXY_DIR is not a git clone — update needs a clone to pull" >&2
         rm -f "$_update_setup_out"
         return 1
@@ -102,6 +108,27 @@ update_run() {
         rm -f "$_update_setup_out"
         return 1
     fi
+    # Dry-run: change nothing and fetch nothing — the fetch itself is a repo write (it moves
+    # refs/remotes/origin/main). Count from the last-fetched refs and say how stale they may be.
+    if [ "$_update_dry" = 1 ]; then
+        _update_beyond="$(git -C "$PROXY_DIR" rev-list --count HEAD..origin/main 2>/dev/null)" || true
+        case "${_update_beyond:-}" in
+            ''|*[!0-9]*)
+                echo "corti-bridge: could not count commits behind origin/main (dry run) — check the clone: git -C \"$PROXY_DIR\" status" >&2
+                rm -f "$_update_setup_out"
+                return 1
+                ;;
+            0)
+                echo "corti-bridge: already up to date (as of the last fetch; dry run)" >&2
+                rm -f "$_update_setup_out"
+                return 0
+                ;;
+        esac
+        echo "corti-bridge: $((_update_beyond)) new commit(s) on main, as of the last fetch — dry run; nothing written. Run: corti-bridge update" >&2
+        rm -f "$_update_setup_out"
+        return 0
+    fi
+
     # Bounded, prompt-proof fetch: no timeout(1) on macOS, so pin throughput and kill prompts.
     if ! GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" \
         git -C "$PROXY_DIR" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
@@ -124,11 +151,6 @@ update_run() {
             return 0
             ;;
     esac
-    if [ "$_update_dry" = 1 ]; then
-        echo "corti-bridge: $((_update_beyond)) new commit(s) on main — would pull and re-deploy if the wrapper changed" >&2
-        rm -f "$_update_setup_out"
-        return 0
-    fi
 
     # Pull. Atomicity: --ff-only refuses (HEAD unmoved) on divergence and on tracked-file
     # collisions; a stale MERGE_HEAD from a crashed manual pull needs its own recipe.
@@ -159,8 +181,11 @@ update_run() {
     _update_redeployed=not-needed
     case "$_update_classes" in
         *install*)
-            _update_redeploy_res="$(update_redeploy)"
-            case "$_update_redeploy_res" in
+            # || _update_redeploy_rc=1: a precondition refusal (return 1, no output) would
+            # otherwise kill the run under set -eu before the failed-case mapping fires.
+            _update_redeploy_rc=0
+            _update_redeploy_res="$(update_redeploy)" || _update_redeploy_rc=1
+            case "${_update_redeploy_res:-}" in
                 deployed) _update_redeployed=deployed ;;
                 *) _update_redeployed=failed ;;
             esac
@@ -187,6 +212,9 @@ update_run() {
     rm -f "$_update_setup_out"
 
     if [ "${_update_rc:-0}" = 0 ]; then
+        # The dispatcher label sits before the launch path's mkdir -p "$CORTI_DIR"; a fresh
+        # state dir must exist before the stamp write, or it silently no-ops.
+        mkdir -p "$CORTI_DIR"
         _update_stamp
         echo "corti-bridge: update complete" >&2
         return 0
