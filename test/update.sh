@@ -44,8 +44,8 @@ git -C "$SCRATCH/up" remote add origin "$SCRATCH/origin.git"
 git -C "$SCRATCH/up" push -q origin main
 git clone -q "$SCRATCH/origin.git" "$SCRATCH/clone"
 
-# A stub claude: the wrapper only needs it to exist on PATH and to exit cleanly.
-printf '#!/bin/sh\nexit 0\n' > "$SCRATCH/bin/claude"
+# A stub claude: on PATH, exits cleanly, prints a marker so a forbidden fall-through is detectable.
+printf '#!/bin/sh\necho "STUB-CLAUDE $*"\nexit 0\n' > "$SCRATCH/bin/claude"
 chmod +x "$SCRATCH/bin/claude"
 
 CLONE="$SCRATCH/clone"
@@ -154,8 +154,9 @@ chmod +x "$SCRATCH/bin/corti-bridge"
 K_RC_FILE="$SCRATCH/krc"
 update_run_in() {
     : > "$K_RC_FILE"
-    CORTI_PROXY_BIN_DIR="$SCRATCH/bin" "$BRIDGE" "$@" >"$SCRATCH/kout" 2>&1
-    printf '%s' "$?" > "$K_RC_FILE"
+    _krc=0
+    CORTI_PROXY_BIN_DIR="$SCRATCH/bin" "$BRIDGE" "$@" >"$SCRATCH/kout" 2>&1 || _krc=$?
+    printf '%s' "$_krc" > "$K_RC_FILE"
     cat "$SCRATCH/kout"
 }
 up_get_rc() { cat "$K_RC_FILE"; }
@@ -228,7 +229,7 @@ git -C "$CLONE" reset -q --hard "@{u}"
 
 # K7: offline refuses (origin renamed away, URL points nowhere).
 git -C "$CLONE" remote set-url origin "$SCRATCH/origin-gone.git"
-K7=$(update_run_in update 2>&1 || :)
+K7=$(update_run_in update)
 check "update: offline refuses with the cannot-reach message" \
     "$(printf '%s' "$K7" | grep -c 'cannot reach origin' || :)" "1"
 check "update: offline exits 1 (rc)" "$(up_get_rc)" "1"
@@ -250,7 +251,6 @@ K10_SETUP="$CLONE/setup.sh"
 cp "$K10_SETUP" "$K10_SETUP.real"
 wrapper_diff_and_push() {
     printf '// t-%s\n' "$1" >> "$SCRATCH/up/bin/corti-bridge"
-    chmod +x "$SCRATCH/up/bin/w"; mv "$SCRATCH/up/bin/w" "$SCRATCH/up/bin/corti-bridge"
     git -C "$SCRATCH/up" commit -qam "$1"
     git -C "$SCRATCH/up" push -q origin main
 }

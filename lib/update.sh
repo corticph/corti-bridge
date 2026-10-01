@@ -7,7 +7,7 @@ _update_stamp() {
 }
 
 # Echoes (space-separated) the action sets OLD..NEW touches: install gateway.
-# Renames list their new path; deletions match nothing and count as no-op.
+# $1/$2 are SHAs, never paths. Renames list their new path; deletions match nothing.
 update_classify() {
     _uc_old="$1"
     _uc_new="$2"
@@ -22,7 +22,6 @@ update_classify() {
     done <<EOF
 $(git -C "$PROXY_DIR" diff --name-only "$_uc_old" "$_uc_new" 2>/dev/null || true)
 EOF
-    rm -f "$_uc_old" "$_uc_new" 2>/dev/null || true
     if [ "$_uc_install" = 1 ] && [ "$_uc_gateway" = 1 ]; then
         printf 'install gateway'
     elif [ "$_uc_install" = 1 ]; then
@@ -132,16 +131,21 @@ update_run() {
             ;;
         0)
             echo "corti-bridge: already up to date" >&2
+            # The fetch succeeded, so this is a real check — stamp as much as a pull would.
+            mkdir -p "$CORTI_DIR"
+            _update_stamp
             rm -f "$_update_setup_out"
             return 0
             ;;
     esac
 
     # A failed --ff-only leaves HEAD unmoved; three refusal shapes get their own recipes.
+    # merge, not pull: the fetch above already moved refs, and pull would reach the network
+    # a second time with none of the bounds.
     _update_old="$(mktemp "${TMPDIR:-/tmp}/corti-old.XXXXXX")"
-    _update_pull_err="$(mktemp "${TMPDIR:-/tmp}/corti-pullerr.XXXXXX")"
+    _update_pull_err="$(mktemp "${TMPDIR:-/tmp}/corti-mergeerr.XXXXXX")"
     git -C "$PROXY_DIR" rev-parse HEAD > "$_update_old" 2>/dev/null || true
-    if ! git -C "$PROXY_DIR" pull --ff-only --quiet origin main 2>"$_update_pull_err"; then
+    if ! git -C "$PROXY_DIR" merge --ff-only --quiet origin/main 2>"$_update_pull_err"; then
         rm -f "$_update_setup_out" "$_update_old"
         if [ -e "$PROXY_DIR/.git/MERGE_HEAD" ]; then
             echo "corti-bridge: an earlier merge was never concluded — run: git -C \"$PROXY_DIR\" status, then resolve or git merge --abort" >&2
@@ -150,7 +154,7 @@ update_run() {
         elif [ -s "$_update_pull_err" ] && grep -q "would be overwritten" "$_update_pull_err" 2>/dev/null; then
             echo "corti-bridge: uncommitted changes to tracked files would be overwritten — commit or stash first (git -C \"$PROXY_DIR\" status)" >&2
         else
-            echo "corti-bridge: git pull failed — run: cd \"$PROXY_DIR\" && git status" >&2
+            echo "corti-bridge: merge failed — run: cd \"$PROXY_DIR\" && git status" >&2
         fi
         rm -f "$_update_pull_err"
         return 1
@@ -159,7 +163,6 @@ update_run() {
 
     _update_head="$(git -C "$PROXY_DIR" rev-parse HEAD 2>/dev/null || echo '')"
     _update_classes="$(update_classify "$(cat "$_update_old" 2>/dev/null || true)" "$_update_head")"
-    # update_classify rm's its args as paths; they were strings here, so do it.
     rm -f "$_update_old"
 
     _update_redeployed=not-needed

@@ -254,7 +254,10 @@ EOF
     return 0
   fi
 
-  _mp_cands="$(node "$_mp_js" --candidates ${_mp_exp:+"--experimental"} "$_mp_catalog")" || return 1
+  # Without the flag, betas stay out of the menus entirely (models.mjs gates on the literal).
+  _mp_exp_arg=""
+  [ "$_mp_exp" = 1 ] && _mp_exp_arg="--experimental"
+  _mp_cands="$(node "$_mp_js" --candidates $_mp_exp_arg "$_mp_catalog")" || return 1
 
   ui_step "corti-bridge models"
   ui_detail "Fetching Corti's model catalog..."
