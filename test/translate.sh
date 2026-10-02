@@ -858,6 +858,15 @@ await applyIntercepts(s1, { describeImage: describeStub, imageModels: sighted, p
 check("image: sighted model does not describe", describeCalls, 0);
 check("image: sighted model keeps the image block", s1.messages[1].content[0].content[0].type, "image");
 
+// A sighted primary (the multimodal corti-s1-beta pinned as opus, only in the experimental
+// catalog) passes images through untouched — the no-delegation case the opt-in enables.
+const sightedPrimary = new Set(["corti-s1-beta", "corti-s1-mini", "corti-s1-mini-instant"]);
+const sp = imgTurn("corti-s1-beta");
+describeCalls = 0;
+await applyIntercepts(sp, { describeImage: describeStub, imageModels: sightedPrimary, parentSessionId: "sp" });
+check("image: sighted opus primary does not describe", describeCalls, 0);
+check("image: sighted opus primary keeps the image block", sp.messages[1].content[0].content[0].type, "image");
+
 // Cache: same image across two turns (same session) → describe once, byte-identical.
 const c1 = imgTurn("corti-s1");
 const c2 = imgTurn("corti-s1");

@@ -127,6 +127,23 @@ ANTHROPIC_DEFAULT_FABLE_MODEL_PIN=\"1\""
   printf '%s\n' "$_md_pin"
 }
 
+# Echoes the CORTI_EXPERIMENTAL line for models.env, or nothing. When set, the gateway's
+# fetchImageModels queries /models?experimental=true (a pinned beta is only in that catalog).
+# $1 = this run's --experimental intent; $2 = the existing models.env path, so an unpassed
+# flag keeps the prior value.
+models_experimental_line() {
+  if [ "${1:-0}" = 1 ]; then
+    printf 'CORTI_EXPERIMENTAL="1"\n'
+    return 0
+  fi
+  [ -n "$2" ] && [ -f "$2" ] || return 0
+  _md_exp_prev="$(models_env_get "$2" CORTI_EXPERIMENTAL || true)"
+  if [ -n "$_md_exp_prev" ]; then
+    printf 'CORTI_EXPERIMENTAL="%s"\n' "$_md_exp_prev"
+    unset _md_exp_prev
+  fi
+}
+
 # 0 = models.env present and current, 1 = not written (caller records it).
 # $1 state dir, $2 force (1 = --fresh: overwrite even if it exists),
 # $3 experimental (1 = fetch with ?experimental=true so betas compete for fable)
@@ -174,6 +191,9 @@ models_configure() {
     _md_env="$(models_dedupe_fable "$_md_env")"
   fi
 
+  # Read before overwrite so --fresh keeps an existing CORTI_EXPERIMENTAL.
+  _md_env="$(printf '%s\n%s' "$_md_env" "$(models_experimental_line "$_md_exp" "$_md_file")")"
+
   mkdir -p "$_md_dir"
   # Trailing newline: command substitution strips it, and the wrapper sources this file.
   printf '%s\n' "$_md_env" >"$_md_file"
@@ -196,7 +216,7 @@ corti-bridge models - pick which Corti model backs each Claude Code tier.
 Usage: corti-bridge models [--experimental] [--reset]
 
   (default)        Interactively pick a model for each tier (needs CORTI_BEARER/CORTI_BASE_URL)
-  --experimental   Include beta models in the candidate lists
+  --experimental   Include beta models in the candidate lists; persists CORTI_EXPERIMENTAL
   --reset          Clear all pins and re-rank from scratch, no prompts
 
 A chosen model is pinned in models.env; pressing Enter keeps the auto-rank pick
@@ -224,6 +244,8 @@ EOF
 
   if [ "$_mp_reset" = 1 ]; then
     _mp_env="$(models_dedupe_fable "$_mp_auto")"
+    # A reset clears pins, not the opt-in.
+    _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_experimental_line "$_mp_exp" "$_mp_file")")"
     mkdir -p "$_mp_dir"
     printf '%s\n' "$_mp_env" >"$_mp_file.tmp" && mv "$_mp_file.tmp" "$_mp_file"
     ui_step "corti-bridge models --reset"
@@ -232,7 +254,10 @@ EOF
     return 0
   fi
 
-  _mp_cands="$(node "$_mp_js" --candidates "$_mp_catalog")" || return 1
+  # Without the flag, betas stay out of the menus entirely (models.mjs gates on the literal).
+  _mp_exp_arg=""
+  [ "$_mp_exp" = 1 ] && _mp_exp_arg="--experimental"
+  _mp_cands="$(node "$_mp_js" --candidates $_mp_exp_arg "$_mp_catalog")" || return 1
 
   ui_step "corti-bridge models"
   ui_detail "Fetching Corti's model catalog..."
@@ -258,12 +283,27 @@ EOF
     _mp_n=0
     _mp_menu=""
     _mp_default_n=1
-    for _mp_cand in $(printf '%s\n' "$_mp_cands" | grep "^$_mp_tier	" | cut -f2); do
+    _mp_tier_cands="$(printf '%s\n' "$_mp_cands" | grep "^$_mp_tier	" || true)"
+    _mp_tier_tmp="$(mktemp)"
+    printf '%s\n' "$_mp_tier_cands" >"$_mp_tier_tmp"
+    _mp_fallback_sep=""
+    while IFS="$(printf '\t')" read -r _mp_c_tier _mp_c_id _mp_c_ctx _mp_c_flags; do
       _mp_n=$((_mp_n + 1))
-      _mp_menu="${_mp_menu}      ${_mp_n}) $_mp_cand\n"
-      [ "$_mp_cand" != "$_mp_auto_id" ] || _mp_default_n=$_mp_n
-    done
-    unset _mp_cand
+      _mp_label="$_mp_c_id"
+      case "$_mp_c_flags" in
+        *fallback*)
+          if [ -z "$_mp_fallback_sep" ]; then
+            _mp_menu="${_mp_menu}      Or:\n"
+            _mp_fallback_sep=1
+          fi
+          _mp_label="$_mp_c_id"
+          ;;
+      esac
+      _mp_menu="${_mp_menu}      ${_mp_n}) $_mp_label\n"
+      [ "$_mp_c_id" != "$_mp_auto_id" ] || _mp_default_n=$_mp_n
+    done <"$_mp_tier_tmp"
+    rm -f "$_mp_tier_tmp"
+    unset _mp_c_tier _mp_c_id _mp_c_ctx _mp_c_flags _mp_fallback_sep _mp_tier_cands _mp_tier_tmp
 
     if [ "$_mp_n" = 0 ]; then
       [ "$_mp_tier" != fable ] || continue
@@ -342,6 +382,9 @@ EOF
   esac
   [ "$_mp_fable_pinned" = 1 ] || _mp_env="$(models_dedupe_fable "$_mp_env")"
   unset _mp_fable_pinned
+
+  # Without --experimental, preserve the existing value.
+  _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_experimental_line "$_mp_exp" "$_mp_file")")"
 
   mkdir -p "$_mp_dir"
   printf '%s\n' "$_mp_env" >"$_mp_file.tmp" && mv "$_mp_file.tmp" "$_mp_file"

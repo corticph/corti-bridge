@@ -423,7 +423,7 @@ _d_check_update() {
     esac
     if [ "$_d_behind" -gt 0 ]; then
         _d_report WARN update "$_d_behind commit(s) behind origin/main" \
-            "Update: cd \"$PROXY_DIR\" && git pull && ./setup.sh"
+            "Update: corti-bridge update"
     else
         _d_report OK update "up to date with the last fetch of origin/main" ""
     fi

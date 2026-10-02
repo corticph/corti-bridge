@@ -254,6 +254,30 @@ models_fingerprint() { :; }
 check "fable: kept when the probe cannot answer" \
   "$(count_fable "$(models_dedupe_fable "$FABLE_ENV" 2>/dev/null)")" "3"
 
+# --- load_models_env: the wrapper exports CORTI_EXPERIMENTAL without aborting ---
+# The wrapper runs set -eu: a failing last command in load_models_env aborts every launch and
+# restart, so an unset CORTI_EXPERIMENTAL must fall through cleanly, and a set one must still be
+# exported. The function is extracted from the wrapper so the test does not run its main path.
+_wle_fn="$(sed -n '/^load_models_env() {/,/^}/p' "$REPO/bin/corti-bridge")"
+_wle_dir="$(mktemp -d)"
+printf 'ANTHROPIC_DEFAULT_OPUS_MODEL="corti-s1"\n' > "$_wle_dir/models.env"
+# Unset variable: the function must return 0 (a failure here aborts under set -eu).
+_wle_rc="$(CORTI_DIR="$_wle_dir" sh -c '
+  set -eu
+  eval "$1"
+  load_models_env
+' sh "$_wle_fn" >/dev/null 2>&1; echo $?)"
+check "wle: unset CORTI_EXPERIMENTAL does not abort" "$_wle_rc" "0"
+# Set variable: the function must export it for the gateway.
+_wle_got="$(CORTI_DIR="$_wle_dir" CORTI_EXPERIMENTAL=1 sh -c '
+  set -eu
+  eval "$1"
+  load_models_env
+  printf "%s" "${CORTI_EXPERIMENTAL:-}"
+' sh "$_wle_fn" 2>/dev/null)"
+check "wle: set CORTI_EXPERIMENTAL is exported" "$_wle_got" "1"
+rm -rf "$_wle_dir"
+
 printf '\n'
 if [ "$FAILED" -eq 0 ]; then
   printf 'all checks passed\n'

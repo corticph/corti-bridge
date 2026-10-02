@@ -131,6 +131,10 @@ load_models_env() {
     if [ -n "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" ]; then
         export CORTI_VISION_MODEL="${CORTI_VISION_MODEL:-$ANTHROPIC_DEFAULT_HAIKU_MODEL}"
     fi
+    # Gateway boot flag: fetchImageModels uses the experimental catalog when set. Absent → off.
+    if [ -n "${CORTI_EXPERIMENTAL:-}" ]; then
+        export CORTI_EXPERIMENTAL
+    fi
 }
 
 # Update check. A clone is the only documented install and setup.sh bakes its path into
@@ -205,7 +209,7 @@ update_notice() {
     if [ "$1" = 1 ]; then _u_s=""; fi
     echo "" >&2
     echo "corti-bridge: $1 new commit$_u_s on main." >&2
-    echo "  cd \"$PROXY_DIR\" && git pull && ./setup.sh" >&2
+    echo "  corti-bridge update" >&2
 }
 
 # --stop / --restart bypass the credential and claude-installed guards: --stop needs
@@ -218,6 +222,18 @@ case "${1:-}" in
             exit 0
         fi
         echo "corti-bridge: the gateway on $GATEWAY didn't stop — stop it manually (pkill -f gateway.mjs)" >&2
+        exit 1
+        ;;
+    update|--update|upgrade)
+        # No creds, no claude. Claims what used to exec `claude update`; the binary
+        # updater stays reachable as a plain `claude update`.
+        if [ -f "$PROXY_DIR/lib/update.sh" ]; then
+            . "$PROXY_DIR/lib/update.sh"
+            shift
+            update_run "$@"
+            exit $?
+        fi
+        echo "corti-bridge: update needs the full lib (run ./setup.sh from your clone first, or set CORTI_PROXY_DIR)" >&2
         exit 1
         ;;
     --restart|restart)
@@ -336,6 +352,7 @@ Usage: corti-bridge [--anthropic] [args passed to claude]
        corti-bridge restart
        corti-bridge doctor [--deep]
        corti-bridge models [--experimental] [--reset]
+       corti-bridge update [--dry-run]
        corti-bridge theme
        corti-bridge help
 
@@ -343,11 +360,14 @@ Usage: corti-bridge [--anthropic] [args passed to claude]
   --anthropic  Use Corti's /anthropic pass-through mode (default: openai translator)
   --stop       Stop the gateway and exit
   restart      Stop then start the gateway and exit (needs CORTI_BEARER/CORTI_BASE_URL)
+  update       Pull origin/main, re-deploy the wrapper if it changed, and say what
+               applies when (never restarts a running gateway; --dry-run just reports)
+  upgrade      Alias for update
   doctor       Run diagnostics on the install, gateway, and state (no creds needed)
   doctor --deep  Also probe Corti's /models endpoint (active; needs CORTI_BEARER)
   models       Interactively pick which Corti model backs each tier (needs creds)
   models --reset     Clear all pins and re-rank from scratch, no prompts
-  models --experimental  Include beta models in the lists
+  models --experimental  Include beta models in the lists; persists CORTI_EXPERIMENTAL
   theme        Print the lime-mascot TUI theme and install instructions (no writes)
   help         Show this
 EOF

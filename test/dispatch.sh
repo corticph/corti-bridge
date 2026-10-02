@@ -32,6 +32,7 @@ cleanup() {
   [ -n "${C1_PT_GW_PID:-}" ] && { kill "$C1_PT_GW_PID" 2>/dev/null || :; wait "$C1_PT_GW_PID" 2>/dev/null || :; }
   [ -n "${C1PTSTUB_PID:-}" ] && { kill "$C1PTSTUB_PID" 2>/dev/null || :; wait "$C1PTSTUB_PID" 2>/dev/null || :; }
   [ -n "${CALSTUB_PID:-}" ] && { kill "$CALSTUB_PID" 2>/dev/null || :; wait "$CALSTUB_PID" 2>/dev/null || :; }
+  [ -n "${IMGSTUB_PID:-}" ] && { kill "$IMGSTUB_PID" 2>/dev/null || :; wait "$IMGSTUB_PID" 2>/dev/null || :; }
   rm -rf "$SCRATCH"
 }
 trap cleanup EXIT
@@ -1005,6 +1006,121 @@ set -e
 
 kill "$CAL_GW_PID" "$CALSTUB_PID" 2>/dev/null || :
 wait "$CAL_GW_PID" "$CALSTUB_PID" 2>/dev/null || :
+
+# --- IMG e2e: the experimental opt-in gates whether the image-capability lookup sees a beta.
+# A stub serves /models with the multimodal corti-s1-beta only when ?experimental=true is present,
+# and records the /chat/completions body so we can assert an image reached upstream intact vs was
+# described away. Two gateway launches: opted-in (image passes through) and not (image described).
+cat > imgstub.mjs <<'IMGSTUB'
+import fs from "node:fs";
+import https from "node:https";
+import { appendFileSync } from "node:fs";
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      // Match the path portion: /models arrives as /v1/models?experimental=true (query attached).
+      const path = req.url.split("?")[0];
+      if (path.endsWith("/models")) {
+        // Only the experimental catalog lists the multimodal corti-s1-beta.
+        const exp = req.url.includes("experimental=true");
+        const data = [
+          { id: "corti-s1", capabilities: { image_input: false, reasoning: true } },
+          { id: "corti-s1-beta", capabilities: { image_input: true, reasoning: true } },
+          { id: "corti-s1-mini-instant", capabilities: { image_input: true, reasoning: false } },
+        ];
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({
+          data: exp ? data : data.filter((m) => !m.id.endsWith("-beta")),
+          object: "list",
+        }));
+      }
+      // The gateway posts upstream to /v1/chat/completions. An intact image becomes an image_url
+      // part in the translated body; a described image becomes text. The vision sidecall re-enters
+      // the gateway's own /v1/messages and posts upstream as another /chat/completions carrying
+      // response_format+skipImages — so count those to detect delegation, and image_url to detect
+      // passthrough. Both signals come from the same log.
+      if (path.endsWith("/chat/completions")) {
+        appendFileSync("imgchat.log", body + "\n<<<END>>>\n");
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ id: "c", choices: [{ index: 0,
+          message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`IMGPORT=${s.address().port}`));
+IMGSTUB
+
+node imgstub.mjs > imgstub.out 2>&1 &
+IMGSTUB_PID=$!
+IMGUP=""
+while [ -z "$IMGUP" ]; do IMGUP=$(sed -n 's/^IMGPORT=//p' imgstub.out); done
+
+# An image-bearing Anthropic request against the opus alias; mapModel resolves it to the pinned
+# opus id before interceptImages checks the capability set. The image is a 1x1 PNG (iVBORw0KGgo).
+IMG_BODY='{"model":"claude-opus-4","max_tokens":16,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},{"type":"text","text":"what is this"}]}]}'
+
+img_run() {
+  # $1 = gateway port, $2 = experimental env value (1 or unset)
+  _ir_port="$1"; _ir_exp="$2"
+  rm -f imgchat.log
+  _ir_gw="imggateway_$1.mjs"
+  sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+    "$REPO/gateway.mjs" > "$_ir_gw"
+  if [ -n "$_ir_exp" ]; then
+    CORTI_EXPERIMENTAL="$_ir_exp" \
+    ANTHROPIC_DEFAULT_OPUS_MODEL="corti-s1-beta" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL="corti-s1-mini-instant" \
+    CORTI_BEARER=test \
+    CORTI_BASE_URL="https://127.0.0.1:$IMGUP/v1" \
+    CORTI_PORT="$_ir_port" \
+    NODE_TLS_REJECT_UNAUTHORIZED=0 \
+    node "$_ir_gw" > "imggw_$1.out" 2>&1 &
+  else
+    ANTHROPIC_DEFAULT_OPUS_MODEL="corti-s1-beta" \
+    ANTHROPIC_DEFAULT_HAIKU_MODEL="corti-s1-mini-instant" \
+    CORTI_BEARER=test \
+    CORTI_BASE_URL="https://127.0.0.1:$IMGUP/v1" \
+    CORTI_PORT="$_ir_port" \
+    NODE_TLS_REJECT_UNAUTHORIZED=0 \
+    node "$_ir_gw" > "imggw_$1.out" 2>&1 &
+  fi
+  _ir_pid=$!
+  wait_banner "imggw_$1.out" || { echo "FAIL IMG gateway did not start (port $_ir_port)" >&2; FAILED=$((FAILED + 1)); }
+  curl -s -m 15 -H 'content-type: application/json' -d "$IMG_BODY" "http://127.0.0.1:$_ir_port/v1/messages" >/dev/null || :
+  kill "$_ir_pid" 2>/dev/null || :; wait "$_ir_pid" 2>/dev/null || :
+  unset _ir_port _ir_exp _ir_gw _ir_pid
+}
+
+# Opted in: /models?experimental=true lists corti-s1-beta → sighted → the image passes through
+# to upstream as an image_url in the one primary post, and no describe sidecall fires.
+img_run 4301 1
+check "IMG: opted-in makes one upstream post (primary, no sidecall)" \
+  "$(grep -c '<<<END>>>' imgchat.log 2>/dev/null || :)" "1"
+check "IMG: opted-in image reaches upstream as image_url" \
+  "$(grep -c 'image_url' imgchat.log 2>/dev/null || :)" "1"
+check "IMG: opted-in does not delegate to the vision sidecall" \
+  "$(grep -c 'response_format' imgchat.log 2>/dev/null || :)" "0"
+
+# Not opted in: plain /models omits corti-s1-beta → treated as blind → the image is described via
+# the vision sidecall, which posts upstream with response_format+skipImages (a 2nd post). The
+# image_url in the log comes from that sidecall's own re-post, so 1 — the sidecall-only signature
+# is image_url *with* response_format.
+img_run 4302 ""
+check "IMG: not-opted-in delegates to the vision sidecall" \
+  "$(grep -c 'response_format' imgchat.log 2>/dev/null || :)" "1"
+check "IMG: not-opted-in sidecall post carries image_url" \
+  "$(grep -c 'image_url' imgchat.log 2>/dev/null || :)" "1"
+
+kill "$IMGSTUB_PID" 2>/dev/null || :
+wait "$IMGSTUB_PID" 2>/dev/null || :
 
 if [ "$FAILED" -gt 0 ]; then
   printf '\n%s check(s) failed\n' "$FAILED"
