@@ -83,6 +83,13 @@ build_id() {
         "$PROXY_DIR"/lib/*.mjs "$PROXY_DIR"/lib/*.txt 2>/dev/null | cksum | cut -d' ' -f1
 }
 
+# Fingerprint of the credentials the gateway booted with (mirrors build_id; one side owns
+# the algorithm). The gateway bakes CORTI_BEARER in at boot, so after a rotated
+# corti-cli init --fresh key it keeps 401-ing upstream until this mismatch restarts it.
+cred_id() {
+    printf '%s' "${CORTI_BEARER:-}" | cksum | cut -d' ' -f1
+}
+
 # Start the gateway and wait for it to answer health. Caller has already confirmed creds.
 gateway_start() {
     # An uninstalled wrapper still holds the placeholder path; say so instead of polling for 20s.
@@ -91,7 +98,8 @@ gateway_start() {
         echo "corti-bridge: run ./setup.sh from your clone to install the wrapper, or set CORTI_PROXY_DIR to the clone path" >&2
         exit 1
     fi
-    CORTI_BUILD_ID="$(build_id)" nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 &
+    CORTI_BUILD_ID="$(build_id)" CORTI_CRED_ID="$(cred_id)" \
+        nohup node "$PROXY_DIR/gateway.mjs" >> "$CORTI_DIR/gateway.log" 2>&1 &
     # Temp-then-move so a concurrent reader never sees a half-written pid.
     printf '%s' "$!" > "$PID_FILE.tmp" && mv "$PID_FILE.tmp" "$PID_FILE"
     i=1
@@ -464,6 +472,15 @@ if [ -n "$health" ]; then
         *"\"upstream\":\"$CORTI_BASE_URL\""*) ;;
         *'"upstream":'*)
             if [ -z "$restart_reason" ]; then restart_reason="CORTI_BASE_URL changed"; fi ;;
+    esac
+    # A changed CORTI_BEARER means the same: the gateway still authenticates upstream with the
+    # rotated-out key (corti-cli init --fresh), 401-ing every request while health looks fine.
+    # A null credId is a gateway this wrapper didn't start (hand-run, or predating credId with
+    # the key present but set to null); an absent key is caught by the buildId branch instead.
+    case "$health" in
+        *"\"credId\":\"$(cred_id)\""*) ;;
+        *'"credId":'*)
+            if [ -z "$restart_reason" ]; then restart_reason="CORTI_BEARER changed"; fi ;;
     esac
     # The gateway loads its source once, at boot, so after a `git pull` it keeps serving the old
     # code until something restarts it — the update looks applied but isn't. A null buildId is a

@@ -19,7 +19,7 @@ sh test/retry.sh       # pure-function tests for lib/retry.mjs
 sh test/prompt-estimate.sh  # pure-function tests for lib/prompt-estimate.mjs
 sh test/smoke.sh       # sandboxed install + idempotency for setup.sh (scratch HOME)
 sh test/dispatch.sh    # one gateway serving both modes, selected per request by path prefix
-sh test/update.sh      # build-fingerprint restarts + the commits-behind notice (sandboxed clone)
+sh test/update.sh      # build/credential-fingerprint restarts + the commits-behind notice (sandboxed clone)
 ```
 
 There is no per-test runner — each script runs its whole suite and prints `ok`/`FAIL` lines. To iterate on one case, comment out or edit within the script.
@@ -45,7 +45,7 @@ Supporting pieces:
 - **`bin/corti-bridge`** — POSIX sh wrapper installed to `~/.local/bin`. Owns gateway lifecycle (per-port pid file, `/health` payload check, stale-gateway auto-restart), reads `~/.corti-bridge/models.env`, and exports model aliases + `ANTHROPIC_BASE_URL` as process-scoped env before launching `claude`. Also dispatches subcommands: `doctor` (diagnostics), `models` (interactive tier picker), `theme` (prints the lime-mascot TUI theme + install steps — no writes). The gateway never reads `models.env` — only the wrapper does, at launch. Nothing is ever written to any `settings.json`.
 - **`setup.sh` + `lib/*.sh`** — installer. Preflight checks deps then creds before writing anything; a partial install exits 1 rather than leaving a half-configured state. Offers a profile menu (which Claude Code config dir Corti sessions use) and fetches the model catalog. Re-runnable; `--yes` for unattended, `--fresh` to re-fetch the catalog.
 - **`lib/models.mjs`** — ranks Corti's catalog into fable/opus/sonnet/haiku tiers by model-ID *shape* (size/speed/channel suffixes), not hardcoded names, so a new model generation needs no code change. Emits `models.env`; also serves the picker's candidate lists (`--candidates`/`--emit`) so the menu and the ranker can't drift.
-- **`lib/doctor.sh`** — `corti-bridge doctor`: ~18 passive checks on the install, gateway, and state, plus an active `/models` probe under `--deep`. Doctor output goes to stdout (a report) — a deliberate exception to the `ui_*`→stderr invariant, so `doctor | grep FAIL` and `doctor > file` work.
+- **`lib/doctor.sh`** — `corti-bridge doctor`: ~18 passive checks on the install, gateway, and state (including a gateway-vs-shell credential mismatch via `credId`), plus an active `/models` probe under `--deep` that also cross-checks `models.env`'s unpinned tier ids against the live catalog (stale-model detection after a rotation). Doctor output goes to stdout (a report) — a deliberate exception to the `ui_*`→stderr invariant, so `doctor | grep FAIL` and `doctor > file` work.
 - **`lib/retry.mjs`** — the upstream retry policy as pure functions/constants, tested in isolation.
 - **`lib/prompt-estimate.mjs`** — calibration for the char/4 prompt estimate, same shape: pure functions over one bounded per-session store, tested in isolation.
 
@@ -58,6 +58,16 @@ restart-reason list. The gateway never computes the fingerprint — one side own
 the two can't drift. This is what makes a `git pull` take effect: the gateway holds its source in
 memory from boot, so before this it kept serving the old code until an explicit `corti-bridge
 restart`.
+
+The same fingerprint covers credentials as `credId` (`cred_id()`, `bin/corti-bridge`): the wrapper
+`cksum`s the shell's `CORTI_BEARER` into it at launch — never the value, ever the fingerprint —
+and a mismatch in `/health` joins the same restart-reason list as `upstream`/`buildId`. This is
+what makes a credential rotation (`corti-cli init --fresh`, then a new terminal; `~/.env` never
+refreshes running shells) take effect on the next `corti-bridge` launch, instead of leaving the
+in-memory gateway 401-ing upstream with the old key while health looks spotless. `credId: null`
+(hand-started gateway) restarts too — the same call the null-buildId branch makes. `corti-bridge
+doctor` reports the gateway-vs-shell mismatch passively; `corti-bridge models` remains the catalog
+refresh verb (it refetches `/models` and rewrites `models.env` on every run).
 
 `corti-bridge update` (+ `upgrade`) makes the pull itself a verb: gated fail-closed (clone, on
 main, reachable origin), `--ff-only`, re-runs `setup.sh --yes --no-modify-path` only when

@@ -382,6 +382,24 @@ _d_check_gateway() {
                     ;;
             esac
         fi
+        # Same staleness, for the credentials — the next corti-bridge launch does the restart,
+        # not doctor. Can only fire once buildId matched, so the gateway is current enough
+        # to report credId at all.
+        if [ -n "${CORTI_BEARER:-}" ] && command -v cred_id >/dev/null 2>&1; then
+            case "$_d_health" in
+                *"\"credId\":\"$(cred_id)\""*) ;;
+                *'"credId":null'*)
+                    _d_report WARN gateway "running gateway has no credential fingerprint (started by hand, or older build)" \
+                        "A corti-bridge launch will restart it. $_d_sub"
+                    return 0
+                    ;;
+                *'"credId":'*)
+                    _d_report WARN gateway "credential mismatch: running gateway booted with a different CORTI_BEARER than this shell offers" \
+                        "The gateway 401s upstream until a corti-bridge launch restarts it. $_d_sub"
+                    return 0
+                    ;;
+            esac
+        fi
         _d_report OK gateway "healthy on :$_d_PORT ($_d_sub)" \
             "Clone not confirmed from health alone (see proxy-dir + process checks)."
     fi
@@ -510,7 +528,9 @@ _d_check_gateway_log() {
 
 # Active credential/model probe for --deep. Reports HTTP codes as distinct
 # advisories (not collapsed): 000 = network, 401 = rejected, 400 = malformed,
-# 200 = ok. Auto-skips when CORTI_BEARER is unset.
+# 200 = ok. On 200 it also cross-checks models.env's unpinned tier ids against
+# the live catalog — a rotated key can make a tier drop out while the file keeps
+# looking perfectly healthy. Auto-skips when CORTI_BEARER is unset.
 _d_deep_probe() {
     if [ -z "${CORTI_BEARER:-}" ]; then
         _d_report WARN deep "skipped: CORTI_BEARER not set (cannot probe Corti)" ""
@@ -521,16 +541,48 @@ _d_deep_probe() {
         return 0
     fi
     _d_dp_url="$CORTI_BASE_URL/models"
-    _d_dp_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+    # Betas only exist in the ?experimental=true catalog (the other consumers mirror the
+    # persisted opt-in); an experimental fable tier is unpinned, so probe the same scope.
+    case "$(models_env_get "$_d_CORTI_DIR/models.env" CORTI_EXPERIMENTAL || true)" in
+        ?*) _d_dp_url="$_d_dp_url?experimental=true" ;;
+    esac
+    _d_dp_body="$(mktemp)"
+    _d_dp_code=$(curl -s -o "$_d_dp_body" -w '%{http_code}' --max-time 15 \
         -H "Authorization: Bearer $CORTI_BEARER" "$_d_dp_url" 2>/dev/null) || _d_dp_code=000
     case "$_d_dp_code" in
         200)
             _d_report OK deep "Corti /models returned 200 (credentials accepted)" \
                 "Model-id correctness/tiering still not validated (a tier swap parses fine)."
+            if [ ! -s "$_d_dp_body" ]; then
+                _d_report WARN deep "Corti /models returned 200 with an empty body — catalog cross-check skipped" ""
+            elif [ -f "$_d_CORTI_DIR/models.env" ]; then
+                _d_dp_misses=''
+                # Deliberately pinned tiers are exempt: pinned-but-out-of-catalog is a
+                # legal state (a pin survives --fresh by design), not staleness.
+                for _d_dp_tier in FABLE OPUS SONNET HAIKU; do
+                    _d_dp_tid=$(models_env_get "$_d_CORTI_DIR/models.env" "ANTHROPIC_DEFAULT_${_d_dp_tier}_MODEL" || true)
+                    case "$_d_dp_tid" in '') continue ;; esac
+                    _d_dp_pin=$(models_env_get "$_d_CORTI_DIR/models.env" "ANTHROPIC_DEFAULT_${_d_dp_tier}_MODEL_PIN" || true)
+                    case "$_d_dp_pin" in 1) continue ;; esac
+                    if ! grep -qF "\"$_d_dp_tid\"" "$_d_dp_body"; then
+                        _d_dp_misses="$_d_dp_misses ${_d_dp_tier}=${_d_dp_tid}"
+                    fi
+                done
+                case "$_d_dp_misses" in
+                    '')
+                        _d_report OK deep "models.env tier ids are all in the live catalog" ""
+                        ;;
+                    *)
+                        _d_dp_misses="${_d_dp_misses# }"
+                        _d_report WARN deep "models.env lists tiers your live catalog no longer has: $_d_dp_misses" \
+                            "Run: corti-bridge models  (a fresh pick rewrites the file from the live catalog)"
+                        ;;
+                esac
+            fi
             ;;
         401)
             _d_report WARN deep "Corti rejected credentials (401) - token may be revoked or regenerated" \
-                "Run: npx @corti/cli models init"
+                "Run: npx @corti/cli models init - and if init already ran, this shell may still hold the old key: open a new terminal"
             ;;
         400)
             _d_report WARN deep "Corti returned 400 - a malformed CORTI_BEARER is the usual cause" \
@@ -544,6 +596,7 @@ _d_deep_probe() {
             _d_report WARN deep "Corti /models returned HTTP $_d_dp_code" ""
             ;;
     esac
+    rm -f "$_d_dp_body"
 }
 
 # Honest-limits footer. Lists what the run could NOT validate, adjusted for
@@ -553,7 +606,7 @@ _d_deep_probe() {
 _d_limits_footer() {
     printf '\n'
     if [ "$_d_deep" = 1 ]; then
-        printf 'Not checked (even with --deep): model-id correctness/tiering (a tier\nswap parses fine), port of ps-found gateways, second clones on disk. Credential\nreachability was probed; 401 != definitively revoked.\n'
+        printf 'Not checked (even with --deep): model-id tiering (a tier\nswap parses fine), port of ps-found gateways, second clones on disk. Credential\nreachability was probed and models.env tier ids were checked against the live\ncatalog; 401 != definitively revoked.\n'
     else
         printf 'Not checked (passive run): credential validity against Corti, model-id\ncorrectness/tiering, port of ps-found gateways, second clones on disk.\n'
         printf "Run 'corti-bridge doctor --deep' to probe Corti's /models endpoint.\n"
