@@ -54,6 +54,7 @@ models_fetch_catalog() {
     401)
       ui_warn "Corti rejected your credentials (401)"
       ui_detail "  the token may have been revoked or regenerated - run: npx @corti/cli models init"
+      ui_detail "  already re-ran init? this shell may still hold the old key - open a new terminal and retry"
       ;;
     400)
       ui_warn "Corti returned 400"

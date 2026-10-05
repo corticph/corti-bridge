@@ -148,6 +148,18 @@ corti-bridge restart      # stop then start it (needs CORTI_BEARER/CORTI_BASE_UR
 
 Reconfiguring models (`./setup.sh --fresh`) or the profile does **not** require restarting the gateway: the gateway doesn't read `models.env` (the wrapper does, at launch), so a new mapping takes effect the next time you run `corti-bridge`. You only need `restart` if you've changed `CORTI_BASE_URL` — and even then, a normal `corti-bridge` run detects the staleness and restarts it for you. Switching `--anthropic` never needs one: both modes are always being served.
 
+### Credential rotation
+
+The gateway bakes `CORTI_BEARER` in at boot, so a rotated key has no effect on a running gateway until a restart — and nothing else about that gateway looks stale, which is how a session can 401 on a *healthy-looking* gateway. The wrapper therefore fingerprints your shell's `CORTI_BEARER` (an opaque `cksum`, never the value) into `credId` alongside `buildId`, and each launch compares against `/health`. A mismatch — including a hand-started gateway that reports none — restarts with the current credentials before `claude` comes up.
+
+This is what makes the corti-cli ↔ corti-bridge hand-off work after a `corti-cli init --fresh` re-mints your key:
+
+1. **Open a new terminal** — env changes never propagate into running shells, so the old key still sits in `CORTI_BEARER` there (`corti-bridge models` would curl `/models` directly with it and 401).
+2. Start `corti-bridge` — the credId mismatch restarts the gateway with the new key automatically.
+3. `corti-bridge models` — refetches Corti's catalog and rewrites `models.env` in one go: that *is* the model-refresh verb. There is no separate `refresh`.
+
+If anything still 401s, `corti-bridge doctor` reports whether the running gateway's credentials differ from your shell's; `corti-bridge restart` is the manual fix (it needs the new key in the current shell, so it can't repair a stale one by itself).
+
 ### `corti-bridge update`
 
 Bundles the end-of-session notice's manual recipe (`cd <clone> && git pull && ./setup.sh`) into one verb. In order:
@@ -195,10 +207,12 @@ The wrapper prints the log directory on startup, and `/health` reports it as `de
 
 ```bash
 curl -s http://127.0.0.1:4192/health
-# {"status":"healthy","gatewayVersion":2,"mode":"openai","upstream":"https://ai.eu.corti.app/v1","debug":"/Users/you/Library/Logs/corti-bridge"}
+# {"status":"healthy","gatewayVersion":2,"mode":"openai","upstream":"https://ai.eu.corti.app/v1","buildId":"1889519261","credId":"4028365182","debug":"/Users/you/Library/Logs/corti-bridge"}
 #
 # `mode` is not a process-wide setting — it reports what a request carrying no path prefix
-# resolves to, which is what the wrapper compares when deciding whether to restart.
+# resolves to, which is what the wrapper compares when deciding whether to restart. `buildId`
+# and `credId` are fingerprints of the running build and of the credentials it booted with —
+# the wrapper's other restart inputs; `credId: null` means a gateway this wrapper didn't start.
 ```
 
 In `openai` mode each request id gets up to four entries — REQUEST (what the client sent), UPSTREAM-REQUEST (translated OpenAI body), UPSTREAM-RESPONSE (raw upstream bytes, plus upstream headers when the status was an error — that's the only place `server`, `retry-after` and `x-request-id` survive), RESPONSE (translated bytes sent to the client, with a `note` of `completed`/`upstream-error`/`client-abort`/`watchdog-timeout`/`parse-fail` and per-request diagnostics). Mistranslation debugging is a diff problem: compare REQUEST→UPSTREAM-REQUEST and UPSTREAM-RESPONSE→RESPONSE.

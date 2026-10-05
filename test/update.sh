@@ -68,6 +68,10 @@ health_build() {
     curl -sf --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null |
         sed -n 's/.*"buildId":"\([0-9]*\)".*/\1/p'
 }
+health_cred() {
+    curl -sf --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null |
+        sed -n 's/.*"credId":"\([0-9]*\)".*/\1/p'
+}
 # Count of a pattern in a launch's combined output.
 launch_count() {
     _pat="$1"
@@ -101,6 +105,25 @@ check "the restarted gateway carries the new fingerprint" "$(health_build)" "$(f
 check "and does not restart again on the next launch" \
     "$(CORTI_NO_UPDATE_CHECK=1 launch_count 'older build')" "0"
 git -C "$CLONE" checkout -q -- translate.mjs
+CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" >/dev/null 2>&1
+
+# --- K. credential staleness drives the restart ------------------------------------------
+# The credId mirror of section B/C/D: a rotated bearer (corti-cli init --fresh, then a new
+# shell) must restart the gateway on the next launch, or it keeps 401-ing upstream with the
+# dead key it baked in at boot.
+check "unchanged bearer does not restart the gateway" \
+    "$(CORTI_NO_UPDATE_CHECK=1 launch_count 'CORTI_BEARER changed')" "0"
+
+CORTI_BEARER="test-rotated"
+check "a changed bearer restarts the gateway" \
+    "$(CORTI_NO_UPDATE_CHECK=1 launch_count 'CORTI_BEARER changed')" "1"
+check "the restarted gateway carries the new credId" \
+    "$(health_cred)" "$(printf '%s' "$CORTI_BEARER" | cksum | cut -d' ' -f1)"
+check "and does not restart again on the next launch" \
+    "$(CORTI_NO_UPDATE_CHECK=1 launch_count 'CORTI_BEARER changed')" "0"
+
+# Realign the gateway with the suite's base state: everything below asserts on other reasons.
+CORTI_BEARER=test
 CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" >/dev/null 2>&1
 
 # --- E-H. the notice and its guards -----------------------------------------------------

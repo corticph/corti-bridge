@@ -382,6 +382,25 @@ _d_check_gateway() {
                     ;;
             esac
         fi
+        # Same staleness, for the credentials: doctor runs without a launch and does not restart
+        # anything, so a rotated key (corti-cli init --fresh) shows up here as a mismatch the
+        # user can act on — the next corti-bridge launch does the restart, not doctor. Can only
+        # fire once buildId matched, so the gateway is current enough to report credId at all.
+        if [ -n "${CORTI_BEARER:-}" ] && command -v cred_id >/dev/null 2>&1; then
+            case "$_d_health" in
+                *"\"credId\":\"$(cred_id)\""*) ;;
+                *'"credId":null'*)
+                    _d_report WARN gateway "running gateway has no credential fingerprint (started by hand, or older build)" \
+                        "A corti-bridge launch will restart it. $_d_sub"
+                    return 0
+                    ;;
+                *'"credId":'*)
+                    _d_report WARN gateway "credential mismatch: running gateway booted with a different CORTI_BEARER than this shell offers" \
+                        "The gateway 401s upstream until a corti-bridge launch restarts it. $_d_sub"
+                    return 0
+                    ;;
+            esac
+        fi
         _d_report OK gateway "healthy on :$_d_PORT ($_d_sub)" \
             "Clone not confirmed from health alone (see proxy-dir + process checks)."
     fi
