@@ -158,7 +158,7 @@ This is what makes the corti-cli ↔ corti-bridge hand-off work after a `corti-c
 2. Start `corti-bridge` — the credId mismatch restarts the gateway with the new key automatically.
 3. `corti-bridge models` — refetches Corti's catalog and rewrites `models.env` in one go: that *is* the model-refresh verb. There is no separate `refresh`.
 
-If anything still 401s, `corti-bridge doctor` reports whether the running gateway's credentials differ from your shell's; `corti-bridge restart` is the manual fix (it needs the new key in the current shell, so it can't repair a stale one by itself).
+If anything still 401s, `corti-bridge doctor` reports whether the running gateway's credentials differ from your shell's; `corti-bridge restart` is the manual fix (it needs the new key in the current shell, so it can't repair a stale one by itself). `doctor --deep` additionally flags `models.env` tier entries your live catalog no longer contains — a rotated key can serve a different tenant/project, so a model from the previous credential vanishes without anything in the file looking wrong.
 
 ### `corti-bridge update`
 
@@ -193,7 +193,7 @@ Separately, silence *before* upstream sends response headers now has its own dea
 
 ## Debug logging
 
-For a first pass when something's off, run `corti-bridge doctor` — it checks the install, gateway health, and state files passively (add `--deep` to also probe Corti's `/models` endpoint). If a specific request looks wrong, reach for the debug log below.
+For a first pass when something's off, run `corti-bridge doctor` — it checks the install, gateway health, and state files passively (add `--deep` to also probe Corti's `/models` endpoint and cross-check `models.env`'s tier ids against the live catalog — stale models after a credential rotation surface here). If a specific request looks wrong, reach for the debug log below.
 
 Set `CORTI_DEBUG` and the gateway writes every request and response to a log file, one per Claude Code session:
 
