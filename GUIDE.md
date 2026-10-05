@@ -71,7 +71,7 @@ A tier takes the first `[size, speed]` shape it can fill from an explicit shape 
 
 Sorting rather than scanning keeps every pick independent of the order the API returned. An unfilled tier borrows the one above it; nothing sits above opus, so it takes the roomiest model by context window. A fable that only repeats opus is not a tier — but a name comparison is not enough to tell (see [the fingerprint probe](#the-fingerprint-probe)).
 
-`CLAUDE_CODE_MAX_CONTEXT_TOKENS` is derived from whichever model wins the opus slot, not hardcoded — that export is the window Claude Code compacts against. The gateway's own overflow backstop is a separate fixed constant that does *not* follow the mapping; it only catches absurd bodies, because upstream's 400 is authoritative for whichever model was actually called.
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` is derived from the roomiest resolved tier — the harness enforces one global context ceiling, so a fable pinned to a longer-window model lifts it even when opus ranked shorter. Not hardcoded. The gateway's own overflow backstop is a separate fixed constant that does *not* follow the mapping; it only catches absurd bodies, because upstream's 400 is authoritative for whichever model was actually called.
 
 ### Capability derivation
 
@@ -88,7 +88,7 @@ A capability is omitted only when the catalog explicitly says `false` — absenc
 
 Opus, sonnet and haiku are drawn from the GA channel only. Fable is the exception: it takes the strongest model in the catalog whatever its channel, because when Corti ships a model larger than its GA line it has done so on the beta channel alone, and a GA-only rule would leave the tier permanently empty. Beta models only appear in the catalog when the fetch is made with `--experimental` (`?experimental=true`).
 
-Models with a context window under 100k are excluded from every tier — small enough to break a coding session before it gets going. The window comes from each model's `max_input_tokens` in the catalog, so `CLAUDE_CODE_MAX_CONTEXT_TOKENS` tracks the opus tier's real window without a maintained table. A model that omits the field warns by name and falls back to a default — a drift signal, not a guess.
+Models with a context window under 100k are excluded from every tier — small enough to break a coding session before it gets going. The window comes from each model's `max_input_tokens` in the catalog, so `CLAUDE_CODE_MAX_CONTEXT_TOKENS` tracks the resolved tiers' real windows without a maintained table. A model that omits the field warns by name and falls back to a default — a drift signal, not a guess.
 
 ### The fingerprint probe
 
