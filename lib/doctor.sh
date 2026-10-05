@@ -382,10 +382,9 @@ _d_check_gateway() {
                     ;;
             esac
         fi
-        # Same staleness, for the credentials: doctor runs without a launch and does not restart
-        # anything, so a rotated key (corti-cli init --fresh) shows up here as a mismatch the
-        # user can act on — the next corti-bridge launch does the restart, not doctor. Can only
-        # fire once buildId matched, so the gateway is current enough to report credId at all.
+        # Same staleness, for the credentials — the next corti-bridge launch does the restart,
+        # not doctor. Can only fire once buildId matched, so the gateway is current enough
+        # to report credId at all.
         if [ -n "${CORTI_BEARER:-}" ] && command -v cred_id >/dev/null 2>&1; then
             case "$_d_health" in
                 *"\"credId\":\"$(cred_id)\""*) ;;
@@ -530,10 +529,8 @@ _d_check_gateway_log() {
 # Active credential/model probe for --deep. Reports HTTP codes as distinct
 # advisories (not collapsed): 000 = network, 401 = rejected, 400 = malformed,
 # 200 = ok. On 200 it also cross-checks models.env's unpinned tier ids against
-# the live catalog — a rotated key (corti-cli init --fresh) can serve a different
-# tenant/project, and a retired generation drops out of the catalog, so a name
-# models_config wrote from a *previous* credential can vanish while the file
-# keeps looking perfectly healthy. Auto-skips when CORTI_BEARER is unset.
+# the live catalog — a rotated key can make a tier drop out while the file keeps
+# looking perfectly healthy. Auto-skips when CORTI_BEARER is unset.
 _d_deep_probe() {
     if [ -z "${CORTI_BEARER:-}" ]; then
         _d_report WARN deep "skipped: CORTI_BEARER not set (cannot probe Corti)" ""
@@ -544,6 +541,11 @@ _d_deep_probe() {
         return 0
     fi
     _d_dp_url="$CORTI_BASE_URL/models"
+    # Betas only exist in the ?experimental=true catalog (the other consumers mirror the
+    # persisted opt-in); an experimental fable tier is unpinned, so probe the same scope.
+    case "$(models_env_get "$_d_CORTI_DIR/models.env" CORTI_EXPERIMENTAL || true)" in
+        ?*) _d_dp_url="$_d_dp_url?experimental=true" ;;
+    esac
     _d_dp_body="$(mktemp)"
     _d_dp_code=$(curl -s -o "$_d_dp_body" -w '%{http_code}' --max-time 15 \
         -H "Authorization: Bearer $CORTI_BEARER" "$_d_dp_url" 2>/dev/null) || _d_dp_code=000

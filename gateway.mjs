@@ -203,10 +203,8 @@ function healthPayload() {
     // The wrapper re-fingerprints the clone on each launch and restarts us when it stops matching,
     // which is what makes a `git pull` take effect instead of silently serving the old build.
     buildId: process.env.CORTI_BUILD_ID || null,
-    // Same contract, for credentials: the wrapper fingerprints the shell's CORTI_BEARER (never
-    // the value itself — a cksum) at launch and restarts us when it stops matching, which makes
-    // a re-auth (rotated corti-cli init --fresh key) take effect on the next launch instead of
-    // this process 401-ing upstream forever with the key it baked in at boot.
+    // Same contract, for credentials: a rotated CORTI_BEARER must restart us on the next
+    // launch, instead of this process 401-ing upstream forever with the key it baked in.
     credId: process.env.CORTI_CRED_ID || null,
     // A pre-dispatch wrapper compares this against the mode it wants, so it has to describe
     // bare-path behaviour rather than naming a process-wide mode that no longer exists.

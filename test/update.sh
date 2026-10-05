@@ -108,9 +108,8 @@ git -C "$CLONE" checkout -q -- translate.mjs
 CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" >/dev/null 2>&1
 
 # --- K. credential staleness drives the restart ------------------------------------------
-# The credId mirror of section B/C/D: a rotated bearer (corti-cli init --fresh, then a new
-# shell) must restart the gateway on the next launch, or it keeps 401-ing upstream with the
-# dead key it baked in at boot.
+# The credId mirror of section B/C/D: a rotated bearer must restart the gateway on the
+# next launch, or it keeps 401-ing upstream with the dead key it baked in at boot.
 check "unchanged bearer does not restart the gateway" \
     "$(CORTI_NO_UPDATE_CHECK=1 launch_count 'CORTI_BEARER changed')" "0"
 

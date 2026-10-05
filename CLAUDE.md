@@ -19,7 +19,7 @@ sh test/retry.sh       # pure-function tests for lib/retry.mjs
 sh test/prompt-estimate.sh  # pure-function tests for lib/prompt-estimate.mjs
 sh test/smoke.sh       # sandboxed install + idempotency for setup.sh (scratch HOME)
 sh test/dispatch.sh    # one gateway serving both modes, selected per request by path prefix
-sh test/update.sh      # build-fingerprint restarts + the commits-behind notice (sandboxed clone)
+sh test/update.sh      # build/credential-fingerprint restarts + the commits-behind notice (sandboxed clone)
 ```
 
 There is no per-test runner — each script runs its whole suite and prints `ok`/`FAIL` lines. To iterate on one case, comment out or edit within the script.

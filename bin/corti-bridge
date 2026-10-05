@@ -83,12 +83,9 @@ build_id() {
         "$PROXY_DIR"/lib/*.mjs "$PROXY_DIR"/lib/*.txt 2>/dev/null | cksum | cut -d' ' -f1
 }
 
-# Fingerprint of the credentials the gateway booted with, echoed back in /health as credId
-# (same shape as build_id: opaque, only ever compared against itself, one side owns the
-# algorithm). The gateway bakes CORTI_BEARER in at boot, so after a re-auth — a rotated
-# corti-cli init --fresh key — a perfectly healthy-looking gateway keeps 401-ing upstream
-# until this mismatch restarts it. Emitted at launch with CORTI_BUILD_ID (gateway_start);
-# the launch/restart health-compare blocks it out as the bearer-change restart reason.
+# Fingerprint of the credentials the gateway booted with (mirrors build_id; one side owns
+# the algorithm). The gateway bakes CORTI_BEARER in at boot, so after a rotated
+# corti-cli init --fresh key it keeps 401-ing upstream until this mismatch restarts it.
 cred_id() {
     printf '%s' "${CORTI_BEARER:-}" | cksum | cut -d' ' -f1
 }
@@ -478,8 +475,8 @@ if [ -n "$health" ]; then
     esac
     # A changed CORTI_BEARER means the same: the gateway still authenticates upstream with the
     # rotated-out key (corti-cli init --fresh), 401-ing every request while health looks fine.
-    # A null credId is a gateway this wrapper didn't start (hand-run, or one predating credId)
-    # — restarting is the same call the buildId branch makes for a null buildId.
+    # A null credId is a gateway this wrapper didn't start (hand-run, or predating credId with
+    # the key present but set to null); an absent key is caught by the buildId branch instead.
     case "$health" in
         *"\"credId\":\"$(cred_id)\""*) ;;
         *'"credId":'*)
