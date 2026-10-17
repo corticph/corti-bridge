@@ -133,9 +133,10 @@ load_models_env() {
         [ -n "${ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES:-}" ] &&
             export ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES
     fi
-    # Feed the vision sidecall the user's resolved haiku tier. The gateway's visionModel() reads
-    # CORTI_VISION_MODEL first, then ANTHROPIC_DEFAULT_HAIKU_MODEL — the latter reaches the gateway
-    # only via this export. An explicit CORTI_VISION_MODEL override still wins.
+    # Feed the vision sidecall the user's resolved haiku tier as the preferred vision model. The
+    # gateway validates it against the live sighted catalog and steps down to the next sighted tier
+    # (sonnet -> opus -> fable) if it is blind, rather than 400-ing at upstream. An explicit
+    # CORTI_VISION_MODEL override still wins as the preference.
     if [ -n "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" ]; then
         export CORTI_VISION_MODEL="${CORTI_VISION_MODEL:-$ANTHROPIC_DEFAULT_HAIKU_MODEL}"
     fi

@@ -1076,6 +1076,7 @@ img_run() {
     "$REPO/gateway.mjs" > "$_ir_gw"
   if [ -n "$_ir_exp" ]; then
     CORTI_EXPERIMENTAL="$_ir_exp" \
+    CORTI_VISION_MODEL="" \
     ANTHROPIC_DEFAULT_OPUS_MODEL="corti-s1-beta" \
     ANTHROPIC_DEFAULT_HAIKU_MODEL="corti-s1-mini-instant" \
     CORTI_BEARER=test \
@@ -1084,6 +1085,8 @@ img_run() {
     NODE_TLS_REJECT_UNAUTHORIZED=0 \
     node "$_ir_gw" > "imggw_$1.out" 2>&1 &
   else
+    CORTI_EXPERIMENTAL="" \
+    CORTI_VISION_MODEL="" \
     ANTHROPIC_DEFAULT_OPUS_MODEL="corti-s1-beta" \
     ANTHROPIC_DEFAULT_HAIKU_MODEL="corti-s1-mini-instant" \
     CORTI_BEARER=test \

@@ -32,6 +32,7 @@ import {
   isRetryableStatus,
   retryDelayMs,
 } from "./lib/retry.mjs";
+import { VISION_DEFAULT, resolveVisionModel } from "./lib/vision.mjs";
 
 const HOST = process.env.CORTI_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.CORTI_PORT ?? 4192);
@@ -431,15 +432,9 @@ function fetchImageModels() {
   return imageModelsLoading;
 }
 
-/** The vision model used to describe images for a blind primary. Defaults to the instant
- *  sonnet tier (corti-s1-mini-instant): multimodal and non-reasoning, so no thinking cap is needed
- *  and latency is low — describing is perception, not reasoning. CORTI_VISION_MODEL overrides;
- *  point it at a reasoning model (corti-s1-mini) when the question needs chart arithmetic. Must
- *  itself be multimodal — if it's blind, the skipImages recursion guard stops re-describing and
- *  the upstream 400 surfaces as a graceful placeholder, not a crash. */
-function visionModel() {
-  return process.env.CORTI_VISION_MODEL || process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL || "corti-s1-mini-instant";
-}
+// Module-level dedup of the blind-override step-down warning: one line per bypassed model id per
+// process, so a session full of images logs once, not once per image.
+const _visionWarned = new Set();
 
 /** The system prompt for the vision sidecall, in lib/ so the per-type checklists stay readable.
  *  Fixed across every call so it prefix-caches. Asks for a JSON object with typed fields (adapted
@@ -498,11 +493,14 @@ function formatImageDescription(f) {
  *  Resolves { ok, text } on success or { ok:false, code, detail } on failure — interceptImages turns
  *  a failure into a graceful placeholder rather than letting a blind model receive the image.
  *  context (optional) is the surrounding user question / model intent, extracted by interceptImages
- *  so the vision model can focus on what's actually being asked rather than a generic summary. */
-function runDescribeImage(block, context) {
+ *  so the vision model can focus on what's actually being asked rather than a generic summary.
+ *  model is the resolved vision id from resolveVisionModel (imageInterceptOpts); "" means no
+ *  configured tier is sighted — short-circuit to the placeholder without burning an upstream 400. */
+function runDescribeImage(block, context, model) {
+  if (!model) return Promise.resolve({ ok: false, code: "no_sighted_model", detail: "no multimodal model available" });
   return new Promise((resolve) => {
     const reqBody = JSON.stringify({
-      model: visionModel(),
+      model,
       max_tokens: 4096,
       // Extraction, not composition — and unpinned decoding makes every prompt change unmeasurable.
       temperature: 0.1,
@@ -568,11 +566,23 @@ function bodyHasImage(body) {
 /** Opts for interceptImages, built only for image-bearing requests: ensures the capability set is
  *  loaded (lazy, once per process) then wires the describe sidecall. Returns {} when the body
  *  carries no image, so non-image requests pay nothing. The capability fetch is awaited so the
- *  first image-bearing request blocks on it; later requests reuse the cached set. */
+ *  first image-bearing request blocks on it; later requests reuse the cached set.
+ *
+ *  The vision model is resolved here — after the sighted set is fetched — so a blind tier pin steps
+ *  down to the next sighted tier instead of 400-ing at upstream. The resolved model is bound into
+ *  the describeImage closure; runDescribeImage's positional (block, context) signature is kept so
+ *  translate.mjs and test/translate.sh stubs stay arity-stable. A blind explicit CORTI_VISION_MODEL
+ *  logs one deduped warning per bypassed model id. */
 async function imageInterceptOpts(body, skipImages) {
   if (skipImages || !bodyHasImage(body)) return {};
   if (imageModels === null) await fetchImageModels();
-  return { describeImage: runDescribeImage, imageModels };
+  const { model, warned, fallbackFrom } = resolveVisionModel({ env: process.env, imageModels });
+  if (warned && fallbackFrom && !_visionWarned.has(fallbackFrom)) {
+    _visionWarned.add(fallbackFrom);
+    const to = model ? `"${model}"` : "no sighted model — images will be described as placeholders";
+    console.error(`corti-proxy: CORTI_VISION_MODEL "${fallbackFrom}" is not multimodal; using ${to} for image description`);
+  }
+  return { describeImage: (block, context) => runDescribeImage(block, context, model), imageModels };
 }
 
 function handleModels(res) {

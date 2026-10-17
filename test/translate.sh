@@ -10,6 +10,7 @@ REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 node --input-type=module -e '
 import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache, _resetImageCache } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
+import { resolveVisionModel, VISION_DEFAULT, VISION_TIERS } from "'"$REPO"'/lib/vision.mjs";
 
 let failed = 0;
 const check = (name, got, want) => {
@@ -1063,6 +1064,75 @@ const markerBody = {
 };
 await applyIntercepts(markerBody, { describeImage: markerStub, imageModels: blind, parentSessionId: "smark" });
 check("image: lone provenance marker yields null context", markerCtx, null);
+
+// --- Vision-model step-down: a blind vision tier pin steps to the next sighted tier instead of
+// 400-ing. The resolver is pure (lib/vision.mjs) — inject env + sighted Set, assert the picked model.
+// Sighted set mirrors the live experimental catalog: only the corti-s1-mini* family is multimodal.
+const vSighted = new Set(["corti-s1-mini", "corti-s1-mini-beta", "corti-s1-mini-instant", "corti-s1-mini-instant-beta"]);
+const vEnv = (o) => ({ CORTI_VISION_MODEL: "", ANTHROPIC_DEFAULT_HAIKU_MODEL: "", ANTHROPIC_DEFAULT_SONNET_MODEL: "", ANTHROPIC_DEFAULT_OPUS_MODEL: "", ANTHROPIC_DEFAULT_FABLE_MODEL: "", ...o });
+
+// Explicit sighted override is honored, no warning.
+let vr = resolveVisionModel({ env: vEnv({ CORTI_VISION_MODEL: "corti-s1-mini" }), imageModels: vSighted });
+check("vision: explicit sighted override is used", vr.model, "corti-s1-mini");
+check("vision: sighted override warns false", vr.warned, false);
+
+// The live bug shape: override blind, sonnet sighted → steps down to sonnet, warns once.
+vr = resolveVisionModel({
+  env: vEnv({ CORTI_VISION_MODEL: "corti-s1-instant-beta", ANTHROPIC_DEFAULT_HAIKU_MODEL: "corti-s1-instant-beta", ANTHROPIC_DEFAULT_SONNET_MODEL: "corti-s1-mini" }),
+  imageModels: vSighted,
+});
+check("vision: blind override steps down to sighted sonnet", vr.model, "corti-s1-mini");
+check("vision: blind override warns true", vr.warned, true);
+check("vision: blind override records fallbackFrom", vr.fallbackFrom, "corti-s1-instant-beta");
+
+// Ladder: haiku blind, sonnet blind, opus blind, fable sighted → first sighted wins (fable).
+vr = resolveVisionModel({
+  env: vEnv({ ANTHROPIC_DEFAULT_HAIKU_MODEL: "corti-s1-instant-beta", ANTHROPIC_DEFAULT_SONNET_MODEL: "corti-s1-instant-beta", ANTHROPIC_DEFAULT_OPUS_MODEL: "corti-s1", ANTHROPIC_DEFAULT_FABLE_MODEL: "corti-s1-mini" }),
+  imageModels: vSighted,
+});
+check("vision: steps haiku->sonnet->opus->fable, first sighted wins", vr.model, "corti-s1-mini");
+check("vision: no override means no warning", vr.warned, false);
+check("vision: no override means no fallbackFrom", vr.fallbackFrom, null);
+
+// Sonnet is the first sighted rung → sonnet wins before fable (ladder order is cheapest-first).
+vr = resolveVisionModel({
+  env: vEnv({ ANTHROPIC_DEFAULT_HAIKU_MODEL: "corti-s1-instant-beta", ANTHROPIC_DEFAULT_SONNET_MODEL: "corti-s1-mini-beta", ANTHROPIC_DEFAULT_OPUS_MODEL: "corti-s1", ANTHROPIC_DEFAULT_FABLE_MODEL: "corti-s1-mini" }),
+  imageModels: vSighted,
+});
+check("vision: sonnet wins before fable when both sighted", vr.model, "corti-s1-mini-beta");
+
+// No tier sighted → empty string (the true bottom; gateway short-circuits to placeholder).
+vr = resolveVisionModel({
+  env: vEnv({ ANTHROPIC_DEFAULT_HAIKU_MODEL: "corti-s1-instant-beta", ANTHROPIC_DEFAULT_SONNET_MODEL: "corti-s1-instant-beta" }),
+  imageModels: new Set(["corti-s1-mini"]),
+});
+check("vision: no sighted tier resolves to empty", vr.model, "");
+
+// Empty sighted set → every model is blind (matches interceptImages leniency), empty result.
+vr = resolveVisionModel({ env: vEnv({ CORTI_VISION_MODEL: "corti-s1-mini" }), imageModels: new Set() });
+check("vision: empty sighted set treats all as blind", vr.model, "");
+check("vision: empty sighted set warns on the override", vr.warned, true);
+
+// Non-Set sighted input → treated as blind (defensive, same shape as interceptImages).
+vr = resolveVisionModel({ env: vEnv({ CORTI_VISION_MODEL: "corti-s1-mini" }), imageModels: null });
+check("vision: non-Set sighted input resolves to empty", vr.model, "");
+
+// No env tiers set and no override → falls through to VISION_DEFAULT when it is sighted.
+vr = resolveVisionModel({ env: vEnv(), imageModels: vSighted });
+check("vision: bare env resolves to VISION_DEFAULT when sighted", vr.model, VISION_DEFAULT);
+check("vision: bare env warns false", vr.warned, false);
+
+// VISION_DEFAULT itself blind → empty (the catalog dropped the instant sonnet).
+vr = resolveVisionModel({ env: vEnv(), imageModels: new Set(["corti-s1-mini"]) });
+check("vision: blind default resolves to empty", vr.model, "");
+
+// Whitespace-only override and tier values are trimmed, not treated as set-but-blind.
+vr = resolveVisionModel({ env: vEnv({ CORTI_VISION_MODEL: "  corti-s1-mini  " }), imageModels: vSighted });
+check("vision: override is trimmed before sighted check", vr.model, "corti-s1-mini");
+
+// The tier ladder order is the cheapest-first convention (haiku first).
+check("vision: tier ladder starts at haiku", VISION_TIERS[0], "ANTHROPIC_DEFAULT_HAIKU_MODEL");
+check("vision: tier ladder ends at fable", VISION_TIERS[VISION_TIERS.length - 1], "ANTHROPIC_DEFAULT_FABLE_MODEL");
 
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }
