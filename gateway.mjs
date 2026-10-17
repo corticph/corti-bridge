@@ -32,7 +32,7 @@ import {
   isRetryableStatus,
   retryDelayMs,
 } from "./lib/retry.mjs";
-import { VISION_DEFAULT, resolveVisionModel } from "./lib/vision.mjs";
+import { resolveVisionModel } from "./lib/vision.mjs";
 
 const HOST = process.env.CORTI_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.CORTI_PORT ?? 4192);

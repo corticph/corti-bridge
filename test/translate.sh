@@ -1109,13 +1109,23 @@ vr = resolveVisionModel({
 check("vision: no sighted tier resolves to empty", vr.model, "");
 
 // Empty sighted set → every model is blind (matches interceptImages leniency), empty result.
+// This is the TRUE bottom: the catalog loaded (a Set), confirmed nothing is sighted.
 vr = resolveVisionModel({ env: vEnv({ CORTI_VISION_MODEL: "corti-s1-mini" }), imageModels: new Set() });
 check("vision: empty sighted set treats all as blind", vr.model, "");
 check("vision: empty sighted set warns on the override", vr.warned, true);
 
-// Non-Set sighted input → treated as blind (defensive, same shape as interceptImages).
-vr = resolveVisionModel({ env: vEnv({ CORTI_VISION_MODEL: "corti-s1-mini" }), imageModels: null });
-check("vision: non-Set sighted input resolves to empty", vr.model, "");
+// Non-Set imageModels means the /models fetch failed or has not loaded — sightedness unknown,
+// not confirmed blind. Fall back to VISION_DEFAULT (the known-multimodal default) so a transient
+// outage describes images rather than pinning placeholders for the session via the image cache.
+// Regression guard: the old resolver returned "" here, degrading every setup on a /models blip.
+vr = resolveVisionModel({ env: vEnv({ CORTI_VISION_MODEL: "corti-s1-instant-beta" }), imageModels: null });
+check("vision: null imageModels falls back to VISION_DEFAULT", vr.model, VISION_DEFAULT);
+check("vision: null imageModels does not warn (unknown, not blind)", vr.warned, false);
+check("vision: null imageModels clears fallbackFrom", vr.fallbackFrom, null);
+
+// undefined imageModels (env not injected at all) → same null-fallback path.
+vr = resolveVisionModel({ env: vEnv(), imageModels: undefined });
+check("vision: undefined imageModels falls back to VISION_DEFAULT", vr.model, VISION_DEFAULT);
 
 // No env tiers set and no override → falls through to VISION_DEFAULT when it is sighted.
 vr = resolveVisionModel({ env: vEnv(), imageModels: vSighted });
