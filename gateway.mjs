@@ -98,10 +98,10 @@ const NONSTREAM_TIMEOUT_MS = 600_000;
 const CONTINUATION_GRACE_MS = 10_000;
 const CONTINUATION_MIN_MS = 60_000;
 const SHUTDOWN_GRACE_MS = 5_000;
-// Upstream's own 400 is authoritative for whichever model is called; this just bounds the backstop.
-const CONTEXT_WINDOW = 524_288;
-// estimateTokens undercounts real usage, so this trips only on absurd bodies.
-const OVERFLOW_TOKEN_ESTIMATE = 524_288;
+// Upstream's own 400 is authoritative for whichever model is called; this bounds the local
+// backstop to absurd bodies — twice the largest catalog window, far above any servable request.
+const CONTEXT_WINDOW = 2_097_152;
+const OVERFLOW_TOKEN_ESTIMATE = 2_097_152;
 const BYTE_CAP_BYTES = 8_000_000;
 const MEMORY_BREAKER_BYTES = 64_000_000;
 
