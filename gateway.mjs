@@ -795,7 +795,7 @@ async function handleMessages(req, res, body) {
           type: "error",
           error: {
             type: "request_too_large",
-            message: "request body exceeds the largest size measured to reach inference (8 MB); remove or shrink large images",
+            message: "request body exceeds the largest size measured to reach inference (8 MB)",
           },
         },
       },

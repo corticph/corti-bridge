@@ -113,8 +113,9 @@ gateway_start() {
 
 # Source ~/.corti-bridge/models.env and export the tier aliases + capabilities. Called before
 # gateway_start (default path and --restart) so the gateway inherits the haiku tier in its launch
-# env: the gateway's visionModel() reads ANTHROPIC_DEFAULT_HAIKU_MODEL from its own process env,
-# set at boot (the gateway never reads models.env itself, by design). Both files absent → inert.
+# env: the gateway's vision resolver (lib/vision.mjs) reads ANTHROPIC_DEFAULT_HAIKU_MODEL from
+# its own process env, set at boot (the gateway never reads models.env itself, by design). Both
+# files absent → inert.
 load_models_env() {
     [ -f "$CORTI_DIR/models.env" ] || return 0
     . "$CORTI_DIR/models.env"
@@ -265,7 +266,8 @@ case "${1:-}" in
         fi
         # Source models.env so the restarted gateway inherits the haiku tier (and the other
         # tier aliases) in its launch env — same as the default launch path. Without this, a
-        # `corti-bridge restart` gets a gateway whose visionModel() falls to the hardcoded default.
+        # `corti-bridge restart` gets a gateway whose vision resolver (lib/vision.mjs) falls
+        # back to the tier ladder's default instead of the configured tier.
         load_models_env
         if ! gateway_stop; then
             echo "corti-bridge: the gateway on $GATEWAY didn't stop — stop it manually (pkill -f gateway.mjs)" >&2

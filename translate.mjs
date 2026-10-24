@@ -1504,7 +1504,10 @@ function anthropicUsage(usage) {
 /* Auto-mode classifier verdicts can die in the reasoning channel: the upstream fires the
  * "</block>" stop string inside the reasoning before the verdict is ever typed as text, so the
  * reply arrives content-less. The verdict is recoverable only when the model actually
- * concluded — the marker must sit at the very tail of the reasoning. */
+ * concluded — the marker must sit at the very tail of the reasoning. A CoT that merely quotes
+ * the closed marker form ends indistinguishably from a real verdict, so a phantom synthesis
+ * is possible (zero occurrences in the measured corpus of 159 live recoveries); the debug log
+ * carries the reasoning and the recovered text side by side for audit. */
 function tailVerdict(reasoning) {
   const m = typeof reasoning === "string" ? reasoning.match(/<block>(no|yes)\s*$/) : null;
   return m ? `<block>${m[1]}</block>` : null;
