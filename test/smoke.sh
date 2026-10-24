@@ -274,6 +274,43 @@ check "ft-line: stored 0 survives --fresh" \
   "$(models_forward_thinking_line "$_ftdir/models.env")" 'CORTI_FORWARD_THINKING="0"'
 rm -rf "$_ftdir"
 
+# --- models_pick: stored flag lines survive --reset and the picker tail (call-site guard) ---
+# The helper-level ft/uw checks pass even while the picker's write tail drops the stored lines,
+# so the regression is only catchable by driving models_pick itself. Catalog and fingerprint
+# are stubbed; creds are dummies that only satisfy models.sh's guard; CC_ASSUME_YES defaults
+# every menu prompt headlessly.
+_pickle_dir="$(mktemp -d)"
+PICK_CATALOG_JSON='{"data":[{"id":"corti-s1","max_input_tokens":1048576},{"id":"corti-s1-ultra","max_input_tokens":1048576},{"id":"corti-s1-mini","max_input_tokens":262144},{"id":"corti-s1-mini-instant","max_input_tokens":262144}]}'
+models_fetch_catalog() { printf '%s' "$PICK_CATALOG_JSON"; }
+models_fingerprint() { :; }
+_pick_count() {
+  _n=$(grep -c "$2" "$1" 2>/dev/null) || :
+  [ -n "$_n" ] || _n=0
+  printf '%s' "$_n"
+}
+mkdir -p "$_pickle_dir/reset"
+printf 'ANTHROPIC_DEFAULT_HAIKU_MODEL_PIN="1"\nCORTI_EXPERIMENTAL="1"\nCORTI_FORWARD_THINKING="0"\nCLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="0"\n' > "$_pickle_dir/reset/models.env"
+( CORTI_PROXY_CONFIG_DIR="$_pickle_dir/reset" CORTI_BEARER=dummy CORTI_BASE_URL=https://example.invalid \
+  models_pick --reset ) >/dev/null 2>&1
+check "pick-reset: ft opt-out survives --reset" \
+  "$(_pick_count "$_pickle_dir/reset/models.env" '^CORTI_FORWARD_THINKING="0"$')" "1"
+check "pick-reset: uw opt-out survives --reset" \
+  "$(_pick_count "$_pickle_dir/reset/models.env" '^CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="0"$')" "1"
+check "pick-reset: experimental opt-in preserved" \
+  "$(_pick_count "$_pickle_dir/reset/models.env" '^CORTI_EXPERIMENTAL="1"$')" "1"
+check "pick-reset: pins cleared by the reset" \
+  "$(_pick_count "$_pickle_dir/reset/models.env" '_PIN="1"$')" "0"
+mkdir -p "$_pickle_dir/pick"
+printf 'CORTI_EXPERIMENTAL="1"\nCORTI_FORWARD_THINKING="0"\nCLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="0"\n' > "$_pickle_dir/pick/models.env"
+( CORTI_PROXY_CONFIG_DIR="$_pickle_dir/pick" CORTI_BEARER=dummy CORTI_BASE_URL=https://example.invalid \
+  CC_ASSUME_YES=1 models_pick ) >/dev/null 2>&1
+check "pick: ft opt-out survives the picker" \
+  "$(_pick_count "$_pickle_dir/pick/models.env" '^CORTI_FORWARD_THINKING="0"$')" "1"
+check "pick: uw opt-out survives the picker" \
+  "$(_pick_count "$_pickle_dir/pick/models.env" '^CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="0"$')" "1"
+rm -rf "$_pickle_dir"
+unset PICK_CATALOG_JSON _pickle_dir
+
 # --- load_models_env: the wrapper exports CORTI_EXPERIMENTAL without aborting ---
 # The wrapper runs set -eu: a failing last command in load_models_env aborts every launch and
 # restart, so an unset CORTI_EXPERIMENTAL must fall through cleanly, and a set one must still be

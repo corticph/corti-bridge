@@ -277,8 +277,11 @@ EOF
 
   if [ "$_mp_reset" = 1 ]; then
     _mp_env="$(models_dedupe_fable "$_mp_auto")"
-    # A reset clears pins, not the opt-in.
+    # A reset clears pins, not the stored opt-ins and opt-outs: read before the overwrite,
+    # the same read-before-write the setup.sh flow uses.
     _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_experimental_line "$_mp_exp" "$_mp_file")")"
+    _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_forward_thinking_line "$_mp_file")")"
+    _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_unknown_window_line "$_mp_file")")"
     mkdir -p "$_mp_dir"
     printf '%s\n' "$_mp_env" >"$_mp_file.tmp" && mv "$_mp_file.tmp" "$_mp_file"
     ui_step "corti-bridge models --reset"
@@ -418,6 +421,10 @@ EOF
 
   # Without --experimental, preserve the existing value.
   _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_experimental_line "$_mp_exp" "$_mp_file")")"
+  # The picker must also keep the stored opt-outs across its overwrite — a user's "0" on
+  # preserved thinking or on the compact-skip switch is a stored choice, not a pin.
+  _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_forward_thinking_line "$_mp_file")")"
+  _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_unknown_window_line "$_mp_file")")"
 
   mkdir -p "$_mp_dir"
   printf '%s\n' "$_mp_env" >"$_mp_file.tmp" && mv "$_mp_file.tmp" "$_mp_file"
