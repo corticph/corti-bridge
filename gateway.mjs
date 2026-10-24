@@ -98,10 +98,18 @@ const NONSTREAM_TIMEOUT_MS = 600_000;
 const CONTINUATION_GRACE_MS = 10_000;
 const CONTINUATION_MIN_MS = 60_000;
 const SHUTDOWN_GRACE_MS = 5_000;
-// Upstream's own 400 is authoritative for whichever model is called; this bounds the local
-// backstop to absurd bodies — twice the largest catalog window, far above any servable request.
-const CONTEXT_WINDOW = 2_097_152;
-const OVERFLOW_TOKEN_ESTIMATE = 2_097_152;
+/* Upstream's own 400 is authoritative for whichever model is called; the local backstop only
+ * bounds absurd bodies. The altitude derives from the window the wrapper exports at launch
+ * (CLAUDE_CODE_MAX_CONTEXT_TOKENS — the roomiest resolved tier), so the gate tracks the catalog
+ * without a hand-moved literal; a non-finite or absent value floors out rather than disabling
+ * the gate. */
+const BACKSTOP_FLOOR_TOKENS = 2_097_152;
+const exportedContextWindow = Number(process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS);
+const CONTEXT_WINDOW = Math.max(
+  BACKSTOP_FLOOR_TOKENS,
+  2 * (Number.isFinite(exportedContextWindow) ? exportedContextWindow : 0),
+);
+const OVERFLOW_TOKEN_ESTIMATE = CONTEXT_WINDOW;
 const BYTE_CAP_BYTES = 8_000_000;
 const MEMORY_BREAKER_BYTES = 64_000_000;
 
