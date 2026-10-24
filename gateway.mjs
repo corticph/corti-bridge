@@ -829,6 +829,9 @@ async function handleMessages(req, res, body) {
     msgId: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
     requestedModel: anthropicBody.model,
     reasoningMode: REASONING_MODE,
+    // The translated request rides along so response translation (translate.mjs) can see the
+    // request's stop strings — the wire-shaped decisions stay in translate.mjs.
+    upstreamRequest: translated,
     estimatedInput,
     onDiagnostic: (m) => diagnostics.push(m),
     // Fires wherever translate.mjs sees upstream's own prompt_tokens, streaming or not. Paired

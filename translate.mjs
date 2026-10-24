@@ -1501,6 +1501,15 @@ function anthropicUsage(usage) {
   };
 }
 
+/* Auto-mode classifier verdicts can die in the reasoning channel: the upstream fires the
+ * "</block>" stop string inside the reasoning before the verdict is ever typed as text, so the
+ * reply arrives content-less. The verdict is recoverable only when the model actually
+ * concluded — the marker must sit at the very tail of the reasoning. */
+function tailVerdict(reasoning) {
+  const m = typeof reasoning === "string" ? reasoning.match(/<block>(no|yes)\s*$/) : null;
+  return m ? `<block>${m[1]}</block>` : null;
+}
+
 export function translateCompletion(completion, ctx) {
   // The only place upstream's own prompt_tokens surfaces off the streaming path; the gateway
   // calibrates the estimate it reports for the session's next turn against it.
@@ -1519,6 +1528,18 @@ export function translateCompletion(completion, ctx) {
 
   if (typeof message.content === "string" && message.content)
     content.push({ type: "text", text: message.content });
+
+  // Classifier recovery: on a "</block>"-stopped request whose text channel stayed empty, the
+  // verdict marker sits verbatim at the reasoning tail — type it back in as text.
+  if (
+    !content.some((b) => b.type === "text") &&
+    choice.stop_reason === "</block>" &&
+    Array.isArray(ctx?.upstreamRequest?.stop) &&
+    ctx.upstreamRequest.stop.includes("</block>")
+  ) {
+    const verdict = tailVerdict(reasoning);
+    if (verdict) content.push({ type: "text", text: verdict });
+  }
 
   for (const call of message.tool_calls ?? []) {
     let input = {};
@@ -1562,6 +1583,9 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
   let terminated = false;
   let latestUsage = null;
   let outputChars = 0;
+  // Classifier-verdict recovery reads the accumulated reasoning tail (tailVerdict below).
+  let thinkingTail = "";
+  let sawText = false;
   // Anchor sources for a consult's advice; must match the client's history byte for byte.
   let lastText = "";
   let firstBlock = null; // { type:"text", text } | { type:"tool", id }
@@ -1618,6 +1642,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
 
   const reasoningText = (text) => {
     if (!text) return;
+    thinkingTail += text;
     if (ctx.reasoningMode === "drop") return;
     if (ctx.reasoningMode === "thinking") {
       if (open?.kind !== "thinking")
@@ -1634,6 +1659,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
 
   const textDelta = (text) => {
     if (!text) return;
+    sawText = true;
     if (open?.kind !== "text") {
       openBlock("text", { type: "text", text: "" });
       lastText = "";
@@ -1708,6 +1734,21 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
   const finish = (choice) => {
     pendingStop = anthropicStop(choice);
     closeOpen();
+    // Classifier recovery, streaming side: no text on a "</block>"-stopped request with the
+    // verdict marker at the reasoning tail — finish_reason "stop" is the stop-fired evidence.
+    if (
+      !sawText &&
+      Array.isArray(ctx?.upstreamRequest?.stop) &&
+      ctx.upstreamRequest.stop.includes("</block>") &&
+      (choice.stop_reason === "</block>" || (choice.stop_reason == null && choice.finish_reason === "stop"))
+    ) {
+      const verdict = tailVerdict(thinkingTail);
+      if (verdict) {
+        openBlock("text", { type: "text", text: "" });
+        textDelta(verdict);
+        closeOpen();
+      }
+    }
     // Detect a turn ending on a consult_advisor tool_use. The harness would otherwise end the
     // turn and synthesize a "No such tool" error; the gateway uses this to hold the turn open
     // and emit an inline advisor_tool_result instead. Only fires when a hook is registered.

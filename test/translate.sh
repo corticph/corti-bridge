@@ -822,6 +822,63 @@ const d1pres = translateCompletion({
 }, d1ctx);
 check("D1: present tool_call id preserved", d1pres.content[0].id, "call_abc");
 
+// --- B1: auto-mode classifier verdict recovery. The "</block>" stop fires inside the reasoning
+// channel; the marker at the reasoning tail is typed back in as text (fixture: #2/#7 sidecalls).
+const b1ctx = { msgId: "msg_b1", requestedModel: "corti-s1-mini-beta", reasoningMode: "thinking", estimatedInput: 1, upstreamRequest: { stop: ["</block>"] } };
+const b1msg = translateCompletion({
+  choices: [{ index: 0, message: { role: "assistant", content: null, reasoning: "Could be Exfil Scouting? No. Irreversible? No. It is benign. Stage1 probably no block. Need output <block>no" }, finish_reason: "stop", stop_reason: "</block>" }],
+  usage: { prompt_tokens: 38911, completion_tokens: 73 },
+}, b1ctx);
+check("B1: verdict typed back in as text", b1msg.content.some((b) => b.type === "text" && b.text === "<block>no</block>"), true);
+check("B1: thinking block still carries the reasoning", b1msg.content.some((b) => b.type === "thinking" && b.thinking.endsWith("Need output <block>no")), true);
+check("B1: stop_reason mapping unchanged (end_turn)", b1msg.stop_reason, "end_turn");
+const b1yes = translateCompletion({
+  choices: [{ index: 0, message: { role: "assistant", content: null, reasoning: "Transcript ends with Bash find command. Need output <block>yes" }, finish_reason: "stop", stop_reason: "</block>" }],
+  usage: { prompt_tokens: 1, completion_tokens: 1 },
+}, b1ctx);
+check("B1: yes verdict recovered", b1yes.content.some((b) => b.type === "text" && b.text === "<block>yes</block>"), true);
+// Negative gates: no stop string on the request, or the stop never fired at the reasoning tail
+// (a max_tokens cut leaves the sentence dangling) — nothing is synthesized in those cases.
+const b1nctx = { msgId: "msg_b1n", requestedModel: "corti-s1", reasoningMode: "thinking", estimatedInput: 1, upstreamRequest: {} };
+const b1n1 = translateCompletion({ choices: [{ index: 0, message: { role: "assistant", content: null, reasoning: "No block rule matches. Output `<block>no" }, finish_reason: "stop", stop_reason: "</block>" }], usage: {} }, b1nctx);
+check("B1: no request stop string -> no synthesis", b1n1.content.some((b) => b.type === "text" && b.text === "<block>no</block>"), false);
+const b1n2 = translateCompletion({ choices: [{ index: 0, message: { role: "assistant", content: null, reasoning: "This is a local read-only diagnostic. No BLOCK rule matches. The action is" }, finish_reason: "length", stop_reason: null }], usage: {} }, b1ctx);
+check("B1: length cut -> no synthesis", b1n2.content.some((b) => b.type === "text"), false);
+// Text-mode reasoning folds the marker into the already-streamed text; recovery must not
+// duplicate it.
+const b1tctx = { msgId: "msg_b1t", requestedModel: "corti-s1", reasoningMode: "text", estimatedInput: 1, upstreamRequest: { stop: ["</block>"] } };
+const b1t = translateCompletion({ choices: [{ index: 0, message: { role: "assistant", content: null, reasoning: "Benign. The answer is `<block>no" }, finish_reason: "stop", stop_reason: "</block>" }], usage: {} }, b1tctx);
+check("B1: text-mode reasoning not duplicated", b1t.content.filter((b) => b.type === "text").length, 1);
+check("B1: text-mode tail keeps its raw marker", b1t.content[0].text.endsWith("<block>no"), true);
+
+// --- B2: streaming recovery: same gate, but streamed chunks carry no stop_reason, so on a
+// "</block>"-stopped request finish_reason "stop" is the stop-fired evidence.
+const b2events = [];
+const b2ctx = { msgId: "msg_b2", requestedModel: "corti-s1-mini-beta", reasoningMode: "thinking", estimatedInput: 999, upstreamRequest: { stop: ["</block>"] } };
+const b2tx = createStreamTranslator(b2ctx, (ev, data) => b2events.push({ ev, data }));
+b2tx.feed({ choices: [{ delta: { reasoning: "Could be Exfil Scouting? No. Irreversible? No. It is benign. Need output <block>no" } }] });
+b2tx.feed({ choices: [{ delta: {}, finish_reason: "stop" }] });
+b2tx.done();
+const b2text = b2events.filter((e) => e.ev === "content_block_delta" && e.data?.delta?.type === "text_delta").map((e) => e.data.delta.text).join("");
+check("B2: verdict recovered mid-stream", b2text, "<block>no</block>");
+// A verdict delivered as normal streamed text must pass through untouched.
+const b2rev = [];
+const b2rctx = { msgId: "msg_b2r", requestedModel: "corti-s1-mini-beta", reasoningMode: "thinking", estimatedInput: 999, upstreamRequest: { stop: ["</block>"] } };
+const b2rtx = createStreamTranslator(b2rctx, (ev, data) => b2rev.push({ ev, data }));
+b2rtx.feed({ choices: [{ delta: { reasoning: "thinking about the action" } }] });
+b2rtx.feed({ choices: [{ delta: { content: "\n\n<block>no" }, finish_reason: "stop" }] });
+b2rtx.done();
+const b2rtext = b2rev.filter((e) => e.ev === "content_block_delta" && e.data?.delta?.type === "text_delta").map((e) => e.data.delta.text).join("");
+check("B2: normally delivered verdict not duplicated", b2rtext, "\n\n<block>no");
+// A max_tokens burn leaves no marker to recover — no synthesis.
+const b2mev = [];
+const b2mctx = { msgId: "msg_b2m", requestedModel: "corti-s1-mini-beta", reasoningMode: "thinking", estimatedInput: 999, upstreamRequest: { stop: ["</block>"] } };
+const b2mtx = createStreamTranslator(b2mctx, (ev, data) => b2mev.push({ ev, data }));
+b2mtx.feed({ choices: [{ delta: { reasoning: "Hmm, but actually — let me reconsider one mor" } }] });
+b2mtx.feed({ choices: [{ delta: {}, finish_reason: "length" }] });
+b2mtx.done();
+check("B2: length burn -> no synthesis", b2mev.some((e) => e.ev === "content_block_delta" && e.data?.delta?.type === "text_delta"), false);
+
 // --- Image intercept: a non-multimodal primary (corti-s1) gets image blocks replaced with a
 // text description from a sighted side model, so Corti doesn\x27t 400 "not a multimodal model" and
 // kill the session. Capability-driven: a sighted model passes images through untouched. Cached
