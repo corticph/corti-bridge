@@ -158,6 +158,21 @@ models_forward_thinking_line() {
   unset _md_ft_prev
 }
 
+# Echoes the CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT line for models.env.
+# 2.1.3xx CLIs can fire proactive auto-compact on unrecognized gateway model IDs at a fraction
+# of the declared window (measured: 52% of 1M on 2.1.310); with this set, Claude Code compacts
+# only on a recognized "prompt is too long" error — which the gateway deliberately emits at the
+# real ceiling. Stored values survive --fresh; new installs record the default "1".
+# $1 = the existing models.env path.
+models_unknown_window_line() {
+  _md_uw_prev=""
+  if [ -n "$1" ] && [ -f "$1" ]; then
+    _md_uw_prev="$(models_env_get "$1" CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT || true)"
+  fi
+  printf 'CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="%s"\n' "${_md_uw_prev:-1}"
+  unset _md_uw_prev
+}
+
 # 0 = models.env present and current, 1 = not written (caller records it).
 # $1 state dir, $2 force (1 = --fresh: overwrite even if it exists),
 # $3 experimental (1 = fetch with ?experimental=true so betas compete for fable)
@@ -209,6 +224,8 @@ models_configure() {
   _md_env="$(printf '%s\n%s' "$_md_env" "$(models_experimental_line "$_md_exp" "$_md_file")")"
   # Same read-before-overwrite for the forwarding switch, so a user's "0" survives --fresh.
   _md_env="$(printf '%s\n%s' "$_md_env" "$(models_forward_thinking_line "$_md_file")")"
+  # And for the skip-proactive-compaction switch: a stored "0" restores CLI-judged compaction.
+  _md_env="$(printf '%s\n%s' "$_md_env" "$(models_unknown_window_line "$_md_file")")"
 
   mkdir -p "$_md_dir"
   # Trailing newline: command substitution strips it, and the wrapper sources this file.

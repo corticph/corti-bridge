@@ -149,6 +149,12 @@ load_models_env() {
     if [ -n "${CORTI_FORWARD_THINKING:-}" ]; then
         export CORTI_FORWARD_THINKING
     fi
+    # Skip the CLI's proactive auto-compact for unrecognized model IDs — 2.1.3xx has fired it
+    # at a fraction of the declared window; with this set, Claude Code compacts only on the
+    # gateway's prompt-too-long 400, at the real ceiling. "0" restores CLI-judged compaction.
+    if [ -n "${CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT:-}" ]; then
+        export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT
+    fi
 }
 
 # Update check. A clone is the only documented install and setup.sh bakes its path into

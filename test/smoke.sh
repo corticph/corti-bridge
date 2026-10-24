@@ -254,6 +254,17 @@ models_fingerprint() { :; }
 check "fable: kept when the probe cannot answer" \
   "$(count_fable "$(models_dedupe_fable "$FABLE_ENV" 2>/dev/null)")" "3"
 
+# --- models_unknown_window_line: same preserve pattern for the compact-skip switch ---
+# 2.1.3xx fired proactive auto-compact at 52% of a declared 1M window; setting "1" makes the
+# CLI compact only on our gateway's prompt-too-long 400. Fresh installs record the default.
+_uwdir="$(mktemp -d)"
+check "uw-line: fresh default emits on" \
+  "$(models_unknown_window_line /nonexistent)" 'CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="1"'
+printf 'CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="0"\n' > "$_uwdir/models.env"
+check "uw-line: stored 0 survives --fresh" \
+  "$(models_unknown_window_line "$_uwdir/models.env")" 'CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="0"'
+rm -rf "$_uwdir"
+
 # --- models_forward_thinking_line: fresh default on, stored "0" survives a --fresh regen ---
 _ftdir="$(mktemp -d)"
 check "ft-line: fresh default emits on" \
@@ -300,6 +311,20 @@ _wle_ft="$(CORTI_DIR="$_wle_dir" CORTI_FORWARD_THINKING=0 sh -c '
   printf "%s" "${CORTI_FORWARD_THINKING:-}"
 ' sh "$_wle_fn" 2>/dev/null)"
 check "wle: set CORTI_FORWARD_THINKING=0 is exported verbatim" "$_wle_ft" "0"
+# Same fall-through and export for the compact-skip switch, on the claude launch path.
+_wle_uw_rc="$(CORTI_DIR="$_wle_dir" sh -c '
+  set -eu
+  eval "$1"
+  load_models_env
+' sh "$_wle_fn" >/dev/null 2>&1; echo $?)"
+check "wle: unset unknown-window var does not abort" "$_wle_uw_rc" "0"
+_wle_uw="$(CORTI_DIR="$_wle_dir" CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 sh -c '
+  set -eu
+  eval "$1"
+  load_models_env
+  printf "%s" "${CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT:-}"
+' sh "$_wle_fn" 2>/dev/null)"
+check "wle: unknown-window skip exported verbatim" "$_wle_uw" "1"
 rm -rf "$_wle_dir"
 
 printf '\n'
