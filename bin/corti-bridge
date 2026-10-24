@@ -144,6 +144,11 @@ load_models_env() {
     if [ -n "${CORTI_EXPERIMENTAL:-}" ]; then
         export CORTI_EXPERIMENTAL
     fi
+    # Preserved thinking is on by default in the gateway; models.env is the one place to
+    # flip it, so the stored value (e.g. "0") must reach the gateway process.
+    if [ -n "${CORTI_FORWARD_THINKING:-}" ]; then
+        export CORTI_FORWARD_THINKING
+    fi
 }
 
 # Update check. A clone is the only documented install and setup.sh bakes its path into

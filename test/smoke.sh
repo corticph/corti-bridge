@@ -254,6 +254,15 @@ models_fingerprint() { :; }
 check "fable: kept when the probe cannot answer" \
   "$(count_fable "$(models_dedupe_fable "$FABLE_ENV" 2>/dev/null)")" "3"
 
+# --- models_forward_thinking_line: fresh default on, stored "0" survives a --fresh regen ---
+_ftdir="$(mktemp -d)"
+check "ft-line: fresh default emits on" \
+  "$(models_forward_thinking_line /nonexistent)" 'CORTI_FORWARD_THINKING="1"'
+printf 'CORTI_FORWARD_THINKING="0"\n' > "$_ftdir/models.env"
+check "ft-line: stored 0 survives --fresh" \
+  "$(models_forward_thinking_line "$_ftdir/models.env")" 'CORTI_FORWARD_THINKING="0"'
+rm -rf "$_ftdir"
+
 # --- load_models_env: the wrapper exports CORTI_EXPERIMENTAL without aborting ---
 # The wrapper runs set -eu: a failing last command in load_models_env aborts every launch and
 # restart, so an unset CORTI_EXPERIMENTAL must fall through cleanly, and a set one must still be
@@ -276,6 +285,21 @@ _wle_got="$(CORTI_DIR="$_wle_dir" CORTI_EXPERIMENTAL=1 sh -c '
   printf "%s" "${CORTI_EXPERIMENTAL:-}"
 ' sh "$_wle_fn" 2>/dev/null)"
 check "wle: set CORTI_EXPERIMENTAL is exported" "$_wle_got" "1"
+# Same set -eu fall-through for the forwarding switch, flowing into the wrapper export.
+_wle_ft_rc="$(CORTI_DIR="$_wle_dir" sh -c '
+  set -eu
+  eval "$1"
+  load_models_env
+' sh "$_wle_fn" >/dev/null 2>&1; echo $?)"
+check "wle: unset CORTI_FORWARD_THINKING does not abort" "$_wle_ft_rc" "0"
+# The opt-out value: exported verbatim — the gateway reads "0" as off, any other value on.
+_wle_ft="$(CORTI_DIR="$_wle_dir" CORTI_FORWARD_THINKING=0 sh -c '
+  set -eu
+  eval "$1"
+  load_models_env
+  printf "%s" "${CORTI_FORWARD_THINKING:-}"
+' sh "$_wle_fn" 2>/dev/null)"
+check "wle: set CORTI_FORWARD_THINKING=0 is exported verbatim" "$_wle_ft" "0"
 rm -rf "$_wle_dir"
 
 printf '\n'

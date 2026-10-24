@@ -16,6 +16,10 @@ STUB_PID=""
 GW_PID=""
 GW_PORT=4298
 
+# Ambient debug env from an invoking shell would make every test gateway write real
+# gateway-session logs — the two boots that need logs set both vars explicitly.
+unset CORTI_DEBUG CORTI_DEBUG_DIR
+
 cleanup() {
   [ -n "$GW_PID" ] && { kill "$GW_PID" 2>/dev/null || :; wait "$GW_PID" 2>/dev/null || :; }
   [ -n "$STUB_PID" ] && { kill "$STUB_PID" 2>/dev/null || :; wait "$STUB_PID" 2>/dev/null || :; }

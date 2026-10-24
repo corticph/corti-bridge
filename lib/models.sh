@@ -145,6 +145,19 @@ models_experimental_line() {
   fi
 }
 
+# Echoes the CORTI_FORWARD_THINKING line for models.env. Forwarding is on by default in the
+# gateway; the line makes models.env the one place a user flips it off — so a stored choice
+# (any value) survives --fresh, and new installs record the default explicitly.
+# $1 = the existing models.env path.
+models_forward_thinking_line() {
+  _md_ft_prev=""
+  if [ -n "$1" ] && [ -f "$1" ]; then
+    _md_ft_prev="$(models_env_get "$1" CORTI_FORWARD_THINKING || true)"
+  fi
+  printf 'CORTI_FORWARD_THINKING="%s"\n' "${_md_ft_prev:-1}"
+  unset _md_ft_prev
+}
+
 # 0 = models.env present and current, 1 = not written (caller records it).
 # $1 state dir, $2 force (1 = --fresh: overwrite even if it exists),
 # $3 experimental (1 = fetch with ?experimental=true so betas compete for fable)
@@ -194,6 +207,8 @@ models_configure() {
 
   # Read before overwrite so --fresh keeps an existing CORTI_EXPERIMENTAL.
   _md_env="$(printf '%s\n%s' "$_md_env" "$(models_experimental_line "$_md_exp" "$_md_file")")"
+  # Same read-before-overwrite for the forwarding switch, so a user's "0" survives --fresh.
+  _md_env="$(printf '%s\n%s' "$_md_env" "$(models_forward_thinking_line "$_md_file")")"
 
   mkdir -p "$_md_dir"
   # Trailing newline: command substitution strips it, and the wrapper sources this file.

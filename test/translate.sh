@@ -8,7 +8,7 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
-import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache, _resetImageCache } from "'"$REPO"'/translate.mjs";
+import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache, _resetImageCache, estimateTokens } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 import { resolveVisionModel, VISION_DEFAULT, VISION_TIERS } from "'"$REPO"'/lib/vision.mjs";
 
@@ -1143,6 +1143,128 @@ check("vision: override is trimmed before sighted check", vr.model, "corti-s1-mi
 // The tier ladder order is the cheapest-first convention (haiku first).
 check("vision: tier ladder starts at haiku", VISION_TIERS[0], "ANTHROPIC_DEFAULT_HAIKU_MODEL");
 check("vision: tier ladder ends at fable", VISION_TIERS[VISION_TIERS.length - 1], "ANTHROPIC_DEFAULT_FABLE_MODEL");
+
+console.log("");
+// --- forward thinking (CORTI_FORWARD_THINKING) ---------------------------------
+// Default ON: absent opts forwards history thinking (CORTI_FORWARD_THINKING=0 opts out).
+const fwdOff = await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "plan: read the file", signature: "sig" },
+      { type: "text", text: "I\x27ll read it." },
+      { type: "tool_use", id: "t1", name: "run_bash", input: { command: "ls" } },
+    ]},
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "file.txt" }] },
+    { role: "user", content: "and then?" },
+  ],
+}, { forwardThinking: false });
+check("forward-off: assistant history has no reasoning field", fwdOff.request.messages.some((m) => m.reasoning !== undefined), false);
+check("forward-off: drop diag present", fwdOff.dropped.includes("thinking (assistant history)"), true);
+
+// On: thinking is forwarded verbatim on its assistant message, tool/text path unchanged.
+const fwdOn = await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "plan: read the file", signature: "sig" },
+      { type: "text", text: "I\x27ll read it." },
+      { type: "tool_use", id: "t1", name: "run_bash", input: { command: "ls" } },
+    ]},
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "file.txt" }] },
+    { role: "user", content: "and then?" },
+  ],
+}, { forwardThinking: true });
+const fwdAssistant = fwdOn.request.messages.find((m) => m.role === "assistant");
+check("forward-on: reasoning field carries thinking verbatim", fwdAssistant.reasoning, "plan: read the file");
+check("forward-on: text content preserved", fwdAssistant.content, "I\x27ll read it.");
+check("forward-on: tool_calls preserved", fwdAssistant.tool_calls?.[0]?.function?.name, "run_bash");
+check("forward-on: forwarded channel reports count", fwdOn.forwarded, "thinking (assistant history) x1");
+
+// Default: no opts at all must forward. The gateway passes its env-resolved value explicitly,
+// so this pins the translateRequest fallback — failing loudly beats silent drift.
+const fwdDefault = await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "plan: read the file", signature: "sig" },
+      { type: "text", text: "I\x27ll read it." },
+    ]},
+    { role: "user", content: "and then?" },
+  ],
+});
+check("forward-default: no opts forwards thinking", fwdDefault.request.messages[1].reasoning, "plan: read the file");
+
+// Multiple thinking blocks on one assistant message join with blank lines, order preserved.
+const fwdMulti = await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "first consider A", signature: "sig" },
+      { type: "text", text: "ok" },
+    ]},
+  ],
+}, { forwardThinking: true });
+check("forward-on: single block passes through", fwdMulti.request.messages[1].reasoning, "first consider A");
+
+// redacted_thinking stays dropped even with the flag on (opaque blob).
+const fwdRedacted = await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [
+      { type: "redacted_thinking", data: "opaque" },
+      { type: "text", text: "ok" },
+    ]},
+  ],
+}, { forwardThinking: true });
+check("forward-on: redacted_thinking still dropped", fwdRedacted.request.messages[1].reasoning, undefined);
+check("forward-on: redacted drop diag", fwdRedacted.dropped.includes("redacted_thinking (assistant history)"), true);
+
+// Thinking-only assistant history (no text/tool_use anchor): dropped, not forwarded — an
+// assistant message that carries only reasoning has no stable meaning upstream.
+const fwdSolo = await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [{ type: "thinking", thinking: "only thinking", signature: "sig" }] },
+    { role: "user", content: "go on" },
+  ],
+}, { forwardThinking: true });
+check("forward-on: thinking-only history dropped", fwdSolo.request.messages.some((m) => m.role === "assistant" && m.reasoning), false);
+check("forward-on: thinking-only diag", fwdSolo.dropped.some((d) => d.startsWith("thinking-only")), true);
+
+// T4 — byte-stability across consecutive turns: same client history replayed must produce
+// byte-identical upstream messages (prefix cache holds only if the mapping is deterministic).
+const t4Client = (n) => ({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "stable plan", signature: "sig" },
+      { type: "text", text: "I\x27ll read it." },
+      { type: "tool_use", id: "t1", name: "run_bash", input: { command: "ls" } },
+    ]},
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "file.txt" }] },
+    ...(n > 1 ? [{ role: "user", content: "and then?" }] : []),
+  ],
+});
+const t4a = await translateRequest(t4Client(1), { forwardThinking: true });
+const t4b = await translateRequest(t4Client(2), { forwardThinking: true });
+const t4aJSON = JSON.stringify(t4a.request.messages);
+const t4bPrefixJSON = JSON.stringify(t4b.request.messages.slice(0, t4a.request.messages.length));
+check("forward-on: consecutive-turn prefix byte-identical (T4)", t4aJSON, t4bPrefixJSON);
+
+// estimateTokens: forwarding is the billing truth, so thinking chars count by default and
+// must vanish from the estimate when opted out — count_tokens and the overflow guard share it.
+const estBody = { messages: [
+  { role: "assistant", content: [
+    { type: "thinking", thinking: "x".repeat(400), signature: "sig" },
+    { type: "text", text: "done" },
+  ]},
+] };
+const estOn = estimateTokens(estBody);
+const estOff = estimateTokens(estBody, { forwardThinking: false });
+const estWithout = estimateTokens({ messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] });
+check("estimateTokens: default counts forwarded thinking", estOn > estWithout, true);
+check("estimateTokens: opted-out estimate equals thinking-less body", estOff, estWithout);
 
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }

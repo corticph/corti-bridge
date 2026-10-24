@@ -45,6 +45,9 @@ const BARE_PATH_IS_ANTHROPIC = process.env.CORTI_UPSTREAM_MODE === "anthropic";
 const REASONING_MODE = ["thinking", "text", "drop"].includes(process.env.CORTI_REASONING_MODE)
   ? process.env.CORTI_REASONING_MODE
   : "thinking";
+// Preserved thinking: history thinking forwards to Corti as `reasoning` on assistant messages
+// (default on — losing it made agents replay frozen thinking and die on the turn cap; =0 opts out).
+const FORWARD_THINKING = process.env.CORTI_FORWARD_THINKING !== "0";
 
 if (!BEARER) {
   console.error("CORTI_BEARER is required");
@@ -212,6 +215,7 @@ function healthPayload() {
     mode: BARE_PATH_IS_ANTHROPIC ? "anthropic" : "openai",
     upstream: BASE_URL,
     debug: LOG_DIR ?? false,
+    forwardThinking: FORWARD_THINKING,
   };
 }
 
@@ -219,7 +223,7 @@ function healthPayload() {
 server.requestTimeout = 0;
 server.listen(PORT, HOST, () => {
   console.log(
-    `corti-proxy on http://${HOST}:${PORT} (openai: /, anthropic: ${ANTHROPIC_PREFIX}, reasoning: ${REASONING_MODE})`,
+    `corti-proxy on http://${HOST}:${PORT} (openai: /, anthropic: ${ANTHROPIC_PREFIX}, reasoning: ${REASONING_MODE}, forwarding: ${FORWARD_THINKING ? "on" : "off"})`,
   );
   if (LOG_DIR) console.log(`corti-proxy debug log dir: ${LOG_DIR}`);
 });
@@ -370,7 +374,7 @@ function handleOpenAI(req, res, reqPath) {
 // /anthropic 404s on it — so both routes answer locally from the same estimate.
 function countTokens(body) {
   try {
-    return { status: 200, payload: { input_tokens: estimateTokens(JSON.parse(body.toString())) } };
+    return { status: 200, payload: { input_tokens: estimateTokens(JSON.parse(body.toString()), { forwardThinking: FORWARD_THINKING }) } };
   } catch {
     return {
       status: 400,
@@ -759,7 +763,7 @@ async function handleMessages(req, res, body) {
       "body-cap",
     );
 
-  const est = estimateTokens(anthropicBody);
+  const est = estimateTokens(anthropicBody, { forwardThinking: FORWARD_THINKING });
   if (est > OVERFLOW_TOKEN_ESTIMATE)
     return fail(
       {
@@ -804,9 +808,11 @@ async function handleMessages(req, res, body) {
     const out = await translateRequest(anthropicBody, {
       skipAdvisor: noAdvisor, mode: "openai", advisorEffort, parentSessionId,
       skipImages: anthropicBody?.skipImages, ...imageOpts,
+      forwardThinking: FORWARD_THINKING,
     });
     translated = out.request;
     diagnostics.push(...out.dropped.map((d) => `dropped: ${d}`));
+    if (out.forwarded) diagnostics.push(`forwarded: ${out.forwarded}`);
   } catch (err) {
     if (err instanceof TranslateRejection)
       return fail({ status: err.status, envelope: err.envelope }, "translation-rejected");
@@ -1062,7 +1068,7 @@ async function handleMessages(req, res, body) {
       // client request, so the advisor intercept must not touch it.
       // parentSessionId only re-inserts *prior* consults, so the continuation reads the history
       // the first call did; this turn's own consult is not recorded until the continuation settles.
-      translateRequest(contAnthropic, { skipAdvisor: true, skipImages: true, parentSessionId })
+      translateRequest(contAnthropic, { skipAdvisor: true, skipImages: true, parentSessionId, forwardThinking: FORWARD_THINKING })
         .then((out) => {
           const contTranslated = out.request;
           diagnostics.push(...out.dropped.map((d) => `continuation dropped: ${d}`));

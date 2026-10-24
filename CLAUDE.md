@@ -91,10 +91,12 @@ One gateway process serves both modes simultaneously, chosen per request by URL 
 - **Auth swap**: the client's token is always discarded; only `CORTI_BEARER` goes upstream. `CORTI_BASE_URL` must match `https://ai.<env>.corti.app/v1` or the gateway refuses to boot.
 - **Context overflow must become `400 prompt is too long`** (`promptTooLong`) — that exact shape is what triggers Claude Code's auto-compact.
 - **Upstream retries only before any SSE has been written to the client** (a retry after frames have gone out would replay a partial turn). Bounded: 3 attempts, fresh connection per retry. Policy lives in `lib/retry.mjs`.
-- **Parallel tool calls round-trip by stream index**; tool_use/tool_result pairing is repaired for re-wound histories; thinking blocks are stripped on re-entry (signatures are synthetic — `REASONING_SIGNATURE`).
+- **Parallel tool calls round-trip by stream index**; tool_use/tool_result pairing is repaired for re-wound histories; thinking history forwards as `reasoning` on assistant messages by default (`CORTI_FORWARD_THINKING=0` strips; signatures are synthetic — `REASONING_SIGNATURE`).
 - Runtime state lives in `~/.corti-bridge/` (`models.env`, `profile.env`, pid files, `gateway.log`); the repo itself stays stateless.
 
 ## Standing decisions and recurring gotchas
+
+**Preserved thinking is ON by default (`CORTI_FORWARD_THINKING=0` opts out) — do not "simplify" the forwarding path.** Client-replayed history thinking forwards as `reasoning` on assistant history messages (GLM preserved thinking; probe-verified that Corti backends weave it into the prompt, pod-dependent but working). Every run of the day that died without answering died on the OFF arm — frozen replay, eventually `error_max_turns` with no answer; forwarding completed every run it served. Forwarding must stay **byte-identical across turns** (A1): append-only, `\n\n` join between blocks, thinking-only messages dropped, `redacted_thinking` never forwarded. `estimateTokens` counts forwarded thinking while on (billing truth for `count_tokens` and the overflow guard); the estimate/prompt-estimate chain depends on this staying coupled. `models.env` carries the value (`models_forward_thinking_line` preserves a stored `0` through `--fresh`; the wrapper exports it via `load_models_env`), and `/health` reports `forwardThinking`. Guarded by `test/translate.sh` (forward-* checks, T4, estimateTokens), `test/smoke.sh` (ft-line:, wle:), and the live gateway diagnostics `forwarded: thinking (assistant history) xN`. Evidence: `.context/projects/2026-10/12-reasoning-roundtrip-audit/notes.md`.
 
 **Usage reporting — do not "simplify" these** (each shape was reversed once and broke something):
 
