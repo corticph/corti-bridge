@@ -1319,6 +1319,25 @@ const estOff = estimateTokens(estBody, { forwardThinking: false });
 const estWithout = estimateTokens({ messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] });
 check("estimateTokens: default counts forwarded thinking", estOn > estWithout, true);
 check("estimateTokens: opted-out estimate equals thinking-less body", estOff, estWithout);
+const estDropped = estimateTokens({ messages: [
+  { role: "assistant", content: [{ type: "thinking", thinking: "q".repeat(400) }] },
+  { role: "user", content: [{ type: "thinking", thinking: "r".repeat(400) }] },
+] });
+const estSameShell = estimateTokens({ messages: [
+  { role: "assistant", content: [] },
+  { role: "user", content: [] },
+] });
+check("estimateTokens: dropped thinking does not count", estDropped, estSameShell);
+const estAdvBase = estimateTokens({ messages: [
+  { role: "assistant", content: [{ type: "advisor_tool_result", tool_use_id: "t", content: "advice" }] },
+] });
+const estAdv = estimateTokens({ messages: [
+  { role: "assistant", content: [
+    { type: "advisor_tool_result", tool_use_id: "t", content: "advice" },
+    { type: "thinking", thinking: "w".repeat(400) },
+  ] },
+] });
+check("estimateTokens: advisor-anchored thinking counts", estAdv > estAdvBase, true);
 
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }

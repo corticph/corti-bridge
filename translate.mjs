@@ -1310,7 +1310,11 @@ export function estimateTokens(body, opts) {
         add(msg.content);
         continue;
       }
-      for (const b of Array.isArray(msg?.content) ? msg.content : []) {
+      const blocks = Array.isArray(msg?.content) ? msg.content : [];
+      // Mirrors translateRequest: count thinking only where it is forwarded.
+      const fwdThinking = (opts?.forwardThinking ?? true) && msg?.role === "assistant" &&
+        blocks.some((b) => b?.type === "text" || b?.type === "tool_use" || b?.type === "advisor_tool_result");
+      for (const b of blocks) {
         if (!b || typeof b !== "object") continue;
         if (b.type === "text") add(b.text);
         else if (b.type === "image") overhead += 100;
@@ -1325,8 +1329,7 @@ export function estimateTokens(body, opts) {
               else if (c?.type === "image") overhead += 100;
             }
         } else if (b.type === "thinking") {
-          // forwarded as upstream `reasoning` by default, so it is billed; =0 opts out
-          if (opts?.forwardThinking ?? true) add(b.thinking ?? "");
+          if (fwdThinking) add(b.thinking ?? "");
         } else if (b.type === "redacted_thinking") {
           // opaque bytes: never sent upstream, never billed
         } else if (b.type === "document") {
