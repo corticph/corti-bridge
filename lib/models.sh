@@ -202,7 +202,18 @@ models_configure() {
 
   # Callers set the repo root before sourcing: CC_REPO_DIR from setup.sh, REPO from the tests.
   _md_js="${CC_REPO_DIR:-${REPO:-.}}/lib/models.mjs"
-  _md_env="$(node "$_md_js" "$_md_catalog")" || return 1
+  # Pass the preserved pin + its old window so --fresh cannot shrink the pin ceiling.
+  _md_pin_id=""
+  _md_prev_win=""
+  if [ -f "$_md_file" ] && [ "$(models_env_get "$_md_file" ANTHROPIC_DEFAULT_FABLE_MODEL_PIN || true)" = "1" ]; then
+    _md_pin_id="$(models_env_get "$_md_file" ANTHROPIC_DEFAULT_FABLE_MODEL || true)"
+    _md_prev_win="$(models_env_get "$_md_file" CLAUDE_CODE_MAX_CONTEXT_TOKENS || true)"
+  fi
+  if [ -n "$_md_pin_id" ]; then
+    _md_env="$(node "$_md_js" "$_md_catalog" "$_md_pin_id" "${_md_prev_win:-0}")" || return 1
+  else
+    _md_env="$(node "$_md_js" "$_md_catalog")" || return 1
+  fi
 
   # Re-inject the pinned fable block (read from $_md_file before overwrite), replacing what
   # the auto-ranker emitted; otherwise dedupe against the live backend.

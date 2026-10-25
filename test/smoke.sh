@@ -308,6 +308,29 @@ check "pick: uw opt-out survives the picker" \
 rm -rf "$_pickle_dir"
 unset PICK_CATALOG_JSON _pickle_dir
 
+# --- models_configure: a pinned fable keeps its exported window across --fresh ---
+_pindir="$(mktemp -d)"
+cat >"$_pindir/models.env" <<'PINENV'
+ANTHROPIC_DEFAULT_FABLE_MODEL="corti-s1-mega"
+ANTHROPIC_DEFAULT_FABLE_MODEL_NAME="corti-s1-mega"
+ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES="thinking,temperature,mid_conversation_system"
+ANTHROPIC_DEFAULT_FABLE_MODEL_PIN="1"
+CLAUDE_CODE_MAX_CONTEXT_TOKENS="1048576"
+PINENV
+models_fetch_catalog() { printf '{"data":[{"id":"corti-s1","max_input_tokens":262144}]}'; }
+models_fingerprint() { :; }
+( CORTI_PROXY_CONFIG_DIR="$_pindir" CORTI_BEARER=dummy CORTI_BASE_URL=https://example.invalid \
+  models_configure "$_pindir" 1 0 ) >/dev/null 2>&1
+check "pin: pin id survives the refresh" \
+  "$(models_env_get "$_pindir/models.env" ANTHROPIC_DEFAULT_FABLE_MODEL)" "corti-s1-mega"
+check "pin: pin flag still set" \
+  "$(models_env_get "$_pindir/models.env" ANTHROPIC_DEFAULT_FABLE_MODEL_PIN)" "1"
+check "pin: exported window keeps the pin ceiling" \
+  "$(models_env_get "$_pindir/models.env" CLAUDE_CODE_MAX_CONTEXT_TOKENS)" "1048576"
+check "pin: auto-ranked tiers re-emit fresh" \
+  "$(models_env_get "$_pindir/models.env" ANTHROPIC_DEFAULT_OPUS_MODEL)" "corti-s1"
+rm -rf "$_pindir"
+
 # --- load_models_env: the wrapper exports CORTI_EXPERIMENTAL without aborting ---
 # The wrapper runs set -eu: a failing last command in load_models_env aborts every launch and
 # restart, so an unset CORTI_EXPERIMENTAL must fall through cleanly, and a set one must still be
