@@ -255,8 +255,7 @@ check "fable: kept when the probe cannot answer" \
   "$(count_fable "$(models_dedupe_fable "$FABLE_ENV" 2>/dev/null)")" "3"
 
 # --- models_unknown_window_line: same preserve pattern for the compact-skip switch ---
-# 2.1.3xx fired proactive auto-compact at 52% of a declared 1M window; setting "1" makes the
-# CLI compact only on our gateway's prompt-too-long 400. Fresh installs record the default.
+# Setting "1" makes the CLI compact only on the gateway's prompt-too-long 400; "0" is stored.
 _uwdir="$(mktemp -d)"
 check "uw-line: fresh default emits on" \
   "$(models_unknown_window_line /nonexistent)" 'CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="1"'
@@ -275,10 +274,8 @@ check "ft-line: stored 0 survives --fresh" \
 rm -rf "$_ftdir"
 
 # --- models_pick: stored flag lines survive --reset and the picker tail (call-site guard) ---
-# The helper-level ft/uw checks pass even while the picker's write tail drops the stored lines,
-# so the regression is only catchable by driving models_pick itself. Catalog and fingerprint
-# are stubbed; creds are dummies that only satisfy models.sh's guard; CC_ASSUME_YES defaults
-# every menu prompt headlessly.
+# The helper-level ft/uw checks pass even while the picker drops the stored lines, so this drives
+# models_pick itself — catalog/fingerprint stubbed, CC_ASSUME_YES heads every menu prompt.
 _pickle_dir="$(mktemp -d)"
 PICK_CATALOG_JSON='{"data":[{"id":"corti-s1","max_input_tokens":1048576},{"id":"corti-s1-ultra","max_input_tokens":1048576},{"id":"corti-s1-mini","max_input_tokens":262144},{"id":"corti-s1-mini-instant","max_input_tokens":262144}]}'
 models_fetch_catalog() { printf '%s' "$PICK_CATALOG_JSON"; }

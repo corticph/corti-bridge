@@ -1126,10 +1126,8 @@ check "IMG: not-opted-in delegates to the vision sidecall" \
 check "IMG: not-opted-in sidecall post carries image_url" \
   "$(grep -c 'image_url' imgchat.log 2>/dev/null || :)" "1"
 
-# Step-down through the gateway: a blind CORTI_VISION_MODEL with a sighted sonnet tier must still
-# fire the sidecall (stepped to sonnet), not 400 and degrade. Drives the gateway wiring of
-# resolveVisionModel that the pure tests do not reach. The stub catalog marks corti-s1 blind and
-# corti-s1-mini-instant sighted, so a blind haiku + sighted sonnet steps down to the sonnet.
+# Blind CORTI_VISION_MODEL must step down to the sighted sonnet and still fire the sidecall —
+# drives the gateway wiring of resolveVisionModel that the pure tests do not reach.
 rm -f imgchat.log
 _ir_gw="imggateway_4303.mjs"
 sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
@@ -1156,11 +1154,8 @@ check "IMG: step-down logs a deduped warning naming the blind override" \
   "$(grep -c 'corti-s1" is not multimodal' imggw_4303.out 2>/dev/null || :)" "1"
 unset _ir_gw _ir_pid
 
-# Null /models regression guard: a failing /models fetch leaves imageModels null. The resolver
-# must fall back to VISION_DEFAULT (the known-multimodal corti-s1-mini-instant) and still fire the
-# sidecall — not short-circuit to no_sighted_model and pin a placeholder for the session. A second
-# stub answers /models with 503; the gateway self-heals on the next fetch but the image cache would
-# pin a placeholder set during the outage, so the fallback is what prevents that.
+# A failing /models fetch must still fire the sidecall on the default vision model — the image
+# cache would otherwise pin the outage's placeholders for the whole session.
 cat > imgstub503.mjs <<'IMGSTUB503'
 import fs from "node:fs";
 import https from "node:https";

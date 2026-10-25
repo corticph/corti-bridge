@@ -1050,11 +1050,8 @@ export async function translateRequest(body, opts) {
     if (msg.role === "assistant") {
       const texts = [];
       const calls = [];
-      /* Preserved thinking: client-replayed thinking blocks are forwarded as OpenAI
-       * `reasoning` on the assistant message, byte-identical. Default on — models that
-       * lose their reasoning in history replay frozen thinking and stall; =0 opts out.
-       * Append-only history keeps the prefix cache stable; redacted_thinking stays
-       * dropped (opaque blob, unverifiable). */
+      // Preserved thinking: history thinking forwards as `reasoning`, byte-identical (=0 opts
+      // out — stripping it froze agents mid-run); redacted_thinking stays dropped (opaque).
       const reasoningParts = [];
       for (const b of blocksOf(msg.content)) {
         if (b.type === "text" && typeof b.text === "string") texts.push(b.text);
@@ -1065,14 +1062,8 @@ export async function translateRequest(body, opts) {
             function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) },
           });
         } else if (b.type === "advisor_tool_result") {
-          /* C6: prior-turn advisor advice must round-trip into the model's view, not be dropped.
-           * The official doc: "Pass the full assistant content, including advisor_tool_result
-           * blocks, back to the API on subsequent turns. Round-trip the result blocks verbatim."
-           * We can't replay the server-tool wire shape to an OpenAI upstream, so we surface the
-           * advice as text wrapped in a distinct tag — a first-class channel the executor treats
-           * as advice rather than ordinary (skeptically-treated) tool output (reconstruction §3.3).
-           * server_tool_use (the paired call) is in SERVER_BLOCK_TYPES and dropped above — the
-           * executor doesn't need to see the call shape, only the advice it carried. */
+          // C6: advisor advice must round-trip — the OpenAI wire can't carry the server-tool
+          // shape, so it surfaces as tagged text instead of the dropped call shape.
           const advice = advisorResultText(b);
           if (advice) texts.push(advisorGuidanceText(advice));
         } else if (b.type === "thinking" && (opts?.forwardThinking ?? true) && typeof b.thinking === "string" && b.thinking) {
@@ -1088,8 +1079,7 @@ export async function translateRequest(body, opts) {
           dropped.push("empty assistant message");
           continue;
         }
-        // Thinking-only history: an assistant message carrying only `reasoning` has no stable
-        // meaning upstream — drop rather than invent structure the client never sent.
+        // Thinking-only history has no stable meaning upstream — drop, don't invent structure.
         dropped.push("thinking-only assistant message (dropped)");
         continue;
       }
@@ -1291,8 +1281,7 @@ export async function translateRequest(body, opts) {
   // resolved effort above. A model that rejects the level 400s — surfacing a capability gap.
   if (opts?.advisorEffort) req.reasoning_effort = opts.advisorEffort;
 
-  // Preserved-thinking visibility: forwarded thinking is not "dropped"; count it on its own
-  // channel so debug logs read "forwarded: thinking (assistant history)" without the "dropped:" prefix.
+  // Forwarded thinking counts on its own channel so debug logs read "forwarded: …", not "dropped:".
   const forwardedCount = req.messages.filter((m) => m.reasoning).length;
   const out = { request: req, dropped };
   if (forwardedCount) out.forwarded = `thinking (assistant history) x${forwardedCount}`;
@@ -1501,13 +1490,8 @@ function anthropicUsage(usage) {
   };
 }
 
-/* Auto-mode classifier verdicts can die in the reasoning channel: the upstream fires the
- * "</block>" stop string inside the reasoning before the verdict is ever typed as text, so the
- * reply arrives content-less. The verdict is recoverable only when the model actually
- * concluded — the marker must sit at the very tail of the reasoning. A CoT that merely quotes
- * the closed marker form ends indistinguishably from a real verdict, so a phantom synthesis
- * is possible (zero occurrences in the measured corpus of 159 live recoveries); the debug log
- * carries the reasoning and the recovered text side by side for audit. */
+// Auto-mode verdicts die in the reasoning channel: the stop fires before any text is typed, so
+// the reply arrives empty — recover only when the marker sits at the very tail of the reasoning.
 function tailVerdict(reasoning) {
   const m = typeof reasoning === "string" ? reasoning.match(/<block>(no|yes)\s*$/) : null;
   return m ? `<block>${m[1]}</block>` : null;

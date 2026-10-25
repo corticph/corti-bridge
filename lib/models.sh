@@ -145,10 +145,8 @@ models_experimental_line() {
   fi
 }
 
-# Echoes the CORTI_FORWARD_THINKING line for models.env. Forwarding is on by default in the
-# gateway; the line makes models.env the one place a user flips it off — so a stored choice
-# (any value) survives --fresh, and new installs record the default explicitly.
-# $1 = the existing models.env path.
+# Echoes the CORTI_FORWARD_THINKING line for models.env: a stored value (e.g. "0") survives
+# --fresh; new installs record the default. $1 = the existing models.env path.
 models_forward_thinking_line() {
   _md_ft_prev=""
   if [ -n "$1" ] && [ -f "$1" ]; then
@@ -158,12 +156,8 @@ models_forward_thinking_line() {
   unset _md_ft_prev
 }
 
-# Echoes the CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT line for models.env.
-# 2.1.3xx CLIs can fire proactive auto-compact on unrecognized gateway model IDs at a fraction
-# of the declared window (measured: 52% of 1M on 2.1.310); with this set, Claude Code compacts
-# only on a recognized "prompt is too long" error — which the gateway deliberately emits at the
-# real ceiling. Stored values survive --fresh; new installs record the default "1".
-# $1 = the existing models.env path.
+# Echoes the compact-skip line for models.env: with it set, only the gateway's prompt-too-long
+# 400 triggers CLI auto-compact; a stored "0" restores CLI-judged compaction. $1 = models.env path.
 models_unknown_window_line() {
   _md_uw_prev=""
   if [ -n "$1" ] && [ -f "$1" ]; then

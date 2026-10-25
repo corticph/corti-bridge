@@ -1122,9 +1122,8 @@ const markerBody = {
 await applyIntercepts(markerBody, { describeImage: markerStub, imageModels: blind, parentSessionId: "smark" });
 check("image: lone provenance marker yields null context", markerCtx, null);
 
-// --- Vision-model step-down: a blind vision tier pin steps to the next sighted tier instead of
-// 400-ing. The resolver is pure (lib/vision.mjs) — inject env + sighted Set, assert the picked model.
-// Sighted set mirrors the live experimental catalog: only the corti-s1-mini* family is multimodal.
+// --- Vision-model step-down: a blind tier pin steps to the next sighted tier instead of 400-ing.
+// The resolver is pure (lib/vision.mjs): inject env + sighted set, assert the picked model.
 const vSighted = new Set(["corti-s1-mini", "corti-s1-mini-beta", "corti-s1-mini-instant", "corti-s1-mini-instant-beta"]);
 const vEnv = (o) => ({ CORTI_VISION_MODEL: "", ANTHROPIC_DEFAULT_HAIKU_MODEL: "", ANTHROPIC_DEFAULT_SONNET_MODEL: "", ANTHROPIC_DEFAULT_OPUS_MODEL: "", ANTHROPIC_DEFAULT_FABLE_MODEL: "", ...o });
 
@@ -1171,10 +1170,8 @@ vr = resolveVisionModel({ env: vEnv({ CORTI_VISION_MODEL: "corti-s1-mini" }), im
 check("vision: empty sighted set treats all as blind", vr.model, "");
 check("vision: empty sighted set warns on the override", vr.warned, true);
 
-// Non-Set imageModels means the /models fetch failed or has not loaded — sightedness unknown,
-// not confirmed blind. Fall back to VISION_DEFAULT (the known-multimodal default) so a transient
-// outage describes images rather than pinning placeholders for the session via the image cache.
-// Regression guard: the old resolver returned "" here, degrading every setup on a /models blip.
+// Non-Set imageModels = /models fetch failed or has not loaded — fall back to the default
+// rather than pinning outage placeholders for the session (regression: old resolver returned "").
 vr = resolveVisionModel({ env: vEnv({ CORTI_VISION_MODEL: "corti-s1-instant-beta" }), imageModels: null });
 check("vision: null imageModels falls back to VISION_DEFAULT", vr.model, VISION_DEFAULT);
 check("vision: null imageModels does not warn (unknown, not blind)", vr.warned, false);

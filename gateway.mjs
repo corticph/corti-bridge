@@ -45,8 +45,7 @@ const BARE_PATH_IS_ANTHROPIC = process.env.CORTI_UPSTREAM_MODE === "anthropic";
 const REASONING_MODE = ["thinking", "text", "drop"].includes(process.env.CORTI_REASONING_MODE)
   ? process.env.CORTI_REASONING_MODE
   : "thinking";
-// Preserved thinking: history thinking forwards to Corti as `reasoning` on assistant messages
-// (default on — losing it made agents replay frozen thinking and die on the turn cap; =0 opts out).
+// Preserved thinking — history thinking forwards as `reasoning`; =0 opts out.
 const FORWARD_THINKING = process.env.CORTI_FORWARD_THINKING !== "0";
 
 if (!BEARER) {
@@ -98,11 +97,8 @@ const NONSTREAM_TIMEOUT_MS = 600_000;
 const CONTINUATION_GRACE_MS = 10_000;
 const CONTINUATION_MIN_MS = 60_000;
 const SHUTDOWN_GRACE_MS = 5_000;
-/* Upstream's own 400 is authoritative for whichever model is called; the local backstop only
- * bounds absurd bodies. The altitude derives from the window the wrapper exports at launch
- * (CLAUDE_CODE_MAX_CONTEXT_TOKENS — the roomiest resolved tier), so the gate tracks the catalog
- * without a hand-moved literal; a non-finite or absent value floors out rather than disabling
- * the gate. */
+// Upstream's own 400 stays authoritative; this bound only catches absurd bodies. It derives
+// from the exported window at launch so the gate tracks the catalog without a hand-set literal.
 const BACKSTOP_FLOOR_TOKENS = 2_097_152;
 const exportedContextWindow = Number(process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS);
 const CONTEXT_WINDOW = Math.max(
@@ -837,8 +833,8 @@ async function handleMessages(req, res, body) {
     msgId: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
     requestedModel: anthropicBody.model,
     reasoningMode: REASONING_MODE,
-    // The translated request rides along so response translation (translate.mjs) can see the
-    // request's stop strings — the wire-shaped decisions stay in translate.mjs.
+    // Rides along so response translation can see the request's stop strings — wire decisions
+    // stay in translate.mjs.
     upstreamRequest: translated,
     estimatedInput,
     onDiagnostic: (m) => diagnostics.push(m),
