@@ -254,6 +254,83 @@ models_fingerprint() { :; }
 check "fable: kept when the probe cannot answer" \
   "$(count_fable "$(models_dedupe_fable "$FABLE_ENV" 2>/dev/null)")" "3"
 
+# --- models_unknown_window_line: same preserve pattern for the compact-skip switch ---
+# Setting "1" makes the CLI compact only on the gateway's prompt-too-long 400; "0" is stored.
+_uwdir="$(mktemp -d)"
+check "uw-line: fresh default emits on" \
+  "$(models_unknown_window_line /nonexistent)" 'CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="1"'
+printf 'CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="0"\n' > "$_uwdir/models.env"
+check "uw-line: stored 0 survives --fresh" \
+  "$(models_unknown_window_line "$_uwdir/models.env")" 'CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="0"'
+rm -rf "$_uwdir"
+
+# --- models_forward_thinking_line: fresh default on, stored "0" survives a --fresh regen ---
+_ftdir="$(mktemp -d)"
+check "ft-line: fresh default emits on" \
+  "$(models_forward_thinking_line /nonexistent)" 'CORTI_FORWARD_THINKING="1"'
+printf 'CORTI_FORWARD_THINKING="0"\n' > "$_ftdir/models.env"
+check "ft-line: stored 0 survives --fresh" \
+  "$(models_forward_thinking_line "$_ftdir/models.env")" 'CORTI_FORWARD_THINKING="0"'
+rm -rf "$_ftdir"
+
+# --- models_pick: stored flag lines survive --reset and the picker tail (call-site guard) ---
+# The helper-level ft/uw checks pass even while the picker drops the stored lines, so this drives
+# models_pick itself — catalog/fingerprint stubbed, CC_ASSUME_YES heads every menu prompt.
+_pickle_dir="$(mktemp -d)"
+PICK_CATALOG_JSON='{"data":[{"id":"corti-s1","max_input_tokens":1048576},{"id":"corti-s1-ultra","max_input_tokens":1048576},{"id":"corti-s1-mini","max_input_tokens":262144},{"id":"corti-s1-mini-instant","max_input_tokens":262144}]}'
+models_fetch_catalog() { printf '%s' "$PICK_CATALOG_JSON"; }
+models_fingerprint() { :; }
+_pick_count() {
+  _n=$(grep -c "$2" "$1" 2>/dev/null) || :
+  [ -n "$_n" ] || _n=0
+  printf '%s' "$_n"
+}
+mkdir -p "$_pickle_dir/reset"
+printf 'ANTHROPIC_DEFAULT_HAIKU_MODEL_PIN="1"\nCORTI_EXPERIMENTAL="1"\nCORTI_FORWARD_THINKING="0"\nCLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="0"\n' > "$_pickle_dir/reset/models.env"
+( CORTI_PROXY_CONFIG_DIR="$_pickle_dir/reset" CORTI_BEARER=dummy CORTI_BASE_URL=https://example.invalid \
+  models_pick --reset ) >/dev/null 2>&1
+check "pick-reset: ft opt-out survives --reset" \
+  "$(_pick_count "$_pickle_dir/reset/models.env" '^CORTI_FORWARD_THINKING="0"$')" "1"
+check "pick-reset: uw opt-out survives --reset" \
+  "$(_pick_count "$_pickle_dir/reset/models.env" '^CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="0"$')" "1"
+check "pick-reset: experimental opt-in preserved" \
+  "$(_pick_count "$_pickle_dir/reset/models.env" '^CORTI_EXPERIMENTAL="1"$')" "1"
+check "pick-reset: pins cleared by the reset" \
+  "$(_pick_count "$_pickle_dir/reset/models.env" '_PIN="1"$')" "0"
+mkdir -p "$_pickle_dir/pick"
+printf 'CORTI_EXPERIMENTAL="1"\nCORTI_FORWARD_THINKING="0"\nCLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="0"\n' > "$_pickle_dir/pick/models.env"
+( CORTI_PROXY_CONFIG_DIR="$_pickle_dir/pick" CORTI_BEARER=dummy CORTI_BASE_URL=https://example.invalid \
+  CC_ASSUME_YES=1 models_pick ) >/dev/null 2>&1
+check "pick: ft opt-out survives the picker" \
+  "$(_pick_count "$_pickle_dir/pick/models.env" '^CORTI_FORWARD_THINKING="0"$')" "1"
+check "pick: uw opt-out survives the picker" \
+  "$(_pick_count "$_pickle_dir/pick/models.env" '^CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="0"$')" "1"
+rm -rf "$_pickle_dir"
+unset PICK_CATALOG_JSON _pickle_dir
+
+# --- models_configure: a pinned fable keeps its exported window across --fresh ---
+_pindir="$(mktemp -d)"
+cat >"$_pindir/models.env" <<'PINENV'
+ANTHROPIC_DEFAULT_FABLE_MODEL="corti-s1-mega"
+ANTHROPIC_DEFAULT_FABLE_MODEL_NAME="corti-s1-mega"
+ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES="thinking,temperature,mid_conversation_system"
+ANTHROPIC_DEFAULT_FABLE_MODEL_PIN="1"
+CLAUDE_CODE_MAX_CONTEXT_TOKENS="1048576"
+PINENV
+models_fetch_catalog() { printf '{"data":[{"id":"corti-s1","max_input_tokens":262144}]}'; }
+models_fingerprint() { :; }
+( CORTI_PROXY_CONFIG_DIR="$_pindir" CORTI_BEARER=dummy CORTI_BASE_URL=https://example.invalid \
+  models_configure "$_pindir" 1 0 ) >/dev/null 2>&1
+check "pin: pin id survives the refresh" \
+  "$(models_env_get "$_pindir/models.env" ANTHROPIC_DEFAULT_FABLE_MODEL)" "corti-s1-mega"
+check "pin: pin flag still set" \
+  "$(models_env_get "$_pindir/models.env" ANTHROPIC_DEFAULT_FABLE_MODEL_PIN)" "1"
+check "pin: exported window keeps the pin ceiling" \
+  "$(models_env_get "$_pindir/models.env" CLAUDE_CODE_MAX_CONTEXT_TOKENS)" "1048576"
+check "pin: auto-ranked tiers re-emit fresh" \
+  "$(models_env_get "$_pindir/models.env" ANTHROPIC_DEFAULT_OPUS_MODEL)" "corti-s1"
+rm -rf "$_pindir"
+
 # --- load_models_env: the wrapper exports CORTI_EXPERIMENTAL without aborting ---
 # The wrapper runs set -eu: a failing last command in load_models_env aborts every launch and
 # restart, so an unset CORTI_EXPERIMENTAL must fall through cleanly, and a set one must still be
@@ -276,6 +353,35 @@ _wle_got="$(CORTI_DIR="$_wle_dir" CORTI_EXPERIMENTAL=1 sh -c '
   printf "%s" "${CORTI_EXPERIMENTAL:-}"
 ' sh "$_wle_fn" 2>/dev/null)"
 check "wle: set CORTI_EXPERIMENTAL is exported" "$_wle_got" "1"
+# Same set -eu fall-through for the forwarding switch, flowing into the wrapper export.
+_wle_ft_rc="$(CORTI_DIR="$_wle_dir" sh -c '
+  set -eu
+  eval "$1"
+  load_models_env
+' sh "$_wle_fn" >/dev/null 2>&1; echo $?)"
+check "wle: unset CORTI_FORWARD_THINKING does not abort" "$_wle_ft_rc" "0"
+# The opt-out value: exported verbatim — the gateway reads "0" as off, any other value on.
+_wle_ft="$(CORTI_DIR="$_wle_dir" CORTI_FORWARD_THINKING=0 sh -c '
+  set -eu
+  eval "$1"
+  load_models_env
+  printf "%s" "${CORTI_FORWARD_THINKING:-}"
+' sh "$_wle_fn" 2>/dev/null)"
+check "wle: set CORTI_FORWARD_THINKING=0 is exported verbatim" "$_wle_ft" "0"
+# Same fall-through and export for the compact-skip switch, on the claude launch path.
+_wle_uw_rc="$(CORTI_DIR="$_wle_dir" sh -c '
+  set -eu
+  eval "$1"
+  load_models_env
+' sh "$_wle_fn" >/dev/null 2>&1; echo $?)"
+check "wle: unset unknown-window var does not abort" "$_wle_uw_rc" "0"
+_wle_uw="$(CORTI_DIR="$_wle_dir" CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 sh -c '
+  set -eu
+  eval "$1"
+  load_models_env
+  printf "%s" "${CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT:-}"
+' sh "$_wle_fn" 2>/dev/null)"
+check "wle: unknown-window skip exported verbatim" "$_wle_uw" "1"
 rm -rf "$_wle_dir"
 
 printf '\n'

@@ -113,8 +113,8 @@ gateway_start() {
 
 # Source ~/.corti-bridge/models.env and export the tier aliases + capabilities. Called before
 # gateway_start (default path and --restart) so the gateway inherits the haiku tier in its launch
-# env: the gateway's visionModel() reads ANTHROPIC_DEFAULT_HAIKU_MODEL from its own process env,
-# set at boot (the gateway never reads models.env itself, by design). Both files absent → inert.
+# env: the vision resolver (lib/vision.mjs) reads ANTHROPIC_DEFAULT_HAIKU_MODEL from its own
+# process env, set at boot (the gateway never reads models.env itself). Both files absent → inert.
 load_models_env() {
     [ -f "$CORTI_DIR/models.env" ] || return 0
     . "$CORTI_DIR/models.env"
@@ -133,15 +133,24 @@ load_models_env() {
         [ -n "${ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES:-}" ] &&
             export ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES
     fi
-    # Feed the vision sidecall the user's resolved haiku tier. The gateway's visionModel() reads
-    # CORTI_VISION_MODEL first, then ANTHROPIC_DEFAULT_HAIKU_MODEL — the latter reaches the gateway
-    # only via this export. An explicit CORTI_VISION_MODEL override still wins.
+    # Preferred vision model: the resolved haiku tier (explicit CORTI_VISION_MODEL still wins);
+    # the gateway steps down to the next sighted tier if the preference turns out blind.
     if [ -n "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" ]; then
         export CORTI_VISION_MODEL="${CORTI_VISION_MODEL:-$ANTHROPIC_DEFAULT_HAIKU_MODEL}"
     fi
     # Gateway boot flag: fetchImageModels uses the experimental catalog when set. Absent → off.
     if [ -n "${CORTI_EXPERIMENTAL:-}" ]; then
         export CORTI_EXPERIMENTAL
+    fi
+    # Preserved thinking is on by default in the gateway; models.env is the one place to
+    # flip it, so the stored value (e.g. "0") must reach the gateway process.
+    if [ -n "${CORTI_FORWARD_THINKING:-}" ]; then
+        export CORTI_FORWARD_THINKING
+    fi
+    # With this set, only the gateway's prompt-too-long 400 triggers CLI auto-compact — not the
+    # CLI's own window judgment. "0" restores CLI-judged compaction.
+    if [ -n "${CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT:-}" ]; then
+        export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT
     fi
 }
 
@@ -251,9 +260,8 @@ case "${1:-}" in
             echo "corti-bridge: CORTI_BEARER and CORTI_BASE_URL must be set to restart the gateway" >&2
             exit 1
         fi
-        # Source models.env so the restarted gateway inherits the haiku tier (and the other
-        # tier aliases) in its launch env — same as the default launch path. Without this, a
-        # `corti-bridge restart` gets a gateway whose visionModel() falls to the hardcoded default.
+        # Source models.env so the restarted gateway inherits the tier aliases — same as the
+        # launch path; without it the vision resolver falls back to the ladder default.
         load_models_env
         if ! gateway_stop; then
             echo "corti-bridge: the gateway on $GATEWAY didn't stop — stop it manually (pkill -f gateway.mjs)" >&2

@@ -16,6 +16,10 @@ STUB_PID=""
 GW_PID=""
 GW_PORT=4298
 
+# Ambient debug env from an invoking shell would make every test gateway write real
+# gateway-session logs — the two boots that need logs set both vars explicitly.
+unset CORTI_DEBUG CORTI_DEBUG_DIR
+
 cleanup() {
   [ -n "$GW_PID" ] && { kill "$GW_PID" 2>/dev/null || :; wait "$GW_PID" 2>/dev/null || :; }
   [ -n "$STUB_PID" ] && { kill "$STUB_PID" 2>/dev/null || :; wait "$STUB_PID" 2>/dev/null || :; }
@@ -1076,6 +1080,7 @@ img_run() {
     "$REPO/gateway.mjs" > "$_ir_gw"
   if [ -n "$_ir_exp" ]; then
     CORTI_EXPERIMENTAL="$_ir_exp" \
+    CORTI_VISION_MODEL="" \
     ANTHROPIC_DEFAULT_OPUS_MODEL="corti-s1-beta" \
     ANTHROPIC_DEFAULT_HAIKU_MODEL="corti-s1-mini-instant" \
     CORTI_BEARER=test \
@@ -1084,6 +1089,8 @@ img_run() {
     NODE_TLS_REJECT_UNAUTHORIZED=0 \
     node "$_ir_gw" > "imggw_$1.out" 2>&1 &
   else
+    CORTI_EXPERIMENTAL="" \
+    CORTI_VISION_MODEL="" \
     ANTHROPIC_DEFAULT_OPUS_MODEL="corti-s1-beta" \
     ANTHROPIC_DEFAULT_HAIKU_MODEL="corti-s1-mini-instant" \
     CORTI_BEARER=test \
@@ -1118,6 +1125,92 @@ check "IMG: not-opted-in delegates to the vision sidecall" \
   "$(grep -c 'response_format' imgchat.log 2>/dev/null || :)" "1"
 check "IMG: not-opted-in sidecall post carries image_url" \
   "$(grep -c 'image_url' imgchat.log 2>/dev/null || :)" "1"
+
+# Blind CORTI_VISION_MODEL must step down to the sighted sonnet and still fire the sidecall —
+# drives the gateway wiring of resolveVisionModel that the pure tests do not reach.
+rm -f imgchat.log
+_ir_gw="imggateway_4303.mjs"
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > "$_ir_gw"
+CORTI_EXPERIMENTAL="1" \
+CORTI_VISION_MODEL="corti-s1" \
+ANTHROPIC_DEFAULT_OPUS_MODEL="corti-s1" \
+ANTHROPIC_DEFAULT_HAIKU_MODEL="corti-s1" \
+ANTHROPIC_DEFAULT_SONNET_MODEL="corti-s1-mini-instant" \
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$IMGUP/v1" \
+CORTI_PORT=4303 \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node "$_ir_gw" > "imggw_4303.out" 2>&1 &
+_ir_pid=$!
+wait_banner "imggw_4303.out" || { echo "FAIL IMG step-down gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+curl -s -m 15 -H 'content-type: application/json' -d "$IMG_BODY" "http://127.0.0.1:4303/v1/messages" >/dev/null || :
+kill "$_ir_pid" 2>/dev/null || :; wait "$_ir_pid" 2>/dev/null || :
+check "IMG: blind override steps down and fires the sidecall" \
+  "$(grep -c 'response_format' imgchat.log 2>/dev/null || :)" "1"
+check "IMG: step-down sidecall targets the sighted sonnet" \
+  "$(grep -c '"model":"corti-s1-mini-instant"' imgchat.log 2>/dev/null || :)" "1"
+check "IMG: step-down logs a deduped warning naming the blind override" \
+  "$(grep -c 'corti-s1" is not multimodal' imggw_4303.out 2>/dev/null || :)" "1"
+unset _ir_gw _ir_pid
+
+# A failing /models fetch must still fire the sidecall on the default vision model — the image
+# cache would otherwise pin the outage's placeholders for the whole session.
+cat > imgstub503.mjs <<'IMGSTUB503'
+import fs from "node:fs";
+import https from "node:https";
+import { appendFileSync } from "node:fs";
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      const path = req.url.split("?")[0];
+      if (path.endsWith("/models")) { res.writeHead(503); return res.end(""); }
+      if (path.endsWith("/chat/completions")) {
+        appendFileSync("imgchat503.log", body + "\n<<<END>>>\n");
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ id: "c", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`IMGPORT503=${s.address().port}`));
+IMGSTUB503
+node imgstub503.mjs > imgstub503.out 2>&1 &
+IMGSTUB503_PID=$!
+IMGUP503=""
+while [ -z "$IMGUP503" ]; do IMGUP503=$(sed -n 's/^IMGPORT503=//p' imgstub503.out); done
+rm -f imgchat503.log
+_ir_gw="imggateway_4304.mjs"
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > "$_ir_gw"
+CORTI_EXPERIMENTAL="1" \
+CORTI_VISION_MODEL="" \
+ANTHROPIC_DEFAULT_OPUS_MODEL="corti-s1" \
+ANTHROPIC_DEFAULT_HAIKU_MODEL="corti-s1" \
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$IMGUP503/v1" \
+CORTI_PORT=4304 \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node "$_ir_gw" > "imggw_4304.out" 2>&1 &
+_ir_pid=$!
+wait_banner "imggw_4304.out" || { echo "FAIL IMG null-models gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+curl -s -m 15 -H 'content-type: application/json' -d "$IMG_BODY" "http://127.0.0.1:4304/v1/messages" >/dev/null || :
+kill "$_ir_pid" 2>/dev/null || :; wait "$_ir_pid" 2>/dev/null || :
+# imageModels is null after the 503, so the resolver falls back to VISION_DEFAULT and the sidecall
+# fires against corti-s1-mini-instant (rather than short-circuiting to no_sighted_model).
+check "IMG: null /models still fires the sidecall via VISION_DEFAULT" \
+  "$(grep -c 'response_format' imgchat503.log 2>/dev/null || :)" "1"
+check "IMG: null /models sidecall targets VISION_DEFAULT" \
+  "$(grep -c '"model":"corti-s1-mini-instant"' imgchat503.log 2>/dev/null || :)" "1"
+kill "$IMGSTUB503_PID" 2>/dev/null || :
+wait "$IMGSTUB503_PID" 2>/dev/null || :
+unset _ir_gw _ir_pid
 
 kill "$IMGSTUB_PID" 2>/dev/null || :
 wait "$IMGSTUB_PID" 2>/dev/null || :

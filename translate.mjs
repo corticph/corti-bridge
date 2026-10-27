@@ -1050,6 +1050,9 @@ export async function translateRequest(body, opts) {
     if (msg.role === "assistant") {
       const texts = [];
       const calls = [];
+      // Preserved thinking: history thinking forwards as `reasoning`, byte-identical (=0 opts
+      // out — stripping it froze agents mid-run); redacted_thinking stays dropped (opaque).
+      const reasoningParts = [];
       for (const b of blocksOf(msg.content)) {
         if (b.type === "text" && typeof b.text === "string") texts.push(b.text);
         else if (b.type === "tool_use") {
@@ -1059,16 +1062,12 @@ export async function translateRequest(body, opts) {
             function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) },
           });
         } else if (b.type === "advisor_tool_result") {
-          // C6: prior-turn advisor advice must round-trip into the model's view, not be dropped.
-          // The official doc: "Pass the full assistant content, including advisor_tool_result
-          // blocks, back to the API on subsequent turns. Round-trip the result blocks verbatim."
-          // We can't replay the server-tool wire shape to an OpenAI upstream, so we surface the
-          // advice as text wrapped in a distinct tag — a first-class channel the executor treats
-          // as advice rather than ordinary (skeptically-treated) tool output (reconstruction §3.3).
-          // server_tool_use (the paired call) is in SERVER_BLOCK_TYPES and dropped above — the
-          // executor doesn't need to see the call shape, only the advice it carried.
+          // C6: advisor advice must round-trip — the OpenAI wire can't carry the server-tool
+          // shape, so it surfaces as tagged text instead of the dropped call shape.
           const advice = advisorResultText(b);
           if (advice) texts.push(advisorGuidanceText(advice));
+        } else if (b.type === "thinking" && (opts?.forwardThinking ?? true) && typeof b.thinking === "string" && b.thinking) {
+          reasoningParts.push(b.thinking);
         } else if (b.type === "thinking" || b.type === "redacted_thinking" || SERVER_BLOCK_TYPES.has(b.type)) {
           dropped.push(`${b.type} (assistant history)`);
         } else if (b.type !== "text") {
@@ -1076,12 +1075,18 @@ export async function translateRequest(body, opts) {
         }
       }
       if (!texts.length && !calls.length) {
-        dropped.push("empty assistant message");
+        if (!reasoningParts.length) {
+          dropped.push("empty assistant message");
+          continue;
+        }
+        // Thinking-only history has no stable meaning upstream — drop, don't invent structure.
+        dropped.push("thinking-only assistant message (dropped)");
         continue;
       }
       flushPending();
       const out = { role: "assistant", content: texts.length ? texts.join("\n\n") : "" };
       if (calls.length) out.tool_calls = calls;
+      if (reasoningParts.length) out.reasoning = reasoningParts.join("\n\n");
       pendingCalls = calls.map((c) => c.id);
       messages.push(out);
       continue;
@@ -1276,14 +1281,18 @@ export async function translateRequest(body, opts) {
   // resolved effort above. A model that rejects the level 400s — surfacing a capability gap.
   if (opts?.advisorEffort) req.reasoning_effort = opts.advisorEffort;
 
-  return { request: req, dropped };
+  // Forwarded thinking counts on its own channel so debug logs read "forwarded: …", not "dropped:".
+  const forwardedCount = req.messages.filter((m) => m.reasoning).length;
+  const out = { request: req, dropped };
+  if (forwardedCount) out.forwarded = `thinking (assistant history) x${forwardedCount}`;
+  return out;
 }
 
 /* ------------------------------------------------------------------ */
 /* count_tokens estimate                                               */
 /* ------------------------------------------------------------------ */
 
-export function estimateTokens(body) {
+export function estimateTokens(body, opts) {
   try {
     let chars = 0;
     let overhead = 0;
@@ -1301,7 +1310,11 @@ export function estimateTokens(body) {
         add(msg.content);
         continue;
       }
-      for (const b of Array.isArray(msg?.content) ? msg.content : []) {
+      const blocks = Array.isArray(msg?.content) ? msg.content : [];
+      // Mirrors translateRequest: count thinking only where it is forwarded.
+      const fwdThinking = (opts?.forwardThinking ?? true) && msg?.role === "assistant" &&
+        blocks.some((b) => b?.type === "text" || b?.type === "tool_use" || b?.type === "advisor_tool_result");
+      for (const b of blocks) {
         if (!b || typeof b !== "object") continue;
         if (b.type === "text") add(b.text);
         else if (b.type === "image") overhead += 100;
@@ -1315,8 +1328,10 @@ export function estimateTokens(body) {
               if (c?.type === "text") add(c.text);
               else if (c?.type === "image") overhead += 100;
             }
-        } else if (b.type === "thinking" || b.type === "redacted_thinking") {
-          // stripped before upstream; not billed
+        } else if (b.type === "thinking") {
+          if (fwdThinking) add(b.thinking ?? "");
+        } else if (b.type === "redacted_thinking") {
+          // opaque bytes: never sent upstream, never billed
         } else if (b.type === "document") {
           const t = documentText(b);
           if (t != null) add(t);
@@ -1478,6 +1493,13 @@ function anthropicUsage(usage) {
   };
 }
 
+// Auto-mode verdicts die in the reasoning channel: the stop fires before any text is typed, so
+// the reply arrives empty — recover only when the marker sits at the very tail of the reasoning.
+function tailVerdict(reasoning) {
+  const m = typeof reasoning === "string" ? reasoning.match(/<block>(no|yes)\s*$/) : null;
+  return m ? `<block>${m[1]}</block>` : null;
+}
+
 export function translateCompletion(completion, ctx) {
   // The only place upstream's own prompt_tokens surfaces off the streaming path; the gateway
   // calibrates the estimate it reports for the session's next turn against it.
@@ -1496,6 +1518,18 @@ export function translateCompletion(completion, ctx) {
 
   if (typeof message.content === "string" && message.content)
     content.push({ type: "text", text: message.content });
+
+  // Classifier recovery: on a "</block>"-stopped request whose text channel stayed empty, the
+  // verdict marker sits verbatim at the reasoning tail — type it back in as text.
+  if (
+    !content.some((b) => b.type === "text") &&
+    choice.stop_reason === "</block>" &&
+    Array.isArray(ctx?.upstreamRequest?.stop) &&
+    ctx.upstreamRequest.stop.includes("</block>")
+  ) {
+    const verdict = tailVerdict(reasoning);
+    if (verdict) content.push({ type: "text", text: verdict });
+  }
 
   for (const call of message.tool_calls ?? []) {
     let input = {};
@@ -1539,6 +1573,9 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
   let terminated = false;
   let latestUsage = null;
   let outputChars = 0;
+  // Classifier-verdict recovery reads the accumulated reasoning tail (tailVerdict below).
+  let thinkingTail = "";
+  let sawText = false;
   // Anchor sources for a consult's advice; must match the client's history byte for byte.
   let lastText = "";
   let firstBlock = null; // { type:"text", text } | { type:"tool", id }
@@ -1595,6 +1632,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
 
   const reasoningText = (text) => {
     if (!text) return;
+    thinkingTail += text;
     if (ctx.reasoningMode === "drop") return;
     if (ctx.reasoningMode === "thinking") {
       if (open?.kind !== "thinking")
@@ -1611,6 +1649,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
 
   const textDelta = (text) => {
     if (!text) return;
+    sawText = true;
     if (open?.kind !== "text") {
       openBlock("text", { type: "text", text: "" });
       lastText = "";
@@ -1685,6 +1724,21 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
   const finish = (choice) => {
     pendingStop = anthropicStop(choice);
     closeOpen();
+    // Classifier recovery, streaming side: no text on a "</block>"-stopped request with the
+    // verdict marker at the reasoning tail — finish_reason "stop" is the stop-fired evidence.
+    if (
+      !sawText &&
+      Array.isArray(ctx?.upstreamRequest?.stop) &&
+      ctx.upstreamRequest.stop.includes("</block>") &&
+      (choice.stop_reason === "</block>" || (choice.stop_reason == null && choice.finish_reason === "stop"))
+    ) {
+      const verdict = tailVerdict(thinkingTail);
+      if (verdict) {
+        openBlock("text", { type: "text", text: "" });
+        textDelta(verdict);
+        closeOpen();
+      }
+    }
     // Detect a turn ending on a consult_advisor tool_use. The harness would otherwise end the
     // turn and synthesize a "No such tool" error; the gateway uses this to hold the turn open
     // and emit an inline advisor_tool_result instead. Only fires when a hook is registered.

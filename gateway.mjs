@@ -32,6 +32,7 @@ import {
   isRetryableStatus,
   retryDelayMs,
 } from "./lib/retry.mjs";
+import { resolveVisionModel } from "./lib/vision.mjs";
 
 const HOST = process.env.CORTI_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.CORTI_PORT ?? 4192);
@@ -44,6 +45,8 @@ const BARE_PATH_IS_ANTHROPIC = process.env.CORTI_UPSTREAM_MODE === "anthropic";
 const REASONING_MODE = ["thinking", "text", "drop"].includes(process.env.CORTI_REASONING_MODE)
   ? process.env.CORTI_REASONING_MODE
   : "thinking";
+// Preserved thinking — history thinking forwards as `reasoning`; =0 opts out.
+const FORWARD_THINKING = process.env.CORTI_FORWARD_THINKING !== "0";
 
 if (!BEARER) {
   console.error("CORTI_BEARER is required");
@@ -94,10 +97,15 @@ const NONSTREAM_TIMEOUT_MS = 600_000;
 const CONTINUATION_GRACE_MS = 10_000;
 const CONTINUATION_MIN_MS = 60_000;
 const SHUTDOWN_GRACE_MS = 5_000;
-// Upstream's own 400 is authoritative for whichever model is called; this just bounds the backstop.
-const CONTEXT_WINDOW = 524_288;
-// estimateTokens undercounts real usage, so this trips only on absurd bodies.
-const OVERFLOW_TOKEN_ESTIMATE = 524_288;
+// Upstream's own 400 stays authoritative; this bound only catches absurd bodies. It derives
+// from the exported window at launch so the gate tracks the catalog without a hand-set literal.
+const BACKSTOP_FLOOR_TOKENS = 2_097_152;
+const exportedContextWindow = Number(process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS);
+const CONTEXT_WINDOW = Math.max(
+  BACKSTOP_FLOOR_TOKENS,
+  2 * (Number.isFinite(exportedContextWindow) ? exportedContextWindow : 0),
+);
+const OVERFLOW_TOKEN_ESTIMATE = CONTEXT_WINDOW;
 const BYTE_CAP_BYTES = 8_000_000;
 const MEMORY_BREAKER_BYTES = 64_000_000;
 
@@ -211,6 +219,7 @@ function healthPayload() {
     mode: BARE_PATH_IS_ANTHROPIC ? "anthropic" : "openai",
     upstream: BASE_URL,
     debug: LOG_DIR ?? false,
+    forwardThinking: FORWARD_THINKING,
   };
 }
 
@@ -218,7 +227,7 @@ function healthPayload() {
 server.requestTimeout = 0;
 server.listen(PORT, HOST, () => {
   console.log(
-    `corti-proxy on http://${HOST}:${PORT} (openai: /, anthropic: ${ANTHROPIC_PREFIX}, reasoning: ${REASONING_MODE})`,
+    `corti-proxy on http://${HOST}:${PORT} (openai: /, anthropic: ${ANTHROPIC_PREFIX}, reasoning: ${REASONING_MODE}, forwarding: ${FORWARD_THINKING ? "on" : "off"})`,
   );
   if (LOG_DIR) console.log(`corti-proxy debug log dir: ${LOG_DIR}`);
 });
@@ -369,7 +378,7 @@ function handleOpenAI(req, res, reqPath) {
 // /anthropic 404s on it — so both routes answer locally from the same estimate.
 function countTokens(body) {
   try {
-    return { status: 200, payload: { input_tokens: estimateTokens(JSON.parse(body.toString())) } };
+    return { status: 200, payload: { input_tokens: estimateTokens(JSON.parse(body.toString()), { forwardThinking: FORWARD_THINKING }) } };
   } catch {
     return {
       status: 400,
@@ -431,15 +440,9 @@ function fetchImageModels() {
   return imageModelsLoading;
 }
 
-/** The vision model used to describe images for a blind primary. Defaults to the instant
- *  sonnet tier (corti-s1-mini-instant): multimodal and non-reasoning, so no thinking cap is needed
- *  and latency is low — describing is perception, not reasoning. CORTI_VISION_MODEL overrides;
- *  point it at a reasoning model (corti-s1-mini) when the question needs chart arithmetic. Must
- *  itself be multimodal — if it's blind, the skipImages recursion guard stops re-describing and
- *  the upstream 400 surfaces as a graceful placeholder, not a crash. */
-function visionModel() {
-  return process.env.CORTI_VISION_MODEL || process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL || "corti-s1-mini-instant";
-}
+// Module-level dedup of the blind-override step-down warning: one line per bypassed model id per
+// process, so a session full of images logs once, not once per image.
+const _visionWarned = new Set();
 
 /** The system prompt for the vision sidecall, in lib/ so the per-type checklists stay readable.
  *  Fixed across every call so it prefix-caches. Asks for a JSON object with typed fields (adapted
@@ -498,11 +501,14 @@ function formatImageDescription(f) {
  *  Resolves { ok, text } on success or { ok:false, code, detail } on failure — interceptImages turns
  *  a failure into a graceful placeholder rather than letting a blind model receive the image.
  *  context (optional) is the surrounding user question / model intent, extracted by interceptImages
- *  so the vision model can focus on what's actually being asked rather than a generic summary. */
-function runDescribeImage(block, context) {
+ *  so the vision model can focus on what's actually being asked rather than a generic summary.
+ *  model is the resolved vision id from resolveVisionModel (imageInterceptOpts); "" means no
+ *  configured tier is sighted — short-circuit to the placeholder without burning an upstream 400. */
+function runDescribeImage(block, context, model) {
+  if (!model) return Promise.resolve({ ok: false, code: "no_sighted_model", detail: "no multimodal model available" });
   return new Promise((resolve) => {
     const reqBody = JSON.stringify({
-      model: visionModel(),
+      model,
       max_tokens: 4096,
       // Extraction, not composition — and unpinned decoding makes every prompt change unmeasurable.
       temperature: 0.1,
@@ -568,11 +574,23 @@ function bodyHasImage(body) {
 /** Opts for interceptImages, built only for image-bearing requests: ensures the capability set is
  *  loaded (lazy, once per process) then wires the describe sidecall. Returns {} when the body
  *  carries no image, so non-image requests pay nothing. The capability fetch is awaited so the
- *  first image-bearing request blocks on it; later requests reuse the cached set. */
+ *  first image-bearing request blocks on it; later requests reuse the cached set.
+ *
+ *  The vision model is resolved here — after the sighted set is fetched — so a blind tier pin steps
+ *  down to the next sighted tier instead of 400-ing at upstream. The resolved model is bound into
+ *  the describeImage closure; runDescribeImage's positional (block, context) signature is kept so
+ *  translate.mjs and test/translate.sh stubs stay arity-stable. A blind explicit CORTI_VISION_MODEL
+ *  logs one deduped warning per bypassed model id. */
 async function imageInterceptOpts(body, skipImages) {
   if (skipImages || !bodyHasImage(body)) return {};
   if (imageModels === null) await fetchImageModels();
-  return { describeImage: runDescribeImage, imageModels };
+  const { model, warned, fallbackFrom } = resolveVisionModel({ env: process.env, imageModels });
+  if (warned && fallbackFrom && !_visionWarned.has(fallbackFrom)) {
+    _visionWarned.add(fallbackFrom);
+    const to = model ? `"${model}"` : "no sighted model — images will be described as placeholders";
+    console.error(`corti-proxy: CORTI_VISION_MODEL "${fallbackFrom}" is not multimodal; using ${to} for image description`);
+  }
+  return { describeImage: (block, context) => runDescribeImage(block, context, model), imageModels };
 }
 
 function handleModels(res) {
@@ -749,7 +767,7 @@ async function handleMessages(req, res, body) {
       "body-cap",
     );
 
-  const est = estimateTokens(anthropicBody);
+  const est = estimateTokens(anthropicBody, { forwardThinking: FORWARD_THINKING });
   if (est > OVERFLOW_TOKEN_ESTIMATE)
     return fail(
       {
@@ -773,7 +791,7 @@ async function handleMessages(req, res, body) {
           type: "error",
           error: {
             type: "request_too_large",
-            message: "request body exceeds the largest size measured to reach inference (8 MB); remove or shrink large images",
+            message: "request body exceeds the largest size measured to reach inference (8 MB)",
           },
         },
       },
@@ -794,9 +812,11 @@ async function handleMessages(req, res, body) {
     const out = await translateRequest(anthropicBody, {
       skipAdvisor: noAdvisor, mode: "openai", advisorEffort, parentSessionId,
       skipImages: anthropicBody?.skipImages, ...imageOpts,
+      forwardThinking: FORWARD_THINKING,
     });
     translated = out.request;
     diagnostics.push(...out.dropped.map((d) => `dropped: ${d}`));
+    if (out.forwarded) diagnostics.push(`forwarded: ${out.forwarded}`);
   } catch (err) {
     if (err instanceof TranslateRejection)
       return fail({ status: err.status, envelope: err.envelope }, "translation-rejected");
@@ -813,6 +833,9 @@ async function handleMessages(req, res, body) {
     msgId: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
     requestedModel: anthropicBody.model,
     reasoningMode: REASONING_MODE,
+    // Rides along so response translation can see the request's stop strings — wire decisions
+    // stay in translate.mjs.
+    upstreamRequest: translated,
     estimatedInput,
     onDiagnostic: (m) => diagnostics.push(m),
     // Fires wherever translate.mjs sees upstream's own prompt_tokens, streaming or not. Paired
@@ -1052,7 +1075,7 @@ async function handleMessages(req, res, body) {
       // client request, so the advisor intercept must not touch it.
       // parentSessionId only re-inserts *prior* consults, so the continuation reads the history
       // the first call did; this turn's own consult is not recorded until the continuation settles.
-      translateRequest(contAnthropic, { skipAdvisor: true, skipImages: true, parentSessionId })
+      translateRequest(contAnthropic, { skipAdvisor: true, skipImages: true, parentSessionId, forwardThinking: FORWARD_THINKING })
         .then((out) => {
           const contTranslated = out.request;
           diagnostics.push(...out.dropped.map((d) => `continuation dropped: ${d}`));

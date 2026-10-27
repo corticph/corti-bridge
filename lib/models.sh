@@ -145,6 +145,28 @@ models_experimental_line() {
   fi
 }
 
+# Echoes the CORTI_FORWARD_THINKING line for models.env: a stored value (e.g. "0") survives
+# --fresh; new installs record the default. $1 = the existing models.env path.
+models_forward_thinking_line() {
+  _md_ft_prev=""
+  if [ -n "$1" ] && [ -f "$1" ]; then
+    _md_ft_prev="$(models_env_get "$1" CORTI_FORWARD_THINKING || true)"
+  fi
+  printf 'CORTI_FORWARD_THINKING="%s"\n' "${_md_ft_prev:-1}"
+  unset _md_ft_prev
+}
+
+# Echoes the compact-skip line for models.env: with it set, only the gateway's prompt-too-long
+# 400 triggers CLI auto-compact; a stored "0" restores CLI-judged compaction. $1 = models.env path.
+models_unknown_window_line() {
+  _md_uw_prev=""
+  if [ -n "$1" ] && [ -f "$1" ]; then
+    _md_uw_prev="$(models_env_get "$1" CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT || true)"
+  fi
+  printf 'CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="%s"\n' "${_md_uw_prev:-1}"
+  unset _md_uw_prev
+}
+
 # 0 = models.env present and current, 1 = not written (caller records it).
 # $1 state dir, $2 force (1 = --fresh: overwrite even if it exists),
 # $3 experimental (1 = fetch with ?experimental=true so betas compete for fable)
@@ -180,7 +202,18 @@ models_configure() {
 
   # Callers set the repo root before sourcing: CC_REPO_DIR from setup.sh, REPO from the tests.
   _md_js="${CC_REPO_DIR:-${REPO:-.}}/lib/models.mjs"
-  _md_env="$(node "$_md_js" "$_md_catalog")" || return 1
+  # Pass the preserved pin + its old window so --fresh cannot shrink the pin ceiling.
+  _md_pin_id=""
+  _md_prev_win=""
+  if [ -f "$_md_file" ] && [ "$(models_env_get "$_md_file" ANTHROPIC_DEFAULT_FABLE_MODEL_PIN || true)" = "1" ]; then
+    _md_pin_id="$(models_env_get "$_md_file" ANTHROPIC_DEFAULT_FABLE_MODEL || true)"
+    _md_prev_win="$(models_env_get "$_md_file" CLAUDE_CODE_MAX_CONTEXT_TOKENS || true)"
+  fi
+  if [ -n "$_md_pin_id" ]; then
+    _md_env="$(node "$_md_js" "$_md_catalog" "$_md_pin_id" "${_md_prev_win:-0}")" || return 1
+  else
+    _md_env="$(node "$_md_js" "$_md_catalog")" || return 1
+  fi
 
   # Re-inject the pinned fable block (read from $_md_file before overwrite), replacing what
   # the auto-ranker emitted; otherwise dedupe against the live backend.
@@ -194,6 +227,10 @@ models_configure() {
 
   # Read before overwrite so --fresh keeps an existing CORTI_EXPERIMENTAL.
   _md_env="$(printf '%s\n%s' "$_md_env" "$(models_experimental_line "$_md_exp" "$_md_file")")"
+  # Same read-before-overwrite for the forwarding switch, so a user's "0" survives --fresh.
+  _md_env="$(printf '%s\n%s' "$_md_env" "$(models_forward_thinking_line "$_md_file")")"
+  # And for the skip-proactive-compaction switch: a stored "0" restores CLI-judged compaction.
+  _md_env="$(printf '%s\n%s' "$_md_env" "$(models_unknown_window_line "$_md_file")")"
 
   mkdir -p "$_md_dir"
   # Trailing newline: command substitution strips it, and the wrapper sources this file.
@@ -245,8 +282,11 @@ EOF
 
   if [ "$_mp_reset" = 1 ]; then
     _mp_env="$(models_dedupe_fable "$_mp_auto")"
-    # A reset clears pins, not the opt-in.
+    # A reset clears pins, not the stored opt-ins and opt-outs: read before the overwrite,
+    # the same read-before-write the setup.sh flow uses.
     _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_experimental_line "$_mp_exp" "$_mp_file")")"
+    _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_forward_thinking_line "$_mp_file")")"
+    _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_unknown_window_line "$_mp_file")")"
     mkdir -p "$_mp_dir"
     printf '%s\n' "$_mp_env" >"$_mp_file.tmp" && mv "$_mp_file.tmp" "$_mp_file"
     ui_step "corti-bridge models --reset"
@@ -386,6 +426,10 @@ EOF
 
   # Without --experimental, preserve the existing value.
   _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_experimental_line "$_mp_exp" "$_mp_file")")"
+  # The picker must also keep the stored opt-outs across its overwrite — a user's "0" on
+  # preserved thinking or on the compact-skip switch is a stored choice, not a pin.
+  _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_forward_thinking_line "$_mp_file")")"
+  _mp_env="$(printf '%s\n%s' "$_mp_env" "$(models_unknown_window_line "$_mp_file")")"
 
   mkdir -p "$_mp_dir"
   printf '%s\n' "$_mp_env" >"$_mp_file.tmp" && mv "$_mp_file.tmp" "$_mp_file"

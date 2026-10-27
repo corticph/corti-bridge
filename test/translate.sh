@@ -8,8 +8,9 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
-import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache, _resetImageCache } from "'"$REPO"'/translate.mjs";
+import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache, _resetImageCache, estimateTokens } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
+import { resolveVisionModel, VISION_DEFAULT, VISION_TIERS } from "'"$REPO"'/lib/vision.mjs";
 
 let failed = 0;
 const check = (name, got, want) => {
@@ -821,6 +822,63 @@ const d1pres = translateCompletion({
 }, d1ctx);
 check("D1: present tool_call id preserved", d1pres.content[0].id, "call_abc");
 
+// --- B1: auto-mode classifier verdict recovery. The "</block>" stop fires inside the reasoning
+// channel; the marker at the reasoning tail is typed back in as text (fixture: #2/#7 sidecalls).
+const b1ctx = { msgId: "msg_b1", requestedModel: "corti-s1-mini-beta", reasoningMode: "thinking", estimatedInput: 1, upstreamRequest: { stop: ["</block>"] } };
+const b1msg = translateCompletion({
+  choices: [{ index: 0, message: { role: "assistant", content: null, reasoning: "Could be Exfil Scouting? No. Irreversible? No. It is benign. Stage1 probably no block. Need output <block>no" }, finish_reason: "stop", stop_reason: "</block>" }],
+  usage: { prompt_tokens: 38911, completion_tokens: 73 },
+}, b1ctx);
+check("B1: verdict typed back in as text", b1msg.content.some((b) => b.type === "text" && b.text === "<block>no</block>"), true);
+check("B1: thinking block still carries the reasoning", b1msg.content.some((b) => b.type === "thinking" && b.thinking.endsWith("Need output <block>no")), true);
+check("B1: stop_reason mapping unchanged (end_turn)", b1msg.stop_reason, "end_turn");
+const b1yes = translateCompletion({
+  choices: [{ index: 0, message: { role: "assistant", content: null, reasoning: "Transcript ends with Bash find command. Need output <block>yes" }, finish_reason: "stop", stop_reason: "</block>" }],
+  usage: { prompt_tokens: 1, completion_tokens: 1 },
+}, b1ctx);
+check("B1: yes verdict recovered", b1yes.content.some((b) => b.type === "text" && b.text === "<block>yes</block>"), true);
+// Negative gates: no stop string on the request, or the stop never fired at the reasoning tail
+// (a max_tokens cut leaves the sentence dangling) — nothing is synthesized in those cases.
+const b1nctx = { msgId: "msg_b1n", requestedModel: "corti-s1", reasoningMode: "thinking", estimatedInput: 1, upstreamRequest: {} };
+const b1n1 = translateCompletion({ choices: [{ index: 0, message: { role: "assistant", content: null, reasoning: "No block rule matches. Output `<block>no" }, finish_reason: "stop", stop_reason: "</block>" }], usage: {} }, b1nctx);
+check("B1: no request stop string -> no synthesis", b1n1.content.some((b) => b.type === "text" && b.text === "<block>no</block>"), false);
+const b1n2 = translateCompletion({ choices: [{ index: 0, message: { role: "assistant", content: null, reasoning: "This is a local read-only diagnostic. No BLOCK rule matches. The action is" }, finish_reason: "length", stop_reason: null }], usage: {} }, b1ctx);
+check("B1: length cut -> no synthesis", b1n2.content.some((b) => b.type === "text"), false);
+// Text-mode reasoning folds the marker into the already-streamed text; recovery must not
+// duplicate it.
+const b1tctx = { msgId: "msg_b1t", requestedModel: "corti-s1", reasoningMode: "text", estimatedInput: 1, upstreamRequest: { stop: ["</block>"] } };
+const b1t = translateCompletion({ choices: [{ index: 0, message: { role: "assistant", content: null, reasoning: "Benign. The answer is `<block>no" }, finish_reason: "stop", stop_reason: "</block>" }], usage: {} }, b1tctx);
+check("B1: text-mode reasoning not duplicated", b1t.content.filter((b) => b.type === "text").length, 1);
+check("B1: text-mode tail keeps its raw marker", b1t.content[0].text.endsWith("<block>no"), true);
+
+// --- B2: streaming recovery: same gate, but streamed chunks carry no stop_reason, so on a
+// "</block>"-stopped request finish_reason "stop" is the stop-fired evidence.
+const b2events = [];
+const b2ctx = { msgId: "msg_b2", requestedModel: "corti-s1-mini-beta", reasoningMode: "thinking", estimatedInput: 999, upstreamRequest: { stop: ["</block>"] } };
+const b2tx = createStreamTranslator(b2ctx, (ev, data) => b2events.push({ ev, data }));
+b2tx.feed({ choices: [{ delta: { reasoning: "Could be Exfil Scouting? No. Irreversible? No. It is benign. Need output <block>no" } }] });
+b2tx.feed({ choices: [{ delta: {}, finish_reason: "stop" }] });
+b2tx.done();
+const b2text = b2events.filter((e) => e.ev === "content_block_delta" && e.data?.delta?.type === "text_delta").map((e) => e.data.delta.text).join("");
+check("B2: verdict recovered mid-stream", b2text, "<block>no</block>");
+// A verdict delivered as normal streamed text must pass through untouched.
+const b2rev = [];
+const b2rctx = { msgId: "msg_b2r", requestedModel: "corti-s1-mini-beta", reasoningMode: "thinking", estimatedInput: 999, upstreamRequest: { stop: ["</block>"] } };
+const b2rtx = createStreamTranslator(b2rctx, (ev, data) => b2rev.push({ ev, data }));
+b2rtx.feed({ choices: [{ delta: { reasoning: "thinking about the action" } }] });
+b2rtx.feed({ choices: [{ delta: { content: "\n\n<block>no" }, finish_reason: "stop" }] });
+b2rtx.done();
+const b2rtext = b2rev.filter((e) => e.ev === "content_block_delta" && e.data?.delta?.type === "text_delta").map((e) => e.data.delta.text).join("");
+check("B2: normally delivered verdict not duplicated", b2rtext, "\n\n<block>no");
+// A max_tokens burn leaves no marker to recover — no synthesis.
+const b2mev = [];
+const b2mctx = { msgId: "msg_b2m", requestedModel: "corti-s1-mini-beta", reasoningMode: "thinking", estimatedInput: 999, upstreamRequest: { stop: ["</block>"] } };
+const b2mtx = createStreamTranslator(b2mctx, (ev, data) => b2mev.push({ ev, data }));
+b2mtx.feed({ choices: [{ delta: { reasoning: "Hmm, but actually — let me reconsider one mor" } }] });
+b2mtx.feed({ choices: [{ delta: {}, finish_reason: "length" }] });
+b2mtx.done();
+check("B2: length burn -> no synthesis", b2mev.some((e) => e.ev === "content_block_delta" && e.data?.delta?.type === "text_delta"), false);
+
 // --- Image intercept: a non-multimodal primary (corti-s1) gets image blocks replaced with a
 // text description from a sighted side model, so Corti doesn\x27t 400 "not a multimodal model" and
 // kill the session. Capability-driven: a sighted model passes images through untouched. Cached
@@ -1063,6 +1121,223 @@ const markerBody = {
 };
 await applyIntercepts(markerBody, { describeImage: markerStub, imageModels: blind, parentSessionId: "smark" });
 check("image: lone provenance marker yields null context", markerCtx, null);
+
+// --- Vision-model step-down: a blind tier pin steps to the next sighted tier instead of 400-ing.
+// The resolver is pure (lib/vision.mjs): inject env + sighted set, assert the picked model.
+const vSighted = new Set(["corti-s1-mini", "corti-s1-mini-beta", "corti-s1-mini-instant", "corti-s1-mini-instant-beta"]);
+const vEnv = (o) => ({ CORTI_VISION_MODEL: "", ANTHROPIC_DEFAULT_HAIKU_MODEL: "", ANTHROPIC_DEFAULT_SONNET_MODEL: "", ANTHROPIC_DEFAULT_OPUS_MODEL: "", ANTHROPIC_DEFAULT_FABLE_MODEL: "", ...o });
+
+// Explicit sighted override is honored, no warning.
+let vr = resolveVisionModel({ env: vEnv({ CORTI_VISION_MODEL: "corti-s1-mini" }), imageModels: vSighted });
+check("vision: explicit sighted override is used", vr.model, "corti-s1-mini");
+check("vision: sighted override warns false", vr.warned, false);
+
+// The live bug shape: override blind, sonnet sighted → steps down to sonnet, warns once.
+vr = resolveVisionModel({
+  env: vEnv({ CORTI_VISION_MODEL: "corti-s1-instant-beta", ANTHROPIC_DEFAULT_HAIKU_MODEL: "corti-s1-instant-beta", ANTHROPIC_DEFAULT_SONNET_MODEL: "corti-s1-mini" }),
+  imageModels: vSighted,
+});
+check("vision: blind override steps down to sighted sonnet", vr.model, "corti-s1-mini");
+check("vision: blind override warns true", vr.warned, true);
+check("vision: blind override records fallbackFrom", vr.fallbackFrom, "corti-s1-instant-beta");
+
+// Ladder: haiku blind, sonnet blind, opus blind, fable sighted → first sighted wins (fable).
+vr = resolveVisionModel({
+  env: vEnv({ ANTHROPIC_DEFAULT_HAIKU_MODEL: "corti-s1-instant-beta", ANTHROPIC_DEFAULT_SONNET_MODEL: "corti-s1-instant-beta", ANTHROPIC_DEFAULT_OPUS_MODEL: "corti-s1", ANTHROPIC_DEFAULT_FABLE_MODEL: "corti-s1-mini" }),
+  imageModels: vSighted,
+});
+check("vision: steps haiku->sonnet->opus->fable, first sighted wins", vr.model, "corti-s1-mini");
+check("vision: no override means no warning", vr.warned, false);
+check("vision: no override means no fallbackFrom", vr.fallbackFrom, null);
+
+// Sonnet is the first sighted rung → sonnet wins before fable (ladder order is cheapest-first).
+vr = resolveVisionModel({
+  env: vEnv({ ANTHROPIC_DEFAULT_HAIKU_MODEL: "corti-s1-instant-beta", ANTHROPIC_DEFAULT_SONNET_MODEL: "corti-s1-mini-beta", ANTHROPIC_DEFAULT_OPUS_MODEL: "corti-s1", ANTHROPIC_DEFAULT_FABLE_MODEL: "corti-s1-mini" }),
+  imageModels: vSighted,
+});
+check("vision: sonnet wins before fable when both sighted", vr.model, "corti-s1-mini-beta");
+
+// No tier sighted → empty string (the true bottom; gateway short-circuits to placeholder).
+vr = resolveVisionModel({
+  env: vEnv({ ANTHROPIC_DEFAULT_HAIKU_MODEL: "corti-s1-instant-beta", ANTHROPIC_DEFAULT_SONNET_MODEL: "corti-s1-instant-beta" }),
+  imageModels: new Set(["corti-s1-mini"]),
+});
+check("vision: no sighted tier resolves to empty", vr.model, "");
+
+// Empty sighted set → every model is blind (matches interceptImages leniency), empty result.
+// This is the TRUE bottom: the catalog loaded (a Set), confirmed nothing is sighted.
+vr = resolveVisionModel({ env: vEnv({ CORTI_VISION_MODEL: "corti-s1-mini" }), imageModels: new Set() });
+check("vision: empty sighted set treats all as blind", vr.model, "");
+check("vision: empty sighted set warns on the override", vr.warned, true);
+
+// Non-Set imageModels = /models fetch failed or has not loaded — fall back to the default
+// rather than pinning outage placeholders for the session (regression: old resolver returned "").
+vr = resolveVisionModel({ env: vEnv({ CORTI_VISION_MODEL: "corti-s1-instant-beta" }), imageModels: null });
+check("vision: null imageModels falls back to VISION_DEFAULT", vr.model, VISION_DEFAULT);
+check("vision: null imageModels does not warn (unknown, not blind)", vr.warned, false);
+check("vision: null imageModels clears fallbackFrom", vr.fallbackFrom, null);
+
+// undefined imageModels (env not injected at all) → same null-fallback path.
+vr = resolveVisionModel({ env: vEnv(), imageModels: undefined });
+check("vision: undefined imageModels falls back to VISION_DEFAULT", vr.model, VISION_DEFAULT);
+
+// No env tiers set and no override → falls through to VISION_DEFAULT when it is sighted.
+vr = resolveVisionModel({ env: vEnv(), imageModels: vSighted });
+check("vision: bare env resolves to VISION_DEFAULT when sighted", vr.model, VISION_DEFAULT);
+check("vision: bare env warns false", vr.warned, false);
+
+// VISION_DEFAULT itself blind → empty (the catalog dropped the instant sonnet).
+vr = resolveVisionModel({ env: vEnv(), imageModels: new Set(["corti-s1-mini"]) });
+check("vision: blind default resolves to empty", vr.model, "");
+
+// Whitespace-only override and tier values are trimmed, not treated as set-but-blind.
+vr = resolveVisionModel({ env: vEnv({ CORTI_VISION_MODEL: "  corti-s1-mini  " }), imageModels: vSighted });
+check("vision: override is trimmed before sighted check", vr.model, "corti-s1-mini");
+
+// The tier ladder order is the cheapest-first convention (haiku first).
+check("vision: tier ladder starts at haiku", VISION_TIERS[0], "ANTHROPIC_DEFAULT_HAIKU_MODEL");
+check("vision: tier ladder ends at fable", VISION_TIERS[VISION_TIERS.length - 1], "ANTHROPIC_DEFAULT_FABLE_MODEL");
+
+console.log("");
+// --- forward thinking (CORTI_FORWARD_THINKING) ---------------------------------
+// Default ON: absent opts forwards history thinking (CORTI_FORWARD_THINKING=0 opts out).
+const fwdOff = await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "plan: read the file", signature: "sig" },
+      { type: "text", text: "I\x27ll read it." },
+      { type: "tool_use", id: "t1", name: "run_bash", input: { command: "ls" } },
+    ]},
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "file.txt" }] },
+    { role: "user", content: "and then?" },
+  ],
+}, { forwardThinking: false });
+check("forward-off: assistant history has no reasoning field", fwdOff.request.messages.some((m) => m.reasoning !== undefined), false);
+check("forward-off: drop diag present", fwdOff.dropped.includes("thinking (assistant history)"), true);
+
+// On: thinking is forwarded verbatim on its assistant message, tool/text path unchanged.
+const fwdOn = await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "plan: read the file", signature: "sig" },
+      { type: "text", text: "I\x27ll read it." },
+      { type: "tool_use", id: "t1", name: "run_bash", input: { command: "ls" } },
+    ]},
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "file.txt" }] },
+    { role: "user", content: "and then?" },
+  ],
+}, { forwardThinking: true });
+const fwdAssistant = fwdOn.request.messages.find((m) => m.role === "assistant");
+check("forward-on: reasoning field carries thinking verbatim", fwdAssistant.reasoning, "plan: read the file");
+check("forward-on: text content preserved", fwdAssistant.content, "I\x27ll read it.");
+check("forward-on: tool_calls preserved", fwdAssistant.tool_calls?.[0]?.function?.name, "run_bash");
+check("forward-on: forwarded channel reports count", fwdOn.forwarded, "thinking (assistant history) x1");
+
+// Default: no opts at all must forward. The gateway passes its env-resolved value explicitly,
+// so this pins the translateRequest fallback — failing loudly beats silent drift.
+const fwdDefault = await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "plan: read the file", signature: "sig" },
+      { type: "text", text: "I\x27ll read it." },
+    ]},
+    { role: "user", content: "and then?" },
+  ],
+});
+check("forward-default: no opts forwards thinking", fwdDefault.request.messages[1].reasoning, "plan: read the file");
+
+// Multiple thinking blocks on one assistant message join with blank lines, order preserved.
+const fwdMulti = await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "first consider A", signature: "sig" },
+      { type: "text", text: "ok" },
+    ]},
+  ],
+}, { forwardThinking: true });
+check("forward-on: single block passes through", fwdMulti.request.messages[1].reasoning, "first consider A");
+
+// redacted_thinking stays dropped even with the flag on (opaque blob).
+const fwdRedacted = await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [
+      { type: "redacted_thinking", data: "opaque" },
+      { type: "text", text: "ok" },
+    ]},
+  ],
+}, { forwardThinking: true });
+check("forward-on: redacted_thinking still dropped", fwdRedacted.request.messages[1].reasoning, undefined);
+check("forward-on: redacted drop diag", fwdRedacted.dropped.includes("redacted_thinking (assistant history)"), true);
+
+// Thinking-only assistant history (no text/tool_use anchor): dropped, not forwarded — an
+// assistant message that carries only reasoning has no stable meaning upstream.
+const fwdSolo = await translateRequest({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [{ type: "thinking", thinking: "only thinking", signature: "sig" }] },
+    { role: "user", content: "go on" },
+  ],
+}, { forwardThinking: true });
+check("forward-on: thinking-only history dropped", fwdSolo.request.messages.some((m) => m.role === "assistant" && m.reasoning), false);
+check("forward-on: thinking-only diag", fwdSolo.dropped.some((d) => d.startsWith("thinking-only")), true);
+
+// T4 — byte-stability across consecutive turns: same client history replayed must produce
+// byte-identical upstream messages (prefix cache holds only if the mapping is deterministic).
+const t4Client = (n) => ({
+  model: "corti-s1", max_tokens: 16, messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "stable plan", signature: "sig" },
+      { type: "text", text: "I\x27ll read it." },
+      { type: "tool_use", id: "t1", name: "run_bash", input: { command: "ls" } },
+    ]},
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "file.txt" }] },
+    ...(n > 1 ? [{ role: "user", content: "and then?" }] : []),
+  ],
+});
+const t4a = await translateRequest(t4Client(1), { forwardThinking: true });
+const t4b = await translateRequest(t4Client(2), { forwardThinking: true });
+const t4aJSON = JSON.stringify(t4a.request.messages);
+const t4bPrefixJSON = JSON.stringify(t4b.request.messages.slice(0, t4a.request.messages.length));
+check("forward-on: consecutive-turn prefix byte-identical (T4)", t4aJSON, t4bPrefixJSON);
+
+// estimateTokens: forwarding is the billing truth, so thinking chars count by default and
+// must vanish from the estimate when opted out — count_tokens and the overflow guard share it.
+const estBody = { messages: [
+  { role: "assistant", content: [
+    { type: "thinking", thinking: "x".repeat(400), signature: "sig" },
+    { type: "text", text: "done" },
+  ]},
+] };
+const estOn = estimateTokens(estBody);
+const estOff = estimateTokens(estBody, { forwardThinking: false });
+const estWithout = estimateTokens({ messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] });
+check("estimateTokens: default counts forwarded thinking", estOn > estWithout, true);
+check("estimateTokens: opted-out estimate equals thinking-less body", estOff, estWithout);
+const estDropped = estimateTokens({ messages: [
+  { role: "assistant", content: [{ type: "thinking", thinking: "q".repeat(400) }] },
+  { role: "user", content: [{ type: "thinking", thinking: "r".repeat(400) }] },
+] });
+const estSameShell = estimateTokens({ messages: [
+  { role: "assistant", content: [] },
+  { role: "user", content: [] },
+] });
+check("estimateTokens: dropped thinking does not count", estDropped, estSameShell);
+const estAdvBase = estimateTokens({ messages: [
+  { role: "assistant", content: [{ type: "advisor_tool_result", tool_use_id: "t", content: "advice" }] },
+] });
+const estAdv = estimateTokens({ messages: [
+  { role: "assistant", content: [
+    { type: "advisor_tool_result", tool_use_id: "t", content: "advice" },
+    { type: "thinking", thinking: "w".repeat(400) },
+  ] },
+] });
+check("estimateTokens: advisor-anchored thinking counts", estAdv > estAdvBase, true);
 
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }
