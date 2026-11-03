@@ -309,6 +309,27 @@ Mechanically, the wrapper exports `ANTHROPIC_BASE_URL=http://127.0.0.1:4192/anth
 
 `openai` mode is the default because pass-through loses something Claude Code relies on (see below), which the translation layer supplies. Use `openai` mode unless you have a reason not to.
 
+One thing pass-through can carry that the translator structurally cannot: Anthropic features whose
+wire fields must round-trip unchanged, such as the server-side auto-mode classifier checks
+(`safeguards` request field in, `safeguard_results` out). The gateway forwards every
+`anthropic-*` request header as an open list and preserves the request's query string
+(`/v1/messages?beta=true`), never an allowlist: Claude Code pairs each new capability with new
+headers/fields, and pinning the known set strips the next one on the release that ships it (per
+Anthropic's gateway compatibility guide). **The honest caveat: Corti's `/anthropic` endpoint is
+not Anthropic's API, so the no-charge server-side checks exist only if Corti implements them —
+compliance is necessary, not sufficient.** Whether the checks run is upstream, not gateway;
+pass-through mode leaves `CLAUDE_CODE_AUTO_MODE_SERVER` untouched (a user-set value wins) so
+Claude Code negotiates with the endpoint directly and falls back to its own notice if they
+don't.
+
+`openai` mode is the reverse and deliberate: the translator rewrites bodies to the OpenAI wire
+format, so the `safeguards`/`safeguard_results` pair can't survive it. The wrapper therefore
+defaults `CLAUDE_CODE_AUTO_MODE_SERVER` to `0` — Claude Code's documented fallback for a gateway
+that can't provide server-side checks. The notice ("this session isn't eligible…") never appears
+and no action is held on it; classifier sidecalls stay client-side, billed as before, and keep
+working through the gateway's `</block>` verdict recovery (B1/B2 in `translate.mjs`). An
+explicitly set value wins — the mode sets the default only.
+
 Use `anthropic` mode to escape-hatch a translation bug, or as a comparison harness: run `corti-bridge` and `corti-bridge --anthropic` **at the same time**. Both write to the same debug log, so the two modes interleave by timestamp in one file — compare by request id rather than diffing two logs from two gateway lifetimes.
 
 The cost is specific and worth knowing before you reach for it: Corti's `/anthropic` endpoint drops input-token accounting on streaming responses. `message_start` reports `usage: {"input_tokens": 0, "output_tokens": 0}` and `message_delta` carries only `output_tokens` — no input count, no cache fields. Claude Code always streams, so in this mode every transcript records zero input tokens and context/cost readouts stop working. Non-streaming requests to the same endpoint return full usage, so no request parameter fixes it. Tool use is unaffected.

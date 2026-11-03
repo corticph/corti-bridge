@@ -166,6 +166,20 @@ function wantsNoAdvisor(req) {
   return typeof token === "string" && token.includes("-noadvisor-");
 }
 
+// Every anthropic-* request header, passed through to Corti's /anthropic upstream as an open
+// list: anthropic-version (defaulting like the API), anthropic-beta, and whatever arrives next.
+// The gateway compatibility guide is explicit that allowlisting the known set strips the next
+// capability's header on the release that introduces it; auto-mode server-side classifier
+// checks ("safeguards" body field in, "safeguard_results" out) ride exactly this path.
+function anthropicHeaders(headers) {
+  const out = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (/^anthropic-/.test(key) && typeof value === "string") out[key] = value;
+  }
+  if (!("anthropic-version" in out)) out["anthropic-version"] = "2023-06-01";
+  return out;
+}
+
 let warnedUnmarked = false;
 
 const server = http.createServer((req, res) => {
@@ -272,7 +286,12 @@ async function handlePassthrough(req, res, reqPath) {
   const id = ++requestId;
   const sessionFile = DEBUG ? sessionLogFile(req) : null;
   const isCountTokens = reqPath.startsWith("/v1/messages/count_tokens");
-  const target = isCountTokens ? null : new URL(`${UPSTREAM_ANTHROPIC}${reqPath}`);
+  // Claude Code posts to "/v1/messages?beta=true"; splitPath drops the query, so re-attach it.
+  // Pass-through means the URL arrives upstream exactly as the client built it.
+  const query = (req.url ?? "").split("?")[1] ?? "";
+  const target = isCountTokens
+    ? null
+    : new URL(`${UPSTREAM_ANTHROPIC}${reqPath}${query ? `?${query}` : ""}`);
 
   let body = await rawBody(req);
   const started = Date.now();
@@ -317,9 +336,10 @@ async function handlePassthrough(req, res, reqPath) {
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${BEARER}`,
-        "anthropic-version": req.headers["anthropic-version"] ?? "2023-06-01",
         "content-length": body.length,
-        ...(req.headers["anthropic-beta"] && { "anthropic-beta": req.headers["anthropic-beta"] }),
+        // Every anthropic-* header, open list — see anthropicHeaders() for why this must
+        // never become an allowlist.
+        ...anthropicHeaders(req.headers),
       },
     },
     (upstream) => {
