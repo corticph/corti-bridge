@@ -83,10 +83,19 @@ const s = https.createServer(
     req.resume();
     req.on("end", () => {
       res.writeHead(200, { "content-type": "application/json" });
-      if (req.url.startsWith("/anthropic/"))
+      if (req.url.startsWith("/anthropic/")) {
+        // Echo what actually reached upstream: full path (query included), every
+        // anthropic-* header, and the bearer — the pass-through assertions below prove
+        // open-list header forwarding and the auth swap (client token discarded,
+        // CORTI_BEARER substituted) off this echo.
+        const eh = {};
+        for (const [k, v] of Object.entries(req.headers))
+          if (/^anthropic-/.test(k)) eh[k] = v;
         return res.end(JSON.stringify({ id: "m", type: "message", role: "assistant",
           content: [{ type: "text", text: "ANTHROPIC" }], model: "corti-s1",
-          stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } }));
+          stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 },
+          echo: { url: req.url, anthropicHeaders: eh, authorization: req.headers.authorization } }));
+      }
       res.end(JSON.stringify({ id: "c", choices: [{ index: 0,
         message: { role: "assistant", content: "OPENAI" }, finish_reason: "stop" }],
         usage: { prompt_tokens: 1, completion_tokens: 1 } }));
@@ -128,6 +137,34 @@ check "openai route emits a translated Anthropic message envelope" \
   "$(post /v1/messages | grep -c '"type":"message"')" "1"
 check "pass-through route returns upstream bytes untranslated" \
   "$(post /anthropic/v1/messages | grep -c '"id":"m"')" "1"
+
+# Pass-through forwards as an open list: every anthropic-* request header the client sent
+# (including ones the gateway does not know, like a future auto-mode/safeguards one) plus the
+# request's query string must arrive upstream exactly as built. The upstream stub echoes both.
+PT_RESP=$(curl -s -m 10 -H 'content-type: application/json' -H 'authorization: Bearer victim-token' \
+  -H 'anthropic-version: 2023-06-01' -H 'anthropic-beta: interleaved-thinking-s-2025-05-14' \
+  -H 'anthropic-safeguards: future-capability' -d "$BODY" "$G/anthropic/v1/messages?beta=true")
+check "passthrough: query string preserved on the upstream URL" \
+  "$(printf '%s' "$PT_RESP" | grep -c '"url":"/anthropic/v1/messages?beta=true"')" "1"
+check "passthrough: anthropic-beta forwarded verbatim" \
+  "$(printf '%s' "$PT_RESP" | grep -c '"anthropic-beta":"interleaved-thinking-s-2025-05-14"')" "1"
+check "passthrough: unknown anthropic-* header forwarded (open list)" \
+  "$(printf '%s' "$PT_RESP" | grep -c '"anthropic-safeguards":"future-capability"')" "1"
+# Defaulted when the client omits it — the upstream needs a version either way. The exact
+# url match is the regression tripwire for a no-query request growing a garbage query
+# (an indexOf/slice(-1) extraction would append "?/anthropic/v1/messages").
+PT_NOVER=$(curl -s -m 10 -H 'content-type: application/json' -d "$BODY" "$G/anthropic/v1/messages")
+check "passthrough: no-query request reaches upstream with no query" \
+  "$(printf '%s' "$PT_NOVER" | grep -c '"url":"/anthropic/v1/messages"')" "1"
+check "passthrough: anthropic-version defaulted upstream" \
+  "$(printf '%s' "$PT_NOVER" | grep -c '"anthropic-version":"2023-06-01"')" "1"
+# Auth swap: the client's token is always discarded, only CORTI_BEARER ("test" in this
+# suite) goes upstream. The stub echoes the bearer it actually received; a client-sent
+# victim token proves substitution rather than mere presence.
+check "passthrough: client token swapped for CORTI_BEARER upstream" \
+  "$(printf '%s' "$PT_RESP" | grep -c '"authorization":"Bearer test"')" "1"
+check "passthrough: client's own token never reaches upstream" \
+  "$(printf '%s' "$PT_RESP" | grep -c '"authorization":"Bearer victim-token"')" "0"
 
 # Prefix matching is anchored: these must NOT be treated as pass-through.
 check "/v1/anthropic/messages stays on the openai route" "$(code /v1/anthropic/messages)" "404"

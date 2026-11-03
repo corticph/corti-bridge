@@ -384,6 +384,40 @@ _wle_uw="$(CORTI_DIR="$_wle_dir" CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORC
 check "wle: unknown-window skip exported verbatim" "$_wle_uw" "1"
 rm -rf "$_wle_dir"
 
+# --- mode env: auto-mode server checks off on openai, anthropic mode respects the user ---
+# The translator cannot round-trip the server-side classifier request/reply ("safeguards" body
+# field in, "safeguard_results" out), so openai mode defaults CLAUDE_CODE_AUTO_MODE_SERVER to 0
+# (Claude Code's documented fallback: stop asking, never show the not-eligible notice). The
+# anthropic pass-through forwards both directions unchanged, so it leaves the variable alone.
+# A user-set value wins in both modes — the mode sets the default only. The block is
+# extracted from the wrapper's launch path so the test does not run claude.
+_ams_fn="$(sed -n '/^if \[ "\$want_mode" = anthropic \]; then$/,/^fi$/p' "$REPO/bin/corti-bridge")"
+_ams_openai="$(GATEWAY=http://127.0.0.1:1 want_mode=openai sh -c '
+  set -eu
+  eval "$1"
+  printf "%s" "${CLAUDE_CODE_AUTO_MODE_SERVER:-}"
+' sh "$_ams_fn" 2>/dev/null)"
+check "mode env: openai mode defaults auto-mode server checks off" "$_ams_openai" "0"
+_ams_override="$(GATEWAY=http://127.0.0.1:1 want_mode=openai CLAUDE_CODE_AUTO_MODE_SERVER=1 sh -c '
+  set -eu
+  eval "$1"
+  printf "%s" "${CLAUDE_CODE_AUTO_MODE_SERVER:-}"
+' sh "$_ams_fn" 2>/dev/null)"
+check "mode env: openai mode respects a user-set value" "$_ams_override" "1"
+_ams_anthropic="$(GATEWAY=http://127.0.0.1:1 want_mode=anthropic CLAUDE_CODE_AUTO_MODE_SERVER=0 sh -c '
+  set -eu
+  eval "$1"
+  printf "%s" "${CLAUDE_CODE_AUTO_MODE_SERVER:-}"
+' sh "$_ams_fn" 2>/dev/null)"
+check "mode env: anthropic mode leaves the variable untouched" "$_ams_anthropic" "0"
+_ams_unset="$(GATEWAY=http://127.0.0.1:1 want_mode=anthropic sh -c '
+  set -eu
+  eval "$1"
+  printf "%s" "${CLAUDE_CODE_AUTO_MODE_SERVER:-}"
+' sh "$_ams_fn" 2>/dev/null)"
+check "mode env: anthropic mode does not set the variable" "$_ams_unset" ""
+unset _ams_fn _ams_openai _ams_override _ams_anthropic _ams_unset
+
 printf '\n'
 if [ "$FAILED" -eq 0 ]; then
   printf 'all checks passed\n'

@@ -539,8 +539,25 @@ fi
 # The gateway serves both, so nothing about it has to change.
 if [ "$want_mode" = anthropic ]; then
     export ANTHROPIC_BASE_URL="$GATEWAY/anthropic"
+    # Pass-through forwards body fields untouched (safeguards in, safeguard_results out), so
+    # Claude Code is free to ask Corti's /anthropic endpoint for server-side classifier checks.
+    # A user-set CLAUDE_CODE_AUTO_MODE_SERVER is respected, not wiped — the mode governs the
+    # default only.
+    :
 else
     export ANTHROPIC_BASE_URL="$GATEWAY"
+    # The translator rewrites bodies to OpenAI wire format: an anthropic-mode "safeguards"
+    # request field can't round-trip, and server-side checks would never see the request.
+    # Claude Code's documented fallback for a gateway that can't provide them is to stop
+    # asking — the notice ("this session isn't eligible...") then never appears and actions
+    # are never held on it. Classifier sidecalls stay client-side, billed as before; the
+    # gateway already recovers their </block> verdicts from the reasoning channel (B1/B2).
+    # An explicitly set value still wins: the mode sets the default only, so a user who
+    # wants the notice (or the server checks attempt) can opt back in with
+    # CLAUDE_CODE_AUTO_MODE_SERVER=1.
+    if [ -z "${CLAUDE_CODE_AUTO_MODE_SERVER:-}" ]; then
+        export CLAUDE_CODE_AUTO_MODE_SERVER=0
+    fi
 fi
 # The gateway discards this token; the suffixes exist only so it can tell the mode and
 # the advisor-noinject marker apart. Placed before the mode suffix so modeMarker still
