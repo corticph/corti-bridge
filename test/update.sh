@@ -45,7 +45,7 @@ git -C "$SCRATCH/up" push -q origin main
 git clone -q "$SCRATCH/origin.git" "$SCRATCH/clone"
 
 # A stub claude: on PATH, exits cleanly, prints a marker so a forbidden fall-through is detectable.
-printf '#!/bin/sh\necho "STUB-CLAUDE $*"\nexit 0\n' > "$SCRATCH/bin/claude"
+printf '#!/bin/sh\necho "STUB-CLAUDE $*"\necho "STUB-ENV auto-mode-server=${CLAUDE_CODE_AUTO_MODE_SERVER-unset}"\nexit 0\n' > "$SCRATCH/bin/claude"
 chmod +x "$SCRATCH/bin/claude"
 
 CLONE="$SCRATCH/clone"
@@ -340,6 +340,12 @@ git -C "$CLONE" checkout -q wip
 check "doctor completes its report on a feature branch" \
     "$(sh "$BRIDGE" doctor | grep -c '^Summary:')" "1"
 git -C "$CLONE" checkout -q main
+
+# Corti never answers the server-side auto-mode review, so the wrapper routes it client-side.
+check "launch: auto-mode review defaults to Claude Code's own classifier" \
+    "$(CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" 2>/dev/null | grep -c 'auto-mode-server=0$' || :)" "1"
+check "launch: an explicit CLAUDE_CODE_AUTO_MODE_SERVER is kept" \
+    "$(CLAUDE_CODE_AUTO_MODE_SERVER=1 CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" 2>/dev/null | grep -c 'auto-mode-server=1$' || :)" "1"
 
 if [ "$FAILED" -gt 0 ]; then
     printf '\n%s check(s) failed\n' "$FAILED"
