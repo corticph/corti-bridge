@@ -152,10 +152,14 @@ check "passthrough: unknown anthropic-* header forwarded (open list)" \
   "$(printf '%s' "$PT_RESP" | grep -c '"anthropic-safeguards":"future-capability"')" "1"
 # Defaulted when the client omits it — the upstream needs a version either way. The exact
 # url match is the regression tripwire for a no-query request growing a garbage query
-# (an indexOf/slice(-1) extraction would append "?/anthropic/v1/messages").
+# (an indexOf of -1 fed straight into slice would append "?/anthropic/v1/messages").
 PT_NOVER=$(curl -s -m 10 -H 'content-type: application/json' -d "$BODY" "$G/anthropic/v1/messages")
 check "passthrough: no-query request reaches upstream with no query" \
   "$(printf '%s' "$PT_NOVER" | grep -c '"url":"/anthropic/v1/messages"')" "1"
+# A raw "?" is legal inside a query; splitting on every "?" would drop the tail.
+PT_QQ=$(curl -s -m 10 -H 'content-type: application/json' -d "$BODY" "$G/anthropic/v1/messages?beta=true&cb=x?y=1")
+check "passthrough: query with a second ? arrives whole" \
+  "$(printf '%s' "$PT_QQ" | grep -c '"url":"/anthropic/v1/messages?beta=true&cb=x?y=1"')" "1"
 check "passthrough: anthropic-version defaulted upstream" \
   "$(printf '%s' "$PT_NOVER" | grep -c '"anthropic-version":"2023-06-01"')" "1"
 # Auth swap: the client's token is always discarded, only CORTI_BEARER ("test" in this

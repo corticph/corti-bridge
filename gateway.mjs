@@ -287,7 +287,9 @@ async function handlePassthrough(req, res, reqPath) {
   const isCountTokens = reqPath.startsWith("/v1/messages/count_tokens");
   // Claude Code posts to "/v1/messages?beta=true"; splitPath drops the query, so re-attach it.
   // Pass-through means the URL arrives upstream exactly as the client built it.
-  const query = (req.url ?? "").split("?")[1] ?? "";
+  const url = req.url ?? "";
+  const qi = url.indexOf("?");
+  const query = qi === -1 ? "" : url.slice(qi + 1);
   const target = isCountTokens
     ? null
     : new URL(`${UPSTREAM_ANTHROPIC}${reqPath}${query ? `?${query}` : ""}`);
