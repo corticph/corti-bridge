@@ -169,8 +169,7 @@ function wantsNoAdvisor(req) {
 // Every anthropic-* request header, passed through to Corti's /anthropic upstream as an open
 // list: anthropic-version (defaulting like the API), anthropic-beta, and whatever arrives next.
 // The gateway compatibility guide is explicit that allowlisting the known set strips the next
-// capability's header on the release that introduces it; auto-mode server-side classifier
-// checks ("safeguards" body field in, "safeguard_results" out) ride exactly this path.
+// capability's header on the release that introduces it.
 function anthropicHeaders(headers) {
   const out = {};
   for (const [key, value] of Object.entries(headers)) {
@@ -288,7 +287,9 @@ async function handlePassthrough(req, res, reqPath) {
   const isCountTokens = reqPath.startsWith("/v1/messages/count_tokens");
   // Claude Code posts to "/v1/messages?beta=true"; splitPath drops the query, so re-attach it.
   // Pass-through means the URL arrives upstream exactly as the client built it.
-  const query = (req.url ?? "").split("?")[1] ?? "";
+  const url = req.url ?? "";
+  const qi = url.indexOf("?");
+  const query = qi === -1 ? "" : url.slice(qi + 1);
   const target = isCountTokens
     ? null
     : new URL(`${UPSTREAM_ANTHROPIC}${reqPath}${query ? `?${query}` : ""}`);
