@@ -45,7 +45,7 @@ git -C "$SCRATCH/up" push -q origin main
 git clone -q "$SCRATCH/origin.git" "$SCRATCH/clone"
 
 # A stub claude: on PATH, exits cleanly, prints a marker so a forbidden fall-through is detectable.
-printf '#!/bin/sh\necho "STUB-CLAUDE $*"\nexit 0\n' > "$SCRATCH/bin/claude"
+printf '#!/bin/sh\necho "STUB-CLAUDE $*"\necho "STUB-ENV auto-mode-server=${CLAUDE_CODE_AUTO_MODE_SERVER-unset}"\necho "STUB-ENV auto-mode-model=${CLAUDE_CODE_AUTO_MODE_MODEL-unset}"\nexit 0\n' > "$SCRATCH/bin/claude"
 chmod +x "$SCRATCH/bin/claude"
 
 CLONE="$SCRATCH/clone"
@@ -340,6 +340,21 @@ git -C "$CLONE" checkout -q wip
 check "doctor completes its report on a feature branch" \
     "$(sh "$BRIDGE" doctor | grep -c '^Summary:')" "1"
 git -C "$CLONE" checkout -q main
+
+# Corti never answers the server-side auto-mode review, so the wrapper routes it client-side.
+check "launch: auto-mode review defaults to Claude Code's own classifier" \
+    "$(unset CLAUDE_CODE_AUTO_MODE_SERVER; CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" 2>/dev/null | grep -c 'auto-mode-server=0$' || :)" "1"
+check "launch: an explicit CLAUDE_CODE_AUTO_MODE_SERVER is kept" \
+    "$(CLAUDE_CODE_AUTO_MODE_SERVER=1 CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" 2>/dev/null | grep -c 'auto-mode-server=1$' || :)" "1"
+check "launch: anthropic mode also routes the review client-side" \
+    "$(unset CLAUDE_CODE_AUTO_MODE_SERVER; CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" --anthropic 2>/dev/null | grep -c 'auto-mode-server=0$' || :)" "1"
+# Corti's /anthropic drops reasoning, so only that mode moves the classifier to the instant haiku tier.
+check "launch: anthropic mode classifies on the haiku tier" \
+    "$(unset CLAUDE_CODE_AUTO_MODE_MODEL; ANTHROPIC_DEFAULT_HAIKU_MODEL=test-instant CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" --anthropic 2>/dev/null | grep -c 'auto-mode-model=test-instant$' || :)" "1"
+check "launch: an explicit CLAUDE_CODE_AUTO_MODE_MODEL is kept" \
+    "$(CLAUDE_CODE_AUTO_MODE_MODEL=mine ANTHROPIC_DEFAULT_HAIKU_MODEL=test-instant CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" --anthropic 2>/dev/null | grep -c 'auto-mode-model=mine$' || :)" "1"
+check "launch: openai mode leaves the classifier model alone" \
+    "$(unset CLAUDE_CODE_AUTO_MODE_MODEL; ANTHROPIC_DEFAULT_HAIKU_MODEL=test-instant CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" 2>/dev/null | grep -c 'auto-mode-model=unset$' || :)" "1"
 
 if [ "$FAILED" -gt 0 ]; then
     printf '\n%s check(s) failed\n' "$FAILED"

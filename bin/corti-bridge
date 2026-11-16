@@ -539,6 +539,11 @@ fi
 # The gateway serves both, so nothing about it has to change.
 if [ "$want_mode" = anthropic ]; then
     export ANTHROPIC_BASE_URL="$GATEWAY/anthropic"
+    # Corti's /anthropic drops reasoning, so a reasoning classifier returns empty at max_tokens
+    # and every auto-mode check fails. The haiku tier is the non-reasoning instant model.
+    if [ -n "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" ]; then
+        export CLAUDE_CODE_AUTO_MODE_MODEL="${CLAUDE_CODE_AUTO_MODE_MODEL:-$ANTHROPIC_DEFAULT_HAIKU_MODEL}"
+    fi
 else
     export ANTHROPIC_BASE_URL="$GATEWAY"
 fi
@@ -568,6 +573,9 @@ export CLAUDE_CODE_DISABLE_ARTIFACT=1
 # plugins, Projects, /bug, /feedback — not just the usage-analytics POST.
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 unset CLAUDE_CODE_ENABLE_DESIGN_SYNC
+# Corti never answers auto mode's server-side check (`safeguards`), so actions get no verdict.
+# 0 is Anthropic's documented gateway opt-out: Claude Code runs its own classifier through us.
+export CLAUDE_CODE_AUTO_MODE_SERVER="${CLAUDE_CODE_AUTO_MODE_SERVER:-0}"
 
 # exec is the normal path: the wrapper's job is done and it should get out of the way. It is
 # given up only when a notice is waiting, because printing one means outliving the session.
