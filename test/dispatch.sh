@@ -139,8 +139,8 @@ check "pass-through route returns upstream bytes untranslated" \
   "$(post /anthropic/v1/messages | grep -c '"id":"m"')" "1"
 
 # Pass-through forwards as an open list: every anthropic-* request header the client sent
-# (including ones the gateway does not know, like a future auto-mode/safeguards one) plus the
-# request's query string must arrive upstream exactly as built. The upstream stub echoes both.
+# (including ones the gateway does not know yet) plus the request's query string must arrive
+# upstream exactly as built. The upstream stub echoes both.
 PT_RESP=$(curl -s -m 10 -H 'content-type: application/json' -H 'authorization: Bearer victim-token' \
   -H 'anthropic-version: 2023-06-01' -H 'anthropic-beta: interleaved-thinking-s-2025-05-14' \
   -H 'anthropic-safeguards: future-capability' -d "$BODY" "$G/anthropic/v1/messages?beta=true")

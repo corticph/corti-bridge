@@ -169,8 +169,7 @@ function wantsNoAdvisor(req) {
 // Every anthropic-* request header, passed through to Corti's /anthropic upstream as an open
 // list: anthropic-version (defaulting like the API), anthropic-beta, and whatever arrives next.
 // The gateway compatibility guide is explicit that allowlisting the known set strips the next
-// capability's header on the release that introduces it; auto-mode server-side classifier
-// checks ("safeguards" body field in, "safeguard_results" out) ride exactly this path.
+// capability's header on the release that introduces it.
 function anthropicHeaders(headers) {
   const out = {};
   for (const [key, value] of Object.entries(headers)) {
