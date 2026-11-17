@@ -47,6 +47,27 @@ function webSearchCacheMap(sessionId) {
 
 export function _resetWebSearchCache() { webSearchBySession.clear(); }
 
+/** Per-session pin: tool name -> its first rendered ToolSearch definition. A past ToolSearch
+ *  result must keep its bytes when the harness later drops or edits the tool (A1). */
+const TOOL_RENDER_CACHE_CAP = 64;
+const TOOL_RENDER_PER_SESSION = 512;
+const toolRenderBySession = new Map();
+
+function toolRenderMemo(sessionId) {
+  if (!sessionId) return undefined;
+  let map = toolRenderBySession.get(sessionId);
+  if (!map) {
+    if (toolRenderBySession.size >= TOOL_RENDER_CACHE_CAP)
+      toolRenderBySession.delete(toolRenderBySession.keys().next().value);
+    map = new Map();
+    toolRenderBySession.set(sessionId, map);
+  }
+  if (map.size >= TOOL_RENDER_PER_SESSION) map.delete(map.keys().next().value);
+  return map;
+}
+
+export function _resetToolRenderCache() { toolRenderBySession.clear(); }
+
 /** Per-session cache: image key -> text description. A described image must produce the same
  *  bytes every turn, else the prefix cache collapses (A1) — same failure mode as WebSearch. Key is
  *  a SHA-256 of the image data, however the image arrived (paste or tool result). No
@@ -945,12 +966,12 @@ function blocksOf(content) {
 }
 
 // tool_reference blocks (ToolSearch) carry no text of their own: render the referenced tools.
-function toolResultText(block, byName) {
+function toolResultText(block, byName, memo) {
   const c = block.content;
   if (typeof c === "string") return c;
   if (Array.isArray(c)) {
     const parts = c.filter((b) => b && b.type === "text" && typeof b.text === "string").map((b) => b.text);
-    const refs = renderToolReferences(c, byName);
+    const refs = renderToolReferences(c, byName, memo);
     if (refs) parts.push(refs);
     return parts.join("\n\n");
   }
@@ -1014,6 +1035,7 @@ export async function translateRequest(body, opts) {
 
   const messages = [];
   const byName = toolsByName(body.tools);
+  const renderMemo = toolRenderMemo(opts?.parentSessionId);
   let pendingCalls = [];
   // Consults this session already made, put back before anything walks the history.
   const history = restoreAdvisorGuidance(opts?.parentSessionId, body.messages);
@@ -1104,7 +1126,7 @@ export async function translateRequest(body, opts) {
 
       for (const b of rawBlocks) {
         if (b.type === "tool_result") {
-          let text = toolResultText(b, byName);
+          let text = toolResultText(b, byName, renderMemo);
           const imgs = toolResultImages(b);
 
           if (imgs.length) {

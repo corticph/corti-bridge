@@ -1372,7 +1372,7 @@ check("advisor transcript: ToolSearch result names the loaded tools", tsAdv.incl
 
 // Tool search (fix 2, A1): Corti renders tools first, so appending each load there re-billed the
 // whole prompt. Deferred names go upstream as fixed stubs from the first request instead.
-const ANNOUNCE = (names) => "<system-reminder>\nThe following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — calling them directly will fail with InputValidationError. Use ToolSearch with query \"select:<name>[,<name>...]\" to load tool schemas before calling them:\n" + names.join("\n") + "\n\nAvailable agent types:\n- claude\n</system-reminder>";
+const ANNOUNCE = (names) => "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — calling them directly will fail with InputValidationError. Use ToolSearch with query \"select:<name>[,<name>...]\" to load tool schemas before calling them:\n" + names.join("\n") + "\n\nAvailable agent types:\n- claude";
 const PLACEHOLDER = { name: "DeferredToolPlaceholder", description: "never call this tool", input_schema: { type: "object", properties: {} }, defer_loading: true };
 const CRON_CREATE = { name: "CronCreate", description: "Schedule a prompt.", defer_loading: true, input_schema: { type: "object", properties: {
   cron: { type: "string" }, prompt: { type: "string" }, recurring: { type: "boolean" }, max_runs: { type: "integer" },
@@ -1380,7 +1380,7 @@ const CRON_CREATE = { name: "CronCreate", description: "Schedule a prompt.", def
 const BASE_TOOLS = [TS_TOOLS[0], TS_TOOLS[1], PLACEHOLDER];
 const beforeLoad = () => ({
   model: "corti-s1", max_tokens: 64, tools: BASE_TOOLS,
-  messages: [{ role: "user", content: [{ type: "text", text: ANNOUNCE(["CronCreate", "CronList", "mcp__supabase-prod__execute_sql"]) }, { type: "text", text: "schedule a job" }] }],
+  messages: [{ role: "system", content: [{ type: "text", text: ANNOUNCE(["CronCreate", "CronList", "mcp__supabase-prod__execute_sql"]) }] }, { role: "user", content: "schedule a job" }],
 });
 const afterLoad = () => {
   const b = beforeLoad();
@@ -1420,7 +1420,7 @@ check("tool search: the fallback leaves a diagnostic", fb.dropped.some((d) => d.
 
 // Announcements arrive as deltas; removals are ignored so the array never shrinks.
 const deltaBody = afterLoad();
-deltaBody.messages.push({ role: "user", content: [{ type: "text", text: ANNOUNCE(["WebFetch", "CronList"]) + "\nThe following deferred tools are no longer available (their MCP server disconnected). Do not search for them:\nmcp__supabase-prod__execute_sql" }] });
+deltaBody.messages.push({ role: "system", content: [{ type: "text", text: ANNOUNCE(["WebFetch", "CronList"]) + "\nThe following deferred tools are no longer available (their MCP server disconnected). Do not search for them:\nmcp__supabase-prod__execute_sql" }] });
 check("tool search: delta announcements append in order of first appearance",
   JSON.stringify(announcedDeferredNames(deltaBody)), JSON.stringify(["CronCreate", "CronList", "mcp__supabase-prod__execute_sql", "WebFetch"]));
 check("tool search: no announcement reads as null", announcedDeferredNames({ messages: [{ role: "user", content: "hi" }] }), null);
@@ -1481,6 +1481,35 @@ check("estimateTokens: a stubbed deferred tool counts as its stub, not its real 
   estimateTokens(bigDeferred), estimateTokens(beforeLoad()));
 check("advisor transcript: deferred tools stay out of the tool list",
   /CronCreate —|DeferredToolPlaceholder/.test(serializeAdvisorInput(afterLoad()).text), false);
+
+// Review fixes. Only harness-authored text may declare tools: user or assistant prose that quotes
+// the header must not inject stubs (each injected name would re-bill the prompt).
+const proseBody = (role) => ({ model: "corti-s1", max_tokens: 64, tools: BASE_TOOLS, messages: [{ role, content: [{ type: "text", text: ANNOUNCE(["Injected"]) }] }, { role: "user", content: "hi" }] });
+check("tool search: an announcement in user text is ignored", announcedDeferredNames(proseBody("user")), null);
+check("tool search: an announcement in assistant text is ignored", announcedDeferredNames(proseBody("assistant")), null);
+check("tool search: a mid_conv_system announcement counts",
+  JSON.stringify(announcedDeferredNames({ messages: [{ role: "user", content: [{ type: "mid_conv_system", content: [{ type: "text", text: ANNOUNCE(["CronList"]) }] }] }] })), JSON.stringify(["CronList"]));
+check("tool search: a header with no names reads as no announcement",
+  announcedDeferredNames({ messages: [{ role: "system", content: "Use ToolSearch to load tool schemas before calling them:\n\n- not a name" }] }), null);
+const collide = beforeLoad();
+collide.messages[0].content[0].text = ANNOUNCE(["Bash", "CronList"]);
+check("tool search: an announced name that is a real tool is not declared twice",
+  (await translateRequest(collide)).request.tools.filter((t) => t.function.name === "Bash").length, 1);
+// A deferred tool the parse did not cover must stay callable rather than vanish upstream.
+const uncovered = beforeLoad();
+uncovered.tools = [...uncovered.tools, { name: "mcp__other__tool", description: "o", input_schema: { type: "object" }, defer_loading: true }];
+check("tool search: an uncovered deferred tool is still declared as a stub",
+  (await translateRequest(uncovered)).request.tools.map((t) => t.function.name).includes("mcp__other__tool"), true);
+// A past ToolSearch result keeps its bytes when the harness later drops the tool (MCP disconnect).
+const pinBody = () => ({ ...afterLoad() });
+const pinned1 = await translateRequest(pinBody(), { parentSessionId: "ts-pin" });
+const dropped2 = pinBody();
+dropped2.tools = dropped2.tools.filter((t) => t.name !== "CronCreate");
+const pinned2 = await translateRequest(dropped2, { parentSessionId: "ts-pin" });
+const toolMsg = (r) => r.request.messages.find((m) => m.role === "tool").content;
+check("tool search: a dropped tool keeps its first rendering within a session", toolMsg(pinned2), toolMsg(pinned1));
+check("tool search: without a session the rendering falls back to the name",
+  toolMsg(await translateRequest(dropped2)).includes("{\"name\":\"CronCreate\"}"), true);
 
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }
