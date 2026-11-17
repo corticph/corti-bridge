@@ -11,6 +11,7 @@ node --input-type=module -e '
 import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache, _resetImageCache, estimateTokens } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 import { resolveVisionModel, VISION_DEFAULT, VISION_TIERS } from "'"$REPO"'/lib/vision.mjs";
+import { announcedDeferredNames, coerceStubInput, DEFERRED_STUB_DESCRIPTION } from "'"$REPO"'/lib/tool-search.mjs";
 
 let failed = 0;
 const check = (name, got, want) => {
@@ -1368,6 +1369,118 @@ check("estimateTokens: counts rendered tool references",
   estimateTokens(tsBody()) > estimateTokens({ ...tsBody(), messages: tsBody().messages.slice(0, 2).concat([{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ts", content: [] }] }]) }), true);
 const tsAdv = serializeAdvisorInput(tsBody()).text;
 check("advisor transcript: ToolSearch result names the loaded tools", tsAdv.includes("[ToolSearch loaded: CronList]"), true);
+
+// Tool search (fix 2, A1): Corti renders tools first, so appending each load there re-billed the
+// whole prompt. Deferred names go upstream as fixed stubs from the first request instead.
+const ANNOUNCE = (names) => "<system-reminder>\nThe following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — calling them directly will fail with InputValidationError. Use ToolSearch with query \"select:<name>[,<name>...]\" to load tool schemas before calling them:\n" + names.join("\n") + "\n\nAvailable agent types:\n- claude\n</system-reminder>";
+const PLACEHOLDER = { name: "DeferredToolPlaceholder", description: "never call this tool", input_schema: { type: "object", properties: {} }, defer_loading: true };
+const CRON_CREATE = { name: "CronCreate", description: "Schedule a prompt.", defer_loading: true, input_schema: { type: "object", properties: {
+  cron: { type: "string" }, prompt: { type: "string" }, recurring: { type: "boolean" }, max_runs: { type: "integer" },
+  labels: { type: "array", items: { type: "string" } }, opts: { type: "object" } }, required: ["cron", "prompt"] } };
+const BASE_TOOLS = [TS_TOOLS[0], TS_TOOLS[1], PLACEHOLDER];
+const beforeLoad = () => ({
+  model: "corti-s1", max_tokens: 64, tools: BASE_TOOLS,
+  messages: [{ role: "user", content: [{ type: "text", text: ANNOUNCE(["CronCreate", "CronList", "mcp__supabase-prod__execute_sql"]) }, { type: "text", text: "schedule a job" }] }],
+});
+const afterLoad = () => {
+  const b = beforeLoad();
+  b.tools = [...BASE_TOOLS.slice(0, 2), CRON_CREATE, PLACEHOLDER];
+  b.messages.push(
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_s1", name: "ToolSearch", input: { query: "select:CronCreate" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_s1", content: [{ type: "tool_reference", tool_name: "CronCreate" }] }] },
+  );
+  return b;
+};
+const upBefore = await translateRequest(beforeLoad());
+const upAfter = await translateRequest(afterLoad());
+check("tool search A1: upstream tools are byte-identical before and after a load",
+  JSON.stringify(upAfter.request.tools), JSON.stringify(upBefore.request.tools));
+check("tool search A1: earlier upstream messages are byte-identical after a load",
+  JSON.stringify(upAfter.request.messages.slice(0, upBefore.request.messages.length)), JSON.stringify(upBefore.request.messages));
+const upNames = upBefore.request.tools.map((t) => t.function.name).join(",");
+check("tool search: every announced name is declared, real tools first", upNames, "Bash,ToolSearch,CronCreate,CronList,mcp__supabase-prod__execute_sql");
+check("tool search: the placeholder never goes upstream", upNames.includes("DeferredToolPlaceholder"), false);
+const tsStub = upAfter.request.tools.find((t) => t.function.name === "CronCreate").function;
+check("tool search: a loaded tool stays a stub upstream", JSON.stringify([tsStub.description, tsStub.parameters]), JSON.stringify([DEFERRED_STUB_DESCRIPTION, { type: "object" }]));
+check("tool search: the loaded definition reaches the model inline",
+  upAfter.request.messages.find((m) => m.role === "tool").content.includes("\"name\":\"CronCreate\",\"parameters\":{\"type\":\"object\",\"properties\":{\"cron\""), true);
+check("tool search: stub schemas map loaded tools to their real schema", upAfter.stubSchemas?.get("CronCreate"), CRON_CREATE.input_schema);
+check("tool search: unloaded stubs carry no schema to type from", upAfter.stubSchemas?.has("CronList"), false);
+check("tool search: plan state is reported", upAfter.toolSearch, "stubbed");
+check("tool search: no stub schemas before any load", upBefore.stubSchemas, undefined);
+
+// Fallback: no announcement to name the deferred tools means forwarding them as real tools.
+const fbBody = afterLoad();
+fbBody.messages[0] = { role: "user", content: "schedule a job" };
+const fb = await translateRequest(fbBody);
+check("tool search: without an announcement deferred tools go upstream as real tools",
+  fb.request.tools.find((t) => t.function.name === "CronCreate")?.function.description, "Schedule a prompt.");
+check("tool search: the fallback is reported", fb.toolSearch, "unannounced");
+check("tool search: the fallback leaves a diagnostic", fb.dropped.some((d) => d.startsWith("tool search: deferred tools without an announcement")), true);
+
+// Announcements arrive as deltas; removals are ignored so the array never shrinks.
+const deltaBody = afterLoad();
+deltaBody.messages.push({ role: "user", content: [{ type: "text", text: ANNOUNCE(["WebFetch", "CronList"]) + "\nThe following deferred tools are no longer available (their MCP server disconnected). Do not search for them:\nmcp__supabase-prod__execute_sql" }] });
+check("tool search: delta announcements append in order of first appearance",
+  JSON.stringify(announcedDeferredNames(deltaBody)), JSON.stringify(["CronCreate", "CronList", "mcp__supabase-prod__execute_sql", "WebFetch"]));
+check("tool search: no announcement reads as null", announcedDeferredNames({ messages: [{ role: "user", content: "hi" }] }), null);
+// A loaded tool no announcement named is still declared, after the announced ones.
+const lateBody = afterLoad();
+lateBody.tools = [...lateBody.tools, { name: "mcp__late__tool", description: "late", input_schema: { type: "object", properties: {} }, defer_loading: true }];
+lateBody.messages.push(
+  { role: "assistant", content: [{ type: "tool_use", id: "toolu_s2", name: "ToolSearch", input: { query: "late" } }] },
+  { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_s2", content: [{ type: "tool_reference", tool_name: "mcp__late__tool" }] }] },
+);
+check("tool search: an unannounced loaded tool is appended as a stub",
+  (await translateRequest(lateBody)).request.tools.map((t) => t.function.name).at(-1), "mcp__late__tool");
+// A deferred WebSearch is one stub, not a stub plus the proxy fallback WebSearch tool.
+const wsDeferred = beforeLoad();
+wsDeferred.messages[0].content[0].text = ANNOUNCE(["WebSearch"]);
+check("tool search: a deferred WebSearch is declared once",
+  (await translateRequest(wsDeferred)).request.tools.filter((t) => t.function.name === "WebSearch").length, 1);
+
+// Stub calls come back untyped (glm47 types an argument only from the declared schema).
+const S = CRON_CREATE.input_schema;
+check("coerceStubInput: bool, integer, array and object are typed back",
+  JSON.stringify(coerceStubInput({ cron: "* * * * *", prompt: "p", recurring: "true", max_runs: "5", labels: "[\"a\", \"b\"]", opts: "{\"x\": 1}" }, S)),
+  JSON.stringify({ cron: "* * * * *", prompt: "p", recurring: true, max_runs: 5, labels: ["a", "b"], opts: { x: 1 } }));
+check("coerceStubInput: a string property that looks like JSON stays a string", coerceStubInput({ prompt: "5" }, S).prompt, "5");
+check("coerceStubInput: a non-integer for an integer property is left for validation", coerceStubInput({ max_runs: "1.5" }, S).max_runs, "1.5");
+check("coerceStubInput: unparseable text is left for validation", coerceStubInput({ recurring: "yes" }, S).recurring, "yes");
+check("coerceStubInput: a key outside the schema is left as is", coerceStubInput({ extra: "1" }, S).extra, "1");
+check("coerceStubInput: nullable union types parse", coerceStubInput({ n: "null" }, { properties: { n: { type: ["integer", "null"] } } }).n, null);
+const typedInput = { recurring: true };
+check("coerceStubInput: already-typed input is returned unchanged", coerceStubInput(typedInput, S), typedInput);
+
+const stubCtx = { msgId: "m", requestedModel: "corti-s1", stubSchemas: upAfter.stubSchemas };
+const stubCompletion = translateCompletion({ choices: [{ message: { role: "assistant", content: null, tool_calls: [
+  { id: "c1", type: "function", function: { name: "CronCreate", arguments: "{\"cron\": \"* * * * *\", \"prompt\": \"p\", \"recurring\": \"false\", \"max_runs\": \"3\"}" } },
+  { id: "c2", type: "function", function: { name: "Bash", arguments: "{\"command\": \"true\"}" } },
+] }, finish_reason: "tool_calls" }] }, stubCtx);
+const nsCalls = stubCompletion.content.filter((b) => b.type === "tool_use");
+check("stub call (non-stream): args are typed back", JSON.stringify(nsCalls[0].input), JSON.stringify({ cron: "* * * * *", prompt: "p", recurring: false, max_runs: 3 }));
+check("stub call (non-stream): a real tool is untouched", nsCalls[1].input.command, "true");
+
+const stEvents = [];
+const st = createStreamTranslator(stubCtx, (e, d) => stEvents.push([e, d]));
+st.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "CronCreate", arguments: "" } }] } }] });
+st.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: "{\"cron\": \"* * * * *\", \"prompt\": \"p\", " } }] } }] });
+st.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: "\"recurring\": \"true\"}" } }] } }] });
+st.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 1, id: "c2", type: "function", function: { name: "Bash", arguments: "{\"command\": " } }] } }] });
+st.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 1, function: { arguments: "\"true\"}" } }] } }] });
+st.feed({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+const jsonDeltas = (i) => stEvents.filter(([e, d]) => e === "content_block_delta" && d.index === i && d.delta.type === "input_json_delta").map(([, d]) => d.delta.partial_json);
+check("stub call (stream): args are held and sent once, typed", JSON.stringify(jsonDeltas(0)), JSON.stringify([JSON.stringify({ cron: "* * * * *", prompt: "p", recurring: true })]));
+check("stub call (stream): the typed args precede the block stop",
+  stEvents.findIndex(([e, d]) => e === "content_block_stop" && d.index === 0) > stEvents.findIndex(([e, d]) => e === "content_block_delta" && d.index === 0), true);
+check("stub call (stream): a real tool still streams incrementally", jsonDeltas(1).length, 2);
+
+const bigDeferred = beforeLoad();
+bigDeferred.tools = [...bigDeferred.tools, { name: "CronList", description: "x".repeat(4000), input_schema: { type: "object" }, defer_loading: true }];
+check("estimateTokens: a stubbed deferred tool counts as its stub, not its real schema",
+  estimateTokens(bigDeferred), estimateTokens(beforeLoad()));
+check("advisor transcript: deferred tools stay out of the tool list",
+  /CronCreate —|DeferredToolPlaceholder/.test(serializeAdvisorInput(afterLoad()).text), false);
 
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }

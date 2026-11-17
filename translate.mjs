@@ -7,7 +7,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { serializeAdvisorInput } from "./lib/advisor-transcript.mjs";
-import { renderToolReferences, toolsByName } from "./lib/tool-search.mjs";
+import { renderToolReferences, toolsByName, planDeferredTools, deferredStub, coerceStubInput, DEFERRED_STUB_DESCRIPTION } from "./lib/tool-search.mjs";
 
 export const REASONING_SIGNATURE = "Y29ydGktcHJveHk="; // base64 "corti-proxy"
 
@@ -1212,9 +1212,17 @@ export async function translateRequest(body, opts) {
   }
 
   const allTools = Array.isArray(body.tools) ? body.tools : [];
-  const tools = allTools.filter(
+  let tools = allTools.filter(
     (t) => t && typeof t === "object" && t.input_schema && typeof t.name === "string",
   );
+  const serverTools = allTools.length - tools.length;
+
+  // Deferred tools go upstream as fixed stubs so a ToolSearch load never changes the tools array
+  // (A1): the real definition reaches the model inline, through the rendered tool_reference.
+  const deferredPlan = planDeferredTools(body);
+  if (deferredPlan?.stubbed) tools = tools.filter((t) => t.defer_loading !== true).concat(deferredPlan.names.map(deferredStub));
+  else if (deferredPlan)
+    dropped.push("tool search: deferred tools without an announcement to name them, forwarded as real tools (each load re-bills the prompt)");
 
   // Convert WebSearch to a function tool so the call is schemaed; the proxy
   // intercepts the tool_result next turn to inject real search results. Only when the client's own
@@ -1241,8 +1249,7 @@ export async function translateRequest(body, opts) {
     });
   }
 
-  const droppedTools = allTools.length - tools.length;
-  if (droppedTools > 0) dropped.push(`${droppedTools} server tool(s) stripped`);
+  if (serverTools > 0) dropped.push(`${serverTools} server tool(s) stripped`);
 
   if (tools.length) {
     req.tools = tools.map((t) => ({
@@ -1287,6 +1294,9 @@ export async function translateRequest(body, opts) {
   // Forwarded thinking counts on its own channel so debug logs read "forwarded: …", not "dropped:".
   const forwardedCount = req.messages.filter((m) => m.reasoning).length;
   const out = { request: req, dropped };
+  // Response translation types stub calls back from these (see coerceStubInput).
+  if (deferredPlan?.stubbed && deferredPlan.schemas.size) out.stubSchemas = deferredPlan.schemas;
+  if (deferredPlan) out.toolSearch = deferredPlan.stubbed ? "stubbed" : "unannounced";
   if (forwardedCount) out.forwarded = `thinking (assistant history) x${forwardedCount}`;
   return out;
 }
@@ -1345,12 +1355,20 @@ export function estimateTokens(body, opts) {
       }
     }
 
+    // Mirrors translateRequest: stubbed deferred tools go upstream as stubs, not real schemas.
+    const plan = planDeferredTools(body);
     for (const t of Array.isArray(body?.tools) ? body.tools : []) {
       if (!t || typeof t !== "object" || !t.input_schema) continue;
+      if (plan?.stubbed && t.defer_loading === true) continue;
       overhead += 16;
       add(t.name);
       add(t.description);
       add(JSON.stringify(t.input_schema));
+    }
+    for (const name of plan?.stubbed ? plan.names : []) {
+      overhead += 16;
+      add(name);
+      add(DEFERRED_STUB_DESCRIPTION);
     }
 
     return Math.max(1, Math.floor(chars / 4) + overhead);
@@ -1544,6 +1562,8 @@ export function translateCompletion(completion, ctx) {
     } catch {
       ctx.onDiagnostic?.(`tool args JSON.parse failed for ${call.function?.name}: using {}`);
     }
+    const stubSchema = ctx?.stubSchemas?.get?.(call.function?.name);
+    if (stubSchema) input = coerceStubInput(input, stubSchema);
     content.push({ type: "tool_use", id: call.id || `chatcmpl-tool-local-${Math.random().toString(16).slice(2, 10)}`, name: call.function?.name, input });
   }
 
@@ -1595,11 +1615,24 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
         index: open.index,
         delta: { type: "signature_delta", signature: REASONING_SIGNATURE },
       });
-    emit("content_block_stop", { type: "content_block_stop", index: open.index });
-    if (open.kind === "tool") {
-      const rec = [...toolBlocks.values()].find((t) => t.blockIndex === open.index);
-      if (rec) rec.closed = true;
+    const rec = open.kind === "tool" ? [...toolBlocks.values()].find((t) => t.blockIndex === open.index) : null;
+    // A stub call's args were held back: typing them needs the whole object (coerceStubInput).
+    if (rec?.stubSchema) {
+      let json = rec.args;
+      try {
+        json = JSON.stringify(coerceStubInput(JSON.parse(rec.args || "{}"), rec.stubSchema));
+      } catch {
+        ctx.onDiagnostic?.(`stub tool args JSON.parse failed for ${rec.name}: sent as received`);
+      }
+      if (json)
+        emit("content_block_delta", {
+          type: "content_block_delta",
+          index: open.index,
+          delta: { type: "input_json_delta", partial_json: json },
+        });
     }
+    emit("content_block_stop", { type: "content_block_stop", index: open.index });
+    if (rec) rec.closed = true;
     open = null;
   };
 
@@ -1692,7 +1725,8 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
         } else {
           openBlock("tool", { type: "tool_use", id, name, input: {} });
           if (!firstBlock) firstBlock = { type: "tool", id };
-          toolBlocks.set(idx, { blockIndex: open.index, closed: false, name, id, args: "" });
+          const stubSchema = ctx?.stubSchemas?.get?.(name);
+          toolBlocks.set(idx, { blockIndex: open.index, closed: false, name, id, args: "", ...(stubSchema ? { stubSchema } : {}) });
         }
       }
     }
@@ -1719,6 +1753,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
       }
       rec.args += frag;
       outputChars += frag.length;
+      if (rec.stubSchema) return;
       emit("content_block_delta", {
         type: "content_block_delta",
         index: rec.blockIndex,

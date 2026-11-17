@@ -215,6 +215,15 @@ const server = http.createServer((req, res) => {
   return handleOpenAI(req, res, reqPath);
 });
 
+// Requests whose deferred tools had no announcement to name them: tool search then falls back to
+// re-billing the prompt on every load. Non-zero means the harness changed its wording.
+let toolSearchUnannounced = 0;
+function noteToolSearch(state) {
+  if (state !== "unannounced") return;
+  if (toolSearchUnannounced++ === 0)
+    console.warn("corti-proxy: deferred tools arrived without a deferred-tools announcement; tool search loads will re-bill the prompt (see corti-bridge doctor)");
+}
+
 function healthPayload() {
   return {
     status: "healthy",
@@ -233,6 +242,7 @@ function healthPayload() {
     upstream: BASE_URL,
     debug: LOG_DIR ?? false,
     forwardThinking: FORWARD_THINKING,
+    toolSearchUnannounced,
   };
 }
 
@@ -828,6 +838,7 @@ async function handleMessages(req, res, body) {
     ? (process.env.CORTI_ADVISOR_EFFORT || "high")
     : undefined;
   let translated;
+  let stubSchemas;
   try {
     const imageOpts = await imageInterceptOpts(anthropicBody, anthropicBody?.skipImages);
     const out = await translateRequest(anthropicBody, {
@@ -838,6 +849,8 @@ async function handleMessages(req, res, body) {
     translated = out.request;
     diagnostics.push(...out.dropped.map((d) => `dropped: ${d}`));
     if (out.forwarded) diagnostics.push(`forwarded: ${out.forwarded}`);
+    stubSchemas = out.stubSchemas;
+    noteToolSearch(out.toolSearch);
   } catch (err) {
     if (err instanceof TranslateRejection)
       return fail({ status: err.status, envelope: err.envelope }, "translation-rejected");
@@ -858,6 +871,7 @@ async function handleMessages(req, res, body) {
     // stay in translate.mjs.
     upstreamRequest: translated,
     estimatedInput,
+    stubSchemas,
     onDiagnostic: (m) => diagnostics.push(m),
     // Fires wherever translate.mjs sees upstream's own prompt_tokens, streaming or not. Paired
     // with the raw estimate for this same body, so the ratio compares like with like.
