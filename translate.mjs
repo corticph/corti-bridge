@@ -7,6 +7,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { serializeAdvisorInput } from "./lib/advisor-transcript.mjs";
+import { renderToolReferences, toolsByName } from "./lib/tool-search.mjs";
 
 export const REASONING_SIGNATURE = "Y29ydGktcHJveHk="; // base64 "corti-proxy"
 
@@ -943,14 +944,15 @@ function blocksOf(content) {
   return Array.isArray(content) ? content : [];
 }
 
-function toolResultText(block) {
+// tool_reference blocks (ToolSearch) carry no text of their own: render the referenced tools.
+function toolResultText(block, byName) {
   const c = block.content;
   if (typeof c === "string") return c;
   if (Array.isArray(c)) {
-    return c
-      .filter((b) => b && b.type === "text" && typeof b.text === "string")
-      .map((b) => b.text)
-      .join("\n\n");
+    const parts = c.filter((b) => b && b.type === "text" && typeof b.text === "string").map((b) => b.text);
+    const refs = renderToolReferences(c, byName);
+    if (refs) parts.push(refs);
+    return parts.join("\n\n");
   }
   return "";
 }
@@ -1011,6 +1013,7 @@ export async function translateRequest(body, opts) {
   }
 
   const messages = [];
+  const byName = toolsByName(body.tools);
   let pendingCalls = [];
   // Consults this session already made, put back before anything walks the history.
   const history = restoreAdvisorGuidance(opts?.parentSessionId, body.messages);
@@ -1101,7 +1104,7 @@ export async function translateRequest(body, opts) {
 
       for (const b of rawBlocks) {
         if (b.type === "tool_result") {
-          let text = toolResultText(b);
+          let text = toolResultText(b, byName);
           const imgs = toolResultImages(b);
 
           if (imgs.length) {
@@ -1294,6 +1297,7 @@ export async function translateRequest(body, opts) {
 
 export function estimateTokens(body, opts) {
   try {
+    const byName = toolsByName(body?.tools);
     let chars = 0;
     let overhead = 0;
     const add = (s) => {
@@ -1323,11 +1327,13 @@ export function estimateTokens(body, opts) {
           add(JSON.stringify(b.input ?? {}));
         } else if (b.type === "tool_result") {
           if (typeof b.content === "string") add(b.content);
-          else if (Array.isArray(b.content))
+          else if (Array.isArray(b.content)) {
             for (const c of b.content) {
               if (c?.type === "text") add(c.text);
               else if (c?.type === "image") overhead += 100;
             }
+            add(renderToolReferences(b.content, byName));
+          }
         } else if (b.type === "thinking") {
           if (fwdThinking) add(b.thinking ?? "");
         } else if (b.type === "redacted_thinking") {

@@ -1339,6 +1339,36 @@ const estAdv = estimateTokens({ messages: [
 ] });
 check("estimateTokens: advisor-anchored thinking counts", estAdv > estAdvBase, true);
 
+// Tool search (fix 1): a ToolSearch result is tool_reference blocks only. Without rendering, the
+// model read "(empty tool result)" and retried; it must see the definitions it was promised.
+const TS_TOOLS = [
+  { name: "Bash", description: "Run a shell command.", input_schema: { type: "object", properties: { command: { type: "string" } } } },
+  { name: "ToolSearch", description: "Load deferred tools.", input_schema: { type: "object", properties: { query: { type: "string" } } } },
+  { name: "CronList", description: "List cron jobs.", input_schema: { type: "object", properties: {} }, defer_loading: true },
+];
+const tsBody = (extra = []) => ({
+  model: "corti-s1", max_tokens: 64, tools: TS_TOOLS,
+  messages: [
+    { role: "user", content: "load CronList" },
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_ts", name: "ToolSearch", input: { query: "select:CronList" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ts", content: [{ type: "tool_reference", tool_name: "CronList" }, ...extra] }] },
+  ],
+});
+const tsTool = (r) => r.request.messages.find((m) => m.role === "tool")?.content;
+const tsText = tsTool(await translateRequest(tsBody()));
+check("tool search: reference is not an empty result", tsText !== "(empty tool result)", true);
+check("tool search: reference renders the full definition in a functions block",
+  tsText, "<functions>\n<function>{\"description\":\"List cron jobs.\",\"name\":\"CronList\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}</function>\n</functions>");
+check("tool search: rendering is byte-identical across translations", tsTool(await translateRequest(tsBody())), tsText);
+const tsUnknown = tsTool(await translateRequest({ ...tsBody(), tools: TS_TOOLS.filter((t) => t.name !== "CronList") }));
+check("tool search: a reference to an absent tool still names it", tsUnknown.includes("\"name\":\"CronList\""), true);
+const tsMixed = tsTool(await translateRequest(tsBody([{ type: "text", text: "note" }])));
+check("tool search: text beside references is kept", tsMixed.startsWith("note\n\n<functions>"), true);
+check("estimateTokens: counts rendered tool references",
+  estimateTokens(tsBody()) > estimateTokens({ ...tsBody(), messages: tsBody().messages.slice(0, 2).concat([{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ts", content: [] }] }]) }), true);
+const tsAdv = serializeAdvisorInput(tsBody()).text;
+check("advisor transcript: ToolSearch result names the loaded tools", tsAdv.includes("[ToolSearch loaded: CronList]"), true);
+
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }
 console.log(`${failed} check(s) failed`);
