@@ -127,3 +127,15 @@ corti-bridge update      # pull + re-deploy the wrapper if it changed; refuses i
 ## Reference
 
 [GUIDE.md](GUIDE.md) covers the rest: the translation surface (system-prompt merge, tool mapping, thinking config, images), the model-ranking algorithm and capability derivation, the fingerprint probe that de-aliases models, debug-logging internals and sensitivity, the profile choice, the full environment reference, and the known degradations in `openai` and `anthropic` mode.
+
+&nbsp;
+
+## Maintainers
+
+Created and maintained by **Andres Thor Saemundsson** ([@andresthor](https://github.com/andresthor)). Issues and PRs welcome.
+
+&nbsp;
+
+## License
+
+[MIT](LICENSE) © Corti
