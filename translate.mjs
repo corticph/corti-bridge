@@ -145,15 +145,37 @@ function mapModel(model) {
   return model;
 }
 
-// Corti's effort vocabulary is {high, max}; the picker's six levels collapse at the midpoint.
-// Off-vocabulary values (medium/low) floor somewhere unknown upstream.
-const mapEffort = (e) => {
+const EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"];
+const normEffort = (e) => {
   if (typeof e !== "string") return undefined;
   const v = e.toLowerCase();
-  if (["low", "medium", "high"].includes(v)) return "high";
-  if (["xhigh", "max", "ultracode"].includes(v)) return "max";
-  return undefined;
+  if (v === "ultracode") return "max";
+  return EFFORT_ORDER.includes(v) ? v : undefined;
 };
+
+/**
+ * The effort level sent upstream for a requested one, given the model's catalog `effort.levels`.
+ * Levels differ per model (corti-s1: low/high/max; corti-s1-mini: low/medium/xhigh), and a level
+ * the model does not list 400s. The nearest listed level wins, ties going up: a request is never
+ * silently given less depth than the next level would give it.
+ *   levels undefined → catalog unknown: the {high, max} collapse that corti-s1 always accepted.
+ *   levels []        → the model takes no effort: undefined, so the field is omitted.
+ */
+export function resolveEffort(requested, levels) {
+  const want = normEffort(requested);
+  if (!want) return undefined;
+  if (!Array.isArray(levels)) return EFFORT_ORDER.indexOf(want) <= EFFORT_ORDER.indexOf("high") ? "high" : "max";
+  const ranked = levels.map(normEffort).filter(Boolean);
+  if (!ranked.length) return undefined;
+  const w = EFFORT_ORDER.indexOf(want);
+  let best;
+  for (const l of ranked) {
+    const d = Math.abs(EFFORT_ORDER.indexOf(l) - w);
+    const bd = best === undefined ? Infinity : Math.abs(EFFORT_ORDER.indexOf(best) - w);
+    if (d < bd || (d === bd && EFFORT_ORDER.indexOf(l) > EFFORT_ORDER.indexOf(best))) best = l;
+  }
+  return best;
+}
 
 /* ------------------------------------------------------------------ */
 /* web search: Tavily API (primary), DuckDuckGo HTML (keyless fallback)*/
@@ -1367,21 +1389,27 @@ export async function translateRequest(body, opts) {
   // effort (depth) and thinking (whether) are separate axes. reasoning_effort is gated on
   // body.thinking: a request with no thinking block is not reasoning-capable and 400s on effort.
   const th = body.thinking;
+  let requestedEffort;
+  let effortTrace;
   if (th && typeof th === "object") {
-    const effort = mapEffort(body.output_config?.effort);
     // output_config.effort (the picker) wins over the legacy budget mapping; adaptive enables only.
     const budgetEffort =
       th.type === "enabled" && typeof th.budget_tokens === "number"
-        ? mapEffort(th.budget_tokens < 4096 ? "low" : th.budget_tokens < 16384 ? "medium" : "high")
+        ? (th.budget_tokens < 4096 ? "low" : th.budget_tokens < 16384 ? "medium" : "high")
         : undefined;
-    req.reasoning_effort = effort ?? budgetEffort ?? "high";
+    requestedEffort = normEffort(body.output_config?.effort) ?? budgetEffort ?? "high";
     if (th.type === "enabled" && typeof th.budget_tokens === "number" && th.budget_tokens > 0)
       req.thinking_token_budget = th.budget_tokens;
   }
-
-  // C2: the advisor child reasons at CORTI_ADVISOR_EFFORT (high by default), overriding the
-  // resolved effort above. A model that rejects the level 400s — surfacing a capability gap.
-  if (opts?.advisorEffort) req.reasoning_effort = opts.advisorEffort;
+  // C2: the advisor child reasons at CORTI_ADVISOR_EFFORT, overriding whatever was requested.
+  if (opts?.advisorEffort) requestedEffort = opts.advisorEffort;
+  if (requestedEffort !== undefined) {
+    // opts.effortLevels: the gateway's catalog lookup (model id → levels, undefined when unknown).
+    const levels = typeof opts?.effortLevels === "function" ? opts.effortLevels(req.model) : undefined;
+    const sent = resolveEffort(requestedEffort, levels);
+    if (sent !== undefined) req.reasoning_effort = sent;
+    effortTrace = { requested: requestedEffort, sent, levels };
+  }
 
   // Forwarded thinking counts on its own channel so debug logs read "forwarded: …", not "dropped:".
   const forwardedCount = req.messages.filter((m) => m.reasoning).length;
@@ -1390,6 +1418,7 @@ export async function translateRequest(body, opts) {
   if (deferredPlan?.stubbed && deferredPlan.schemas.size) out.stubSchemas = deferredPlan.schemas;
   if (deferredPlan) out.toolSearch = deferredPlan.stubbed ? "stubbed" : "unannounced";
   if (forwardedCount) out.forwarded = `thinking (assistant history) x${forwardedCount}`;
+  if (effortTrace) out.effort = effortTrace;
   return out;
 }
 

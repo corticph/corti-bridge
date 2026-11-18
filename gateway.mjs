@@ -106,7 +106,7 @@ const MEMORY_BREAKER_BYTES = 64_000_000;
 
 const DEBUG = isTruthy(process.env.CORTI_DEBUG);
 /** Opt-in from `setup.sh --experimental` / `corti-bridge models --experimental`, persisted in
- *  models.env and exported by the wrapper. The image-capability lookup (fetchImageModels) then
+ *  models.env and exported by the wrapper. The image-capability lookup (fetchCatalog) then
  *  queries /models?experimental=true so a pinned beta (e.g. multimodal corti-s1-beta) is recognized
  *  as sighted; off → plain /models, betas invisible, images described as today. */
 const EXPERIMENTAL = isTruthy(process.env.CORTI_EXPERIMENTAL);
@@ -248,6 +248,8 @@ server.listen(PORT, HOST, () => {
     `corti-proxy on http://${HOST}:${PORT} (openai: /, anthropic: ${ANTHROPIC_PREFIX}, reasoning: ${REASONING_MODE}, forwarding: ${FORWARD_THINKING ? "on" : "off"})`,
   );
   if (LOG_DIR) console.log(`corti-proxy debug log dir: ${LOG_DIR}`);
+  // Effort levels are needed on the first thinking request; fetch them before it arrives.
+  fetchCatalog();
 });
 
 // Without this, SIGTERM is the OS default: the process dies instantly and every open stream
@@ -417,16 +419,32 @@ function countTokens(body) {
   }
 }
 
-/** The set of model ids that accept image input, fetched lazily from the catalog on the first
- *  image-bearing request and cached for the process lifetime. Drives interceptImages: a blind
- *  model gets its images described; a sighted model (a future multimodal corti-s1) passes images
- *  through untouched. null while unknown or after a fetch failure — interceptImages then treats
- *  every model as blind (describe), which is safer than passing an image to a model that 400s. */
+/** The set of model ids that accept image input, from the catalog (prefetched at boot, refetched on
+ *  the next image request after a failure) and cached for the process lifetime. Drives
+ *  interceptImages: a blind model gets its images described; a sighted model (a future multimodal
+ *  corti-s1) passes images through untouched. null while unknown or after a fetch failure —
+ *  interceptImages then treats every model as blind (describe), which is safer than passing an
+ *  image to a model that 400s. */
 let imageModels = null;
 let imageModelsLoading = null;
+/** model id → catalog `effort.levels` ([] when the model takes no effort), from the same fetch.
+ *  null while unknown: translateRequest then falls back to the {high, max} collapse. */
+let effortLevels = null;
+let catalogFailedAt = 0;
+const CATALOG_RETRY_MS = 60_000;
 
-function fetchImageModels() {
+/** Wait for the effort levels: prefetched at boot, refetched at most once a minute after a failure
+ *  so a down /models never adds its timeout to every request. */
+async function effortLevelsLookup() {
+  if (effortLevels === null && (imageModelsLoading || Date.now() - catalogFailedAt >= CATALOG_RETRY_MS))
+    await fetchCatalog();
+  const map = effortLevels;
+  return (id) => map?.get(id);
+}
+
+function fetchCatalog() {
   if (imageModelsLoading) return imageModelsLoading;
+  const failed = () => { imageModels = null; imageModelsLoading = null; catalogFailedAt = Date.now(); };
   imageModelsLoading = new Promise((resolve) => {
     const proxyReq = https.request(
       new URL(`${UPSTREAM_OPENAI}/models${EXPERIMENTAL ? "?experimental=true" : ""}`),
@@ -439,28 +457,37 @@ function fetchImageModels() {
          *  outage self-heals on the next image request. */
         upstream.on("end", () => {
           try {
-            if (upstream.statusCode !== 200) { imageModels = null; imageModelsLoading = null; return resolve(); }
+            if (upstream.statusCode !== 200) { failed(); return resolve(); }
             const list = JSON.parse(Buffer.concat(chunks).toString());
+            // Corti has answered 200 with an empty list transiently; cached, it would last the process.
+            if (!Array.isArray(list?.data) || !list.data.length) { failed(); return resolve(); }
             const sighted = new Set();
-            for (const m of Array.isArray(list?.data) ? list.data : [])
-              if (m && typeof m.id === "string" && m.capabilities?.image_input === true)
-                sighted.add(m.id);
+            const levels = new Map();
+            for (const m of list.data) {
+              if (!m || typeof m.id !== "string") continue;
+              if (m.capabilities?.image_input === true) sighted.add(m.id);
+              // A model without an effort object stays unknown (fallback), never "takes no effort".
+              if (m.effort?.supported === false) levels.set(m.id, []);
+              else if (Array.isArray(m.effort?.levels)) levels.set(m.id, m.effort.levels);
+            }
             imageModels = sighted;
+            effortLevels = levels;
           } catch {
-            imageModels = null;
+            failed();
+            return resolve();
           }
           imageModelsLoading = null;
           resolve();
         });
       },
     );
-    proxyReq.on("error", () => { imageModels = null; imageModelsLoading = null; resolve(); });
+    proxyReq.on("error", () => { failed(); resolve(); });
     /** A TCP hang (connection accepted, no response) parks imageModelsLoading forever; every
      *  image request joins the same pending promise with no fallback. Timeout mirrors the error
      *  handler so a hung /models self-heals. destroy() re-fires that error handler — both set the
      *  same null state, so the double-resolve is harmless; keep them aligned if either changes. */
     proxyReq.setTimeout(30_000, () => {
-      imageModels = null; imageModelsLoading = null; resolve(); proxyReq.destroy();
+      failed(); resolve(); proxyReq.destroy();
     });
     proxyReq.end();
   });
@@ -610,7 +637,7 @@ function bodyHasImage(body) {
  *  logs one deduped warning per bypassed model id. */
 async function imageInterceptOpts(body, skipImages) {
   if (skipImages || !bodyHasImage(body)) return {};
-  if (imageModels === null) await fetchImageModels();
+  if (imageModels === null) await fetchCatalog();
   const { model, warned, fallbackFrom } = resolveVisionModel({ env: process.env, imageModels });
   if (warned && fallbackFrom && !_visionWarned.has(fallbackFrom)) {
     _visionWarned.add(fallbackFrom);
@@ -831,24 +858,32 @@ async function handleMessages(req, res, body) {
 
   /* ---- request translation ---- */
 
-  // The advisor child reasons at high effort by default. CORTI_ADVISOR_EFFORT overrides, passed
-  // verbatim (Corti's vocabulary is {high, max}); set at launch, so a change needs a restart.
+  // The advisor child reasons at high effort by default. CORTI_ADVISOR_EFFORT overrides, resolved
+  // against the advisor model's catalog levels like any other request; set at launch, so a change
+  // needs a restart.
   const noAdvisor = wantsNoAdvisor(req);
   const advisorEffort = noAdvisor
     ? (process.env.CORTI_ADVISOR_EFFORT || "high")
     : undefined;
   let translated;
   let stubSchemas;
+  // One lookup per turn: the advisor continuation must resolve the same effort as the first call.
+  const effortLevels = await effortLevelsLookup();
   try {
     const imageOpts = await imageInterceptOpts(anthropicBody, anthropicBody?.skipImages);
     const out = await translateRequest(anthropicBody, {
       skipAdvisor: noAdvisor, mode: "openai", advisorEffort, parentSessionId,
       skipImages: anthropicBody?.skipImages, ...imageOpts,
       forwardThinking: FORWARD_THINKING,
+      effortLevels,
     });
     translated = out.request;
     diagnostics.push(...out.dropped.map((d) => `dropped: ${d}`));
     if (out.forwarded) diagnostics.push(`forwarded: ${out.forwarded}`);
+    if (out.effort && out.effort.sent !== out.effort.requested) {
+      const lv = out.effort.levels ? `levels ${out.effort.levels.join("/") || "none"}` : "levels unknown";
+      diagnostics.push(`effort: ${out.effort.requested} → ${out.effort.sent ?? "omitted"} (${lv})`);
+    }
     stubSchemas = out.stubSchemas;
     noteToolSearch(out.toolSearch);
   } catch (err) {
@@ -1125,7 +1160,7 @@ async function handleMessages(req, res, body) {
       // client request, so the advisor intercept must not touch it.
       // parentSessionId only re-inserts *prior* turns' consults; this turn's are in `history`
       // already and are not recorded until the turn ends.
-      translateRequest(contAnthropic, { skipAdvisor: true, skipImages: true, parentSessionId, forwardThinking: FORWARD_THINKING })
+      translateRequest(contAnthropic, { skipAdvisor: true, skipImages: true, parentSessionId, forwardThinking: FORWARD_THINKING, effortLevels })
         .then((out) => {
           const contTranslated = out.request;
           diagnostics.push(...out.dropped.map((d) => `continuation dropped: ${d}`));

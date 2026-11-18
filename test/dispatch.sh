@@ -1403,7 +1403,10 @@ const s = https.createServer(
         // Only the experimental catalog lists the multimodal corti-s1-beta.
         const exp = req.url.includes("experimental=true");
         const data = [
-          { id: "corti-s1", capabilities: { image_input: false, reasoning: true } },
+          { id: "corti-s1", capabilities: { image_input: false, reasoning: true },
+            effort: { supported: true, levels: ["low", "high", "max"] } },
+          { id: "corti-s1-mini", capabilities: { image_input: false, reasoning: true },
+            effort: { supported: true, levels: ["low", "medium", "xhigh"] } },
           { id: "corti-s1-beta", capabilities: { image_input: true, reasoning: true } },
           { id: "corti-s1-mini-instant", capabilities: { image_input: true, reasoning: false } },
         ];
@@ -1582,6 +1585,35 @@ check "IMG: null /models sidecall targets VISION_DEFAULT" \
 kill "$IMGSTUB503_PID" 2>/dev/null || :
 wait "$IMGSTUB503_PID" 2>/dev/null || :
 unset _ir_gw _ir_pid
+
+# EFFORT e2e: the boot catalog fetch feeds effort levels into translation. A level the model does
+# not list must never go upstream (corti-s1-mini 400s on high); a listed one passes through.
+rm -f imgchat.log
+_ef_gw="effortgateway_4304.mjs"
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > "$_ef_gw"
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$IMGUP/v1" \
+CORTI_PORT=4304 \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node "$_ef_gw" > "effortgw_4304.out" 2>&1 &
+_ef_pid=$!
+wait_banner "effortgw_4304.out" || { echo "FAIL EFFORT gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+curl -s -m 15 -H 'content-type: application/json' \
+  -d '{"model":"corti-s1-mini","max_tokens":16,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"hi"}]}' \
+  "http://127.0.0.1:4304/v1/messages" >/dev/null || :
+check "EFFORT: mini default high goes upstream as xhigh" \
+  "$(grep -c '"reasoning_effort":"xhigh"' imgchat.log 2>/dev/null || :)" "1"
+check "EFFORT: mini never receives high" \
+  "$(grep -c '"reasoning_effort":"high"' imgchat.log 2>/dev/null || :)" "0"
+rm -f imgchat.log
+curl -s -m 15 -H 'content-type: application/json' \
+  -d '{"model":"corti-s1","max_tokens":16,"thinking":{"type":"adaptive"},"output_config":{"effort":"low"},"messages":[{"role":"user","content":"hi"}]}' \
+  "http://127.0.0.1:4304/v1/messages" >/dev/null || :
+check "EFFORT: s1 picker low is sent as low" \
+  "$(grep -c '"reasoning_effort":"low"' imgchat.log 2>/dev/null || :)" "1"
+kill "$_ef_pid" 2>/dev/null || :; wait "$_ef_pid" 2>/dev/null || :
+unset _ef_gw _ef_pid
 
 kill "$IMGSTUB_PID" 2>/dev/null || :
 wait "$IMGSTUB_PID" 2>/dev/null || :

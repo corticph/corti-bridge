@@ -8,7 +8,7 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
-import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, consultCarry, splitConsult, consultAnchor, recordConsults, _resetWebSearchCache, _resetImageCache, estimateTokens } from "'"$REPO"'/translate.mjs";
+import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, consultCarry, splitConsult, consultAnchor, recordConsults, _resetWebSearchCache, _resetImageCache, estimateTokens, resolveEffort } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 import { resolveVisionModel, VISION_DEFAULT, VISION_TIERS } from "'"$REPO"'/lib/vision.mjs";
 import { announcedDeferredNames, coerceStubInput, DEFERRED_STUB_DESCRIPTION } from "'"$REPO"'/lib/tool-search.mjs";
@@ -34,7 +34,7 @@ const ADAPTIVE = { type: "adaptive" };
 // so every fixture that must reach the advisor carries one.
 const ANYTOOL = () => ({ name: "run_bash", description: "Run a bash command", input_schema: { type: "object" } });
 
-// Corti effort vocabulary is {high, max}. The picker six levels collapse at the midpoint;
+// Without catalog levels (no effortLevels lookup) the picker six levels collapse onto {high, max};
 // budget mapping routes through the same collapse, so medium/low never reach upstream.
 for (const m of ["corti-s1", "corti-s1-mini", "corti-s1-ultra-beta", "corti-s1-ultra-instant-beta"]) {
   check(`${m}: adaptive (no effort) defaults to high`, await effort(m, ADAPTIVE), "high");
@@ -63,6 +63,33 @@ const noThinking = (await translateRequest({
   messages: [{ role: "user", content: "hi" }],
 })).request.reasoning_effort;
 check("no thinking block omits reasoning_effort (non-reasoning guard)", noThinking, undefined);
+
+// Catalog effort levels: nearest listed level, ties up; [] omits; unknown keeps the high/max collapse.
+const S1 = ["low", "high", "max"];
+const MINI = ["low", "medium", "xhigh"];
+for (const [req, levels, want] of [
+  ["low", S1, "low"], ["medium", S1, "high"], ["high", S1, "high"], ["xhigh", S1, "max"], ["max", S1, "max"], ["ultracode", S1, "max"],
+  ["low", MINI, "low"], ["medium", MINI, "medium"], ["high", MINI, "xhigh"], ["xhigh", MINI, "xhigh"], ["max", MINI, "xhigh"],
+  ["high", ["low"], "low"], ["low", ["max"], "max"],
+  ["high", [], undefined], ["high", ["minimal"], undefined],
+  ["low", undefined, "high"], ["xhigh", undefined, "max"], ["bogus", S1, undefined],
+]) check(`resolveEffort(${req}, ${levels ? levels.join("/") || "none" : "unknown"}) = ${want}`, resolveEffort(req, levels), want);
+
+const levelsOf = (map) => (id) => map[id];
+const viaLevels = async (model, thinking, output_config, opts = {}) =>
+  (await translateRequest({ model, max_tokens: 16, thinking, output_config, messages: [{ role: "user", content: "hi" }] },
+    { effortLevels: levelsOf({ "corti-s1": S1, "corti-s1-mini": MINI, "corti-s1-instant": [] }), ...opts })).request.reasoning_effort;
+check("levels: mini adaptive default high resolves to xhigh", await viaLevels("corti-s1-mini", ADAPTIVE), "xhigh");
+check("levels: mini picker medium is sent as medium", await viaLevels("corti-s1-mini", ADAPTIVE, { effort: "medium" }), "medium");
+check("levels: s1 picker low is honoured", await viaLevels("corti-s1", ADAPTIVE, { effort: "low" }), "low");
+check("levels: s1 low budget maps to low", await viaLevels("corti-s1", ENABLED(1000)), "low");
+check("levels: no-effort model omits reasoning_effort", await viaLevels("corti-s1-instant", ADAPTIVE, { effort: "max" }), undefined);
+check("levels: model absent from catalog keeps the collapse", await viaLevels("corti-s1-ultra-beta", ADAPTIVE, { effort: "low" }), "high");
+check("levels: advisor high on mini resolves to xhigh", await viaLevels("corti-s1-mini", ADAPTIVE, undefined, { advisorEffort: "high" }), "xhigh");
+check("levels: advisor max on s1 stays max", await viaLevels("corti-s1", ADAPTIVE, undefined, { advisorEffort: "max" }), "max");
+const traced = await translateRequest({ model: "corti-s1-mini", max_tokens: 16, thinking: ADAPTIVE, messages: [{ role: "user", content: "hi" }] },
+  { effortLevels: levelsOf({ "corti-s1-mini": MINI }) });
+check("levels: trace reports requested and sent", JSON.stringify([traced.effort?.requested, traced.effort?.sent]), JSON.stringify(["high", "xhigh"]));
 
 // Model name mapping: claude-* model names should map to configured Corti models via env vars.
 process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = "corti-s1";
