@@ -112,6 +112,21 @@ check("advisor budget: leaves room for the answer under max_tokens", await tb("c
   await applyIntercepts(rwBody, { mode: "openai", signal: ac.signal, runAdvisor: async (t, o) => { seen.push(o); return "rw advice"; } });
   check("advisor rewrite: the spawn receives the abort signal", seen[0]?.signal === ac.signal, true);
 }
+// A hang-up aborts the rewrite run; that failure must not become the consult cached answer.
+{
+  const mk = (id) => ({ model: "corti-s1", max_tokens: 16, tools: [ANYTOOL()], messages: [
+    { role: "user", content: "advise me" },
+    { role: "assistant", content: [{ type: "tool_use", id, name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: "Error: No such tool available: consult_advisor" }] },
+  ] });
+  const failing = async () => ({ ok: false, code: "unavailable" });
+  const cache = new Map();
+  const gone = new AbortController(); gone.abort();
+  await applyIntercepts(mk("toolu_ab1"), { mode: "openai", signal: gone.signal, runAdvisor: failing, advisorProcessed: cache });
+  check("advisor rewrite: an aborted run is not cached", cache.has("toolu_ab1"), false);
+  await applyIntercepts(mk("toolu_ab2"), { mode: "openai", signal: new AbortController().signal, runAdvisor: failing, advisorProcessed: cache });
+  check("advisor rewrite: a failure without a hang-up is still cached", cache.has("toolu_ab2"), true);
+}
 
 // executorCwd: harness-authored environment block only; the first occurrence is the session own.
 const ENVBLOCK = (d) => "# Environment\n - Primary working directory: " + d + "\n - Is a git repository: true";

@@ -899,6 +899,13 @@ const s = https.createServer(
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ id: "j", choices: [{ index: 0, message, finish_reason: finish }], usage: { prompt_tokens: 1, completion_tokens: 1 } }));
       };
+      // JSONDUPME: both rounds write the same pre-call text, so round 2 is recorded against the
+      // continuation's own first block; that continuation answers as JSON.
+      if (body.includes("JSONDUPME") && body.includes('"tool_call_id":"call_d2"'))
+        return json({ role: "assistant", content: "DUP ANSWER" }, "stop");
+      if (body.includes("JSONDUPME") && body.includes('"tool_call_id":"call_d1"'))
+        return json({ role: "assistant", content: "Consulting.", tool_calls: [{ id: "call_d2", type: "function", function: { name: "consult_advisor", arguments: "{}" } }] }, "tool_calls");
+      if (body.includes("JSONDUPME")) return sse(res, consult("call_d1"));
       if (body.includes("JSONME") && body.includes('"tool_call_id":"call_j2"'))
         return json({ role: "assistant", content: "JSON ANSWER" }, "stop");
       if (body.includes("JSONME") && body.includes('"tool_call_id":"call_j1"'))
@@ -955,6 +962,13 @@ JSONBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messag
 JSONRESP=$(curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: nest-sess-3' \
   -d "$JSONBODY" "$C1NESTG/v1/messages" 2>&1 || true)
 JSONSPAWNS=$(( $(grep -c '<transcript>' "$NEST_ADVISOR_IN" || true) - NESTSPAWNS - CAPSPAWNS ))
+# JSON-DUP: turn 1 runs two JSON-path rounds with identical pre-call text; turn 2 replays it.
+DUPBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"JSONDUPME"}]}'
+curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: nest-sess-8' \
+  -d "$DUPBODY" "$C1NESTG/v1/messages" > /dev/null 2>&1 || true
+DUPBODY2='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"JSONDUPME"},{"role":"assistant","content":[{"type":"text","text":"Consulting."},{"type":"text","text":"Consulting."},{"type":"text","text":"DUP ANSWER"}]},{"role":"user","content":"TURN2"}]}'
+curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: nest-sess-8' \
+  -d "$DUPBODY2" "$C1NESTG/v1/messages" > /dev/null 2>&1 || true
 # ADVISOR-TIMEOUT: the advisor stub times out on this transcript and the model keeps consulting.
 TOBEFORE=$(grep -c '<transcript>' "$NEST_ADVISOR_IN" || true)
 TOBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"TIMEOUTME"}]}'
@@ -1048,6 +1062,12 @@ check "ADVISOR-TIMEOUT: the use cap still ends the loop" \
 check "STREAM-ERROR: a mid-stream drop logs its cause" \
   "$(cat "$SCRATCH"/nest-logs/*nest-sess-7*.log 2>/dev/null | grep -c 'upstream stream error: ')" "1"
 check "C1-NESTED-JSON: a nested consult in a JSON continuation runs the advisor again" "$JSONSPAWNS" "2"
+check "JSON-DUP: turn 2 restores both consults of a JSON-path turn" \
+  "$(nest_bodies nest-sess-8 | tail -1 | python3 -c '
+import sys, json
+b = json.loads(sys.stdin.read())
+print(sorted(t["id"] for m in b["messages"] for t in (m.get("tool_calls") or [])))
+')" "['call_d1', 'call_d2']"
 check "C1-NESTED-JSON: the answer streams through, the consult does not" \
   "$(printf '%s' "$JSONRESP" | grep -c 'JSON ANSWER')/$(printf '%s' "$JSONRESP" | grep -c '"name":"consult_advisor"')" "1/0"
 check "C1-NESTED-JSON: one terminal message_delta and message_stop" \
@@ -1166,6 +1186,7 @@ CORTI_BEARER=test \
 CORTI_BASE_URL="https://127.0.0.1:$HANGUP/v1" \
 CORTI_PORT=4720 \
 CORTI_ADVISOR_STUB="$SCRATCH/hangup-advisor.sh" \
+CORTI_ADVISOR=on \
 HANGUP_ADVISOR_DONE="$HANGUP_ADVISOR_DONE" \
 CORTI_DEBUG=1 \
 CORTI_DEBUG_DIR="$SCRATCH/hangup-logs" \
@@ -1196,11 +1217,26 @@ set -e
 # intercept before anything goes upstream. A hang-up then must stop that advisor child too.
 rm -f "$HANGUP_ADVISOR_DONE"
 RWBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"advise me"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_rw","name":"consult_advisor","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_rw","is_error":true,"content":"Error: No such tool available: consult_advisor"}]}]}'
+RWARRIVED=$(wc -l < hangup-upstream.log)
 curl -s -m 1 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: hangup-rw' \
   -d "$RWBODY" "http://127.0.0.1:4720/v1/messages" > /dev/null 2>&1 || true
 sleep 6
 set +e
 check "HANGUP: a rewrite-path advisor child is stopped on hang-up" \
+  "$([ -e "$HANGUP_ADVISOR_DONE" ] && echo finished || echo stopped)" "stopped"
+check "HANGUP: nothing goes upstream for a client that left during translation" \
+  "$(( $(wc -l < hangup-upstream.log) - RWARRIVED ))" "0"
+set -e
+# Pass-through runs the same rewrite (advisor on); the request must not go upstream either.
+rm -f "$HANGUP_ADVISOR_DONE"
+RWARRIVED=$(wc -l < hangup-upstream.log)
+curl -s -m 1 -N -H 'content-type: application/json' -H 'x-api-key: x' -H 'x-claude-code-session-id: hangup-rw-pt' \
+  -d "$RWBODY" "http://127.0.0.1:4720/anthropic/v1/messages" > /dev/null 2>&1 || true
+sleep 6
+set +e
+check "HANGUP: a pass-through request whose client left during the intercepts never goes upstream" \
+  "$(( $(wc -l < hangup-upstream.log) - RWARRIVED ))" "0"
+check "HANGUP: the pass-through rewrite advisor child is stopped too" \
   "$([ -e "$HANGUP_ADVISOR_DONE" ] && echo finished || echo stopped)" "stopped"
 set -e
 

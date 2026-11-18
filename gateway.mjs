@@ -329,6 +329,13 @@ async function handlePassthrough(req, res, reqPath) {
 
   logRequest(id, sessionFile, req, target, body);
 
+  // The intercepts can take minutes (image descriptions, searches, an advisor rewrite); a client
+  // that left meanwhile already fired res 'close', so nothing below would ever cancel upstream.
+  if (passAbort.signal.aborted) {
+    logResponse({ id, sessionFile, started, status: null, body: "", note: "client-abort" });
+    return;
+  }
+
   if (isCountTokens) {
     const counted = countTokens(body);
     logResponse({
@@ -904,6 +911,9 @@ async function handleMessages(req, res, body) {
       return fail({ status: err.status, envelope: err.envelope }, "translation-rejected");
     throw err;
   }
+  // A hang-up during translation (catalog wait, image descriptions, an advisor rewrite) already
+  // finalized the request; going on would send it upstream and start timers nothing clears.
+  if (finalized || clientGone) return;
 
   // The overflow guard above deliberately stays on the raw estimate; this is only what the client
   // is told the prompt cost, and it has to survive becoming a turn's final usage when the turn dies
@@ -1182,6 +1192,9 @@ async function handleMessages(req, res, body) {
       // already and are not recorded until the turn ends.
       translateRequest(contAnthropic, { skipAdvisor: true, skipImages: true, parentSessionId, forwardThinking: FORWARD_THINKING, effortLevels })
         .then((out) => {
+          // The client may have left while the round's advisor ran; finalize cannot cancel a
+          // request created after it.
+          if (finalized || clientGone) return settle();
           const contTranslated = out.request;
           diagnostics.push(...out.dropped.map((d) => `continuation dropped: ${d}`));
           const body = Buffer.from(JSON.stringify(contTranslated));
@@ -1249,6 +1262,9 @@ async function handleMessages(req, res, body) {
                     roundSource = { ...split, nextBlockIndex: contNextIndex };
                   } else {
                     emitContinuationCompletion(msg, msg.content, true);
+                    // The stream path reports its blocks through contTranslator; this one must
+                    // too, or a round that carried nothing records no anchor and loses its advice.
+                    roundSource = { blocks: msg.content };
                   }
                   proxyReq = null; // response is complete; don't let finalize() tear down a reusable socket
                   settle();
@@ -1511,6 +1527,7 @@ async function handleMessages(req, res, body) {
   // One attempt. Re-invoked by scheduleRetry() while the client response is still
   // unwritten, so a retried request looks to Claude Code like one slow request.
   const sendUpstream = () => {
+    if (finalized || clientGone) return;
     const myAttempt = ++attempt;
     upstreamStatus = null;
     lastActivity = Date.now();

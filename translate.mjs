@@ -1033,9 +1033,13 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
       }
       b.content = guidance;
       b.is_error = false;
-      if (processed.size >= ADVISOR_PROCESSED_PER_SESSION)
-        processed.delete(processed.keys().next().value);
-      processed.set(b.tool_use_id, guidance);
+      // A run the client's hang-up aborted is not this consult's answer; cached, every later
+      // replay would read "advisor unavailable" and never run the advisor again.
+      if (!signal?.aborted) {
+        if (processed.size >= ADVISOR_PROCESSED_PER_SESSION)
+          processed.delete(processed.keys().next().value);
+        processed.set(b.tool_use_id, guidance);
+      }
       const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
       const resStr = res?.ok ? `advisor=${res.text.length} chars` : `advisor_error=${res?.code || "unavailable"}`;
       diagnostics.push(`advisor intercepted: transcript=${text.length} chars${elidedStr} ${resStr}`);
