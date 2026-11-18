@@ -1630,6 +1630,43 @@ check("tool search: a dropped tool keeps its first rendering within a session", 
 check("tool search: without a session the rendering falls back to the name",
   toolMsg(await translateRequest(dropped2)).includes("{\"name\":\"CronCreate\"}"), true);
 
+
+// Block G9 — the two branches meet: a consult turn must keep its byte-identity guarantees while
+// deferred stubs pin the tools array. First call and continuation share one body object, so the
+// stubs and consult_advisor must survive both translations unchanged.
+_resetAdvisorGuidance();
+const c2sbase = () => ({
+  model: "corti-s1", max_tokens: 64, system: "agent",
+  tools: [{ name: "run_bash", description: "run", input_schema: { type: "object", properties: { cmd: { type: "string" } } } }, TS_TOOLS[1], CRON_CREATE, PLACEHOLDER],
+  messages: [
+    { role: "system", content: [{ type: "text", text: ANNOUNCE(["CronCreate"]) }] },
+    { role: "user", content: "fix it" },
+  ],
+});
+const c2sOpen = { mode: "openai", parentSessionId: "c2s", forwardThinking: true };
+const c2sSkip = { skipAdvisor: true, skipImages: true, parentSessionId: "c2s", forwardThinking: true };
+const c2sFirst = c2sbase();
+const c2sUp1 = (await translateRequest(c2sFirst, c2sOpen)).request;
+const c2sNames = c2sUp1.tools.map((t) => t.function.name).join(",");
+check("stubs+advisor: the first call declares the stub and appends consult_advisor",
+  c2sNames, "run_bash,ToolSearch,consult_advisor,CronCreate");
+const c2sCont = (await translateRequest({ ...c2sFirst, messages: [...c2sFirst.messages, ...c2pair("c2s1", [th("plan"), tx("Asking the advisor.")], "advice")] }, c2sSkip)).request;
+check("stubs+advisor: the continuation sends the first call tools byte for byte",
+  JSON.stringify(c2sCont.tools), JSON.stringify(c2sUp1.tools));
+check("stubs+advisor: the continuation extends the first call prefix",
+  JSON.stringify(c2sCont.messages.slice(0, c2sUp1.messages.length)), JSON.stringify(c2sUp1.messages));
+recordConsults("c2s", [{ id: "c2s1", carried: consultCarry([th("plan"), tx("Asking the advisor.")], "Asking the advisor."), advice: "advice", after: [tx("Done.")] }]);
+const c2sNextBody = c2sbase();
+c2sNextBody.messages.push(
+  { role: "assistant", content: [th("plan"), tx("Asking the advisor."), tx("Done.")] },
+  { role: "user", content: "more" },
+);
+const c2sNext = (await translateRequest(c2sNextBody, c2sOpen)).request;
+check("stubs+advisor: the next turn keeps the tools", JSON.stringify(c2sNext.tools), JSON.stringify(c2sUp1.tools));
+check("stubs+advisor: the next turn extends the continuation prefix",
+  JSON.stringify(c2sNext.messages.slice(0, c2sCont.messages.length)), JSON.stringify(c2sCont.messages));
+_resetAdvisorGuidance();
+
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }
 console.log(`${failed} check(s) failed`);
