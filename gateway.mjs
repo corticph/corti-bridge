@@ -867,6 +867,11 @@ async function handleMessages(req, res, body) {
   const advisorEffort = noAdvisor
     ? (process.env.CORTI_ADVISOR_EFFORT || "high")
     : undefined;
+  // Thinking cap for the advisor child: about the 99th percentile of real advisor thinking, so a
+  // normal consult never meets it and a runaway one has to stop and answer.
+  const advisorThinkingBudget = noAdvisor
+    ? (Number(process.env.CORTI_ADVISOR_THINKING_BUDGET) || 8192)
+    : undefined;
   let translated;
   let stubSchemas;
   // One lookup per turn: the advisor continuation must resolve the same effort as the first call.
@@ -874,7 +879,7 @@ async function handleMessages(req, res, body) {
   try {
     const imageOpts = await imageInterceptOpts(anthropicBody, anthropicBody?.skipImages);
     const out = await translateRequest(anthropicBody, {
-      skipAdvisor: noAdvisor, mode: "openai", advisorEffort, parentSessionId,
+      skipAdvisor: noAdvisor, mode: "openai", advisorEffort, advisorThinkingBudget, parentSessionId,
       skipImages: anthropicBody?.skipImages, ...imageOpts,
       forwardThinking: FORWARD_THINKING,
       effortLevels,

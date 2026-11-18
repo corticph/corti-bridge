@@ -1435,6 +1435,14 @@ export async function translateRequest(body, opts) {
     if (sent !== undefined) req.reasoning_effort = sent;
     effortTrace = { requested: requestedEffort, sent, levels };
   }
+  // The advisor child's thinking is capped so it always reaches its answer: uncapped, a hard
+  // consult thinks to max_tokens with no text, and Claude Code then restarts it from zero.
+  // Only on a reasoning request, and never at or above max_tokens (room is left for the answer).
+  if (opts?.advisorThinkingBudget > 0 && req.reasoning_effort !== undefined) {
+    const room = req.max_tokens - 1024;
+    const budget = Math.min(opts.advisorThinkingBudget, req.thinking_token_budget ?? Infinity, room);
+    if (budget > 0) req.thinking_token_budget = budget;
+  }
 
   // Forwarded thinking counts on its own channel so debug logs read "forwarded: …", not "dropped:".
   const forwardedCount = req.messages.filter((m) => m.reasoning).length;

@@ -91,6 +91,14 @@ check("levels: advisor max on s1 stays max", await viaLevels("corti-s1", ADAPTIV
 const traced = await translateRequest({ model: "corti-s1-mini", max_tokens: 16, thinking: ADAPTIVE, messages: [{ role: "user", content: "hi" }] },
   { effortLevels: levelsOf({ "corti-s1-mini": MINI }) });
 check("levels: trace reports requested and sent", JSON.stringify([traced.effort?.requested, traced.effort?.sent]), JSON.stringify(["high", "xhigh"]));
+// Advisor thinking budget: capped on a reasoning request, below max_tokens, never raised.
+const tb = async (model, extra, opts) => (await translateRequest({ model, max_tokens: 32000, thinking: ADAPTIVE, messages: [{ role: "user", content: "hi" }], ...extra },
+  { effortLevels: levelsOf({ "corti-s1": S1, "corti-s1-instant": [] }), ...opts })).request.thinking_token_budget;
+check("advisor budget: set on the advisor child", await tb("corti-s1", {}, { advisorEffort: "high", advisorThinkingBudget: 8192 }), 8192);
+check("advisor budget: absent on an ordinary request", await tb("corti-s1", {}, {}), undefined);
+check("advisor budget: never sent to a model that takes no effort", await tb("corti-s1-instant", {}, { advisorEffort: "high", advisorThinkingBudget: 8192 }), undefined);
+check("advisor budget: a smaller client budget stands", await tb("corti-s1", { thinking: ENABLED(4000) }, { advisorEffort: "high", advisorThinkingBudget: 8192 }), 4000);
+check("advisor budget: leaves room for the answer under max_tokens", await tb("corti-s1", { max_tokens: 6000 }, { advisorEffort: "high", advisorThinkingBudget: 8192 }), 4976);
 
 // executorCwd: harness-authored environment block only; the first occurrence is the session own.
 const ENVBLOCK = (d) => "# Environment\n - Primary working directory: " + d + "\n - Is a git repository: true";

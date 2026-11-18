@@ -1664,6 +1664,18 @@ curl -s -m 15 -H 'content-type: application/json' \
   "http://127.0.0.1:4304/v1/messages" >/dev/null || :
 check "EFFORT: s1 picker low is sent as low" \
   "$(grep -c '"reasoning_effort":"low"' imgchat.log 2>/dev/null || :)" "1"
+rm -f imgchat.log
+curl -s -m 15 -H 'content-type: application/json' -H 'authorization: Bearer local-gateway-noadvisor-openai' \
+  -d '{"model":"corti-s1","max_tokens":32000,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"hi"}]}' \
+  "http://127.0.0.1:4304/v1/messages" >/dev/null || :
+check "ADVISOR-BUDGET: the advisor child reaches upstream with a thinking budget" \
+  "$(grep -c '"thinking_token_budget":8192' imgchat.log 2>/dev/null || :)" "1"
+rm -f imgchat.log
+curl -s -m 15 -H 'content-type: application/json' \
+  -d '{"model":"corti-s1","max_tokens":32000,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"hi"}]}' \
+  "http://127.0.0.1:4304/v1/messages" >/dev/null || :
+check "ADVISOR-BUDGET: an ordinary request carries none" \
+  "$(grep -c 'thinking_token_budget' imgchat.log 2>/dev/null || :)" "0"
 kill "$_ef_pid" 2>/dev/null || :; wait "$_ef_pid" 2>/dev/null || :
 unset _ef_gw _ef_pid
 
