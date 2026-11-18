@@ -100,6 +100,19 @@ check("advisor budget: never sent to a model that takes no effort", await tb("co
 check("advisor budget: a smaller client budget stands", await tb("corti-s1", { thinking: ENABLED(4000) }, { advisorEffort: "high", advisorThinkingBudget: 8192 }), 4000);
 check("advisor budget: leaves room for the answer under max_tokens", await tb("corti-s1", { max_tokens: 6000 }, { advisorEffort: "high", advisorThinkingBudget: 8192 }), 4976);
 
+// C2: the rewrite path hands the caller abort signal to the advisor spawn.
+{
+  const seen = [];
+  const ac = new AbortController();
+  const rwBody = { model: "corti-s1", max_tokens: 16, tools: [ANYTOOL()], messages: [
+    { role: "user", content: "advise me" },
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_rw1", name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_rw1", is_error: true, content: "Error: No such tool available: consult_advisor" }] },
+  ] };
+  await applyIntercepts(rwBody, { mode: "openai", signal: ac.signal, runAdvisor: async (t, o) => { seen.push(o); return "rw advice"; } });
+  check("advisor rewrite: the spawn receives the abort signal", seen[0]?.signal === ac.signal, true);
+}
+
 // executorCwd: harness-authored environment block only; the first occurrence is the session own.
 const ENVBLOCK = (d) => "# Environment\n - Primary working directory: " + d + "\n - Is a git repository: true";
 check("executorCwd: role system message (string)", executorCwd({ messages: [{ role: "system", content: ENVBLOCK("/work/proj") }, { role: "user", content: "hi" }] }), "/work/proj");
@@ -112,6 +125,7 @@ check("executorCwd: first occurrence wins over a later update", executorCwd({ me
 ] }), "/work/first");
 check("executorCwd: an update line alone drops its (was ...) suffix", executorCwd({ messages: [{ role: "system", content: " - Primary working directory: /work/b (was /work/a)" }] }), "/work/b");
 check("executorCwd: absent", executorCwd({ messages: [{ role: "user", content: "hi" }] }), undefined);
+check("executorCwd: prose in the system prompt does not count", executorCwd({ system: "Docs say: Primary working directory: /evil is shown in the env block.", messages: [{ role: "system", content: ENVBLOCK("/work/real") }] }), "/work/real");
 
 // runAdvisor failure mapping, through a real child process (CORTI_ADVISOR_STUB).
 {

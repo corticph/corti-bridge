@@ -966,7 +966,7 @@ function advisorWanted(mode, skipAdvisor) {
 // off), on/off force both modes. skipAdvisor (the -noadvisor- recursion guard) is authoritative
 // and checked first inside advisorWanted so no env var can override it. The runAdvisor
 // dependency is injectable via ctx so tests stay hermetic (no child_process spawn).
-async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor, mode, parentSessionId, advisorProcessed } = {}) {
+async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor, mode, parentSessionId, advisorProcessed, signal } = {}) {
   if (!advisorWanted(mode, skipAdvisor)) return [];
   // No tools means no next action to steer — a one-shot side call (summarise a page, title a
   // chat), not an agent loop. Measured: 6 of 7 consults in one session, 50s of Opus time wasted.
@@ -1016,7 +1016,8 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
         { ...body, messages: restoreAdvisorGuidance(parentSessionId, body.messages) },
         { maxTokens: advisorMaxTokens() },
       );
-      const out = await call(text, { parentSessionId, cwd: executorCwd(body) });
+      // signal: a client that hangs up mid-rewrite must not leave the child running its whole budget.
+      const out = await call(text, { parentSessionId, cwd: executorCwd(body), signal });
       // A bare string is a test stub (backward compat) — treat as success.
       const res = typeof out === "string" ? { ok: true, text: out } : out;
       let guidance;

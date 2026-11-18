@@ -13,7 +13,7 @@ A local gateway that lets Claude Code run on Corti's API. Claude Code speaks Ant
 There is no build or lint step. Tests are plain shell scripts, each a self-contained suite:
 
 ```bash
-sh test/translate.sh   # pure-function tests for translate.mjs — offline, no credentials
+sh test/translate.sh   # translate.mjs tests — offline, no credentials (runAdvisor cases spawn local stub scripts)
 sh test/retry.sh       # pure-function tests for lib/retry.mjs
 sh test/prompt-estimate.sh  # pure-function tests for lib/prompt-estimate.mjs
 sh test/models.sh      # tier-mapping tests for lib/models.mjs (local only — git-ignored with its captured fixtures; absent on fresh clones)

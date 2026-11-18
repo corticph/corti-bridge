@@ -1192,6 +1192,18 @@ check "HANGUP: a pass-through request is cancelled upstream" \
   "$(grep -c '^passthrough cancelled' hangup-upstream.log)" "1"
 set -e
 
+# The rewrite path: a replayed consult the harness answered "Unknown tool" is answered by the
+# intercept before anything goes upstream. A hang-up then must stop that advisor child too.
+rm -f "$HANGUP_ADVISOR_DONE"
+RWBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"advise me"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_rw","name":"consult_advisor","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_rw","is_error":true,"content":"Error: No such tool available: consult_advisor"}]}]}'
+curl -s -m 1 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: hangup-rw' \
+  -d "$RWBODY" "http://127.0.0.1:4720/v1/messages" > /dev/null 2>&1 || true
+sleep 6
+set +e
+check "HANGUP: a rewrite-path advisor child is stopped on hang-up" \
+  "$([ -e "$HANGUP_ADVISOR_DONE" ] && echo finished || echo stopped)" "stopped"
+set -e
+
 kill "$HANGUP_GW_PID" "$HANGSTUB_PID" 2>/dev/null || :
 wait "$HANGUP_GW_PID" "$HANGSTUB_PID" 2>/dev/null || :
 
@@ -1678,6 +1690,39 @@ check "ADVISOR-BUDGET: an ordinary request carries none" \
   "$(grep -c 'thinking_token_budget' imgchat.log 2>/dev/null || :)" "0"
 kill "$_ef_pid" 2>/dev/null || :; wait "$_ef_pid" 2>/dev/null || :
 unset _ef_gw _ef_pid
+
+# CATALOG-WAIT: a slow /models must only hold the requests that read effort levels.
+cat > slowmodels.mjs <<'SLOWSTUB'
+import fs from "node:fs";
+import https from "node:https";
+https.createServer({ key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") }, (req, res) => {
+  req.resume();
+  req.on("end", () => {
+    if (req.url.split("?")[0].endsWith("/models")) return void setTimeout(() => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data: [{ id: "corti-s1", capabilities: { reasoning: true }, effort: { supported: true, levels: ["low", "high", "max"] } }] }));
+    }, 8000);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: "c", choices: [{ index: 0, message: { role: "assistant", content: "fast" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+  });
+}).listen(0, "127.0.0.1", function () { console.log(`SLOWPORT=${this.address().port}`); });
+SLOWSTUB
+node slowmodels.mjs > slowmodels.out 2>&1 &
+SLOWSTUB_PID=$!
+SLOWUP=""
+while [ -z "$SLOWUP" ]; do SLOWUP=$(sed -n 's/^SLOWPORT=//p' slowmodels.out); done
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > slowgateway_4305.mjs
+CORTI_BEARER=test CORTI_BASE_URL="https://127.0.0.1:$SLOWUP/v1" CORTI_PORT=4305 NODE_TLS_REJECT_UNAUTHORIZED=0 \
+  node slowgateway_4305.mjs > slowgw_4305.out 2>&1 &
+SLOWGW_PID=$!
+wait_banner slowgw_4305.out || { echo "FAIL CATALOG-WAIT gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+check "CATALOG-WAIT: a request without thinking does not wait on a slow /models" \
+  "$(curl -s -m 3 -H 'content-type: application/json' \
+    -d '{"model":"corti-s1","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}' \
+    "http://127.0.0.1:4305/v1/messages" | grep -c '"text":"fast"')" "1"
+kill "$SLOWGW_PID" "$SLOWSTUB_PID" 2>/dev/null || :
+wait "$SLOWGW_PID" "$SLOWSTUB_PID" 2>/dev/null || :
 
 kill "$IMGSTUB_PID" 2>/dev/null || :
 wait "$IMGSTUB_PID" 2>/dev/null || :

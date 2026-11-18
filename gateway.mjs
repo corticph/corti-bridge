@@ -305,6 +305,9 @@ async function handlePassthrough(req, res, reqPath) {
 
   let body = await rawBody(req);
   const started = Date.now();
+  // The intercept can run the advisor before anything goes upstream; a hang-up then kills it.
+  const passAbort = new AbortController();
+  res.on("close", () => { if (!res.writableEnded) passAbort.abort(); });
 
   if (!isCountTokens && req.method === "POST" && reqPath === "/v1/messages") {
     try {
@@ -312,6 +315,7 @@ async function handlePassthrough(req, res, reqPath) {
       const imageOpts = await imageInterceptOpts(parsed, parsed?.skipImages);
       await applyIntercepts(parsed, {
         skipAdvisor: wantsNoAdvisor(req),
+        signal: passAbort.signal,
         mode: "anthropic",
         parentSessionId: req.headers["x-claude-code-session-id"],
         skipImages: parsed?.skipImages,
@@ -431,16 +435,16 @@ let imageModels = null;
 let imageModelsLoading = null;
 /** model id → catalog `effort.levels` ([] when the model takes no effort), from the same fetch.
  *  null while unknown: translateRequest then falls back to the {high, max} collapse. */
-let effortLevels = null;
+let catalogEffortLevels = null;
 let catalogFailedAt = 0;
 const CATALOG_RETRY_MS = 60_000;
 
 /** Wait for the effort levels: prefetched at boot, refetched at most once a minute after a failure
  *  so a down /models never adds its timeout to every request. */
 async function effortLevelsLookup() {
-  if (effortLevels === null && (imageModelsLoading || Date.now() - catalogFailedAt >= CATALOG_RETRY_MS))
+  if (catalogEffortLevels === null && (imageModelsLoading || Date.now() - catalogFailedAt >= CATALOG_RETRY_MS))
     await fetchCatalog();
-  const map = effortLevels;
+  const map = catalogEffortLevels;
   return (id) => map?.get(id);
 }
 
@@ -473,7 +477,7 @@ function fetchCatalog() {
               else if (Array.isArray(m.effort?.levels)) levels.set(m.id, m.effort.levels);
             }
             imageModels = sighted;
-            effortLevels = levels;
+            catalogEffortLevels = levels;
           } catch {
             failed();
             return resolve();
@@ -875,11 +879,13 @@ async function handleMessages(req, res, body) {
   let translated;
   let stubSchemas;
   // One lookup per turn: the advisor continuation must resolve the same effort as the first call.
-  const effortLevels = await effortLevelsLookup();
+  // Only a thinking request or the advisor child reads levels, so only those wait on the catalog.
+  const effortLevels = anthropicBody?.thinking || noAdvisor ? await effortLevelsLookup() : () => undefined;
   try {
     const imageOpts = await imageInterceptOpts(anthropicBody, anthropicBody?.skipImages);
     const out = await translateRequest(anthropicBody, {
       skipAdvisor: noAdvisor, mode: "openai", advisorEffort, advisorThinkingBudget, parentSessionId,
+      signal: clientAbort.signal,
       skipImages: anthropicBody?.skipImages, ...imageOpts,
       forwardThinking: FORWARD_THINKING,
       effortLevels,
