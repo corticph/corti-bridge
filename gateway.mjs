@@ -35,6 +35,7 @@ import {
   retryDelayMs,
 } from "./lib/retry.mjs";
 import { resolveVisionModel } from "./lib/vision.mjs";
+import { executorCwd } from "./lib/harness-text.mjs";
 
 const HOST = process.env.CORTI_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.CORTI_PORT ?? 4192);
@@ -928,6 +929,8 @@ async function handleMessages(req, res, body) {
    * never given the advisor, so it must not be able to hold a turn open for one either.
    */
   const advisorOffered = anthropicBody.tools?.some((t) => t?.name === "consult_advisor");
+  // Read once per turn: the advisor child runs in the executor's directory, not the gateway's.
+  const advisorDir = advisorOffered ? executorCwd(anthropicBody) : undefined;
   let advisorHandled = false;
   // State of the current round, read by endContinuationFailure.
   let resIdx = 0;
@@ -983,7 +986,7 @@ async function handleMessages(req, res, body) {
     const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
     diagnostics.push(`advisor hold-and-continue: id=${consultId} transcript=${advisorInput.length} chars${elidedStr} round=${round}`);
     try {
-      const out = await runAdvisor(advisorInput, { parentSessionId, signal: clientAbort.signal });
+      const out = await runAdvisor(advisorInput, { parentSessionId, signal: clientAbort.signal, cwd: advisorDir });
       // Bare string = injected test stub; treat as success for backward compat.
       const result = typeof out === "string" ? { ok: true, text: out } : out;
       return result ?? { ok: false, code: "unavailable" };

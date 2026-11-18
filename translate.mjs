@@ -3,10 +3,12 @@
 import https from "node:https";
 import path from "node:path";
 import fs from "node:fs";
+import os from "node:os";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { serializeAdvisorInput } from "./lib/advisor-transcript.mjs";
+import { executorCwd } from "./lib/harness-text.mjs";
 import { renderToolReferences, toolsByName, planDeferredTools, deferredStub, coerceStubInput, DEFERRED_STUB_DESCRIPTION } from "./lib/tool-search.mjs";
 
 export const REASONING_SIGNATURE = "Y29ydGktcHJveHk="; // base64 "corti-proxy"
@@ -572,6 +574,15 @@ const ADVISOR_TOOL_DEF = {
 // full context the executor has, per the official advisor tool's "server supplies context"
 // behaviour. A bare string return from an injected test stub is treated as { ok: true, text }
 // so tests that return plain advice strings stay unchanged.
+/** The advisor child runs in the executor's directory, so its own environment block names the
+ *  project it is advising on. Never the gateway's: that is whichever project first started it. */
+function advisorCwd(dir) {
+  try {
+    if (typeof dir === "string" && path.isAbsolute(dir) && fs.statSync(dir).isDirectory()) return dir;
+  } catch { /* gone or unreadable: fall through */ }
+  return os.tmpdir();
+}
+
 export function runAdvisor(text, opts = {}) {
   return new Promise((resolve) => {
     // Test seam: CORTI_ADVISOR_STUB is a script that reads the transcript on stdin and writes a
@@ -585,6 +596,9 @@ export function runAdvisor(text, opts = {}) {
       "--system-prompt-file", ADVISOR_PROMPT_FILE,
       "--tools", "",
       "--input-format", "text",
+      // The executor's directory supplies the environment block only: its project settings would
+      // run their hooks and MCP servers on every consult.
+      "--setting-sources", "user",
     ];
     const env = { ...process.env };
     // The child must not inherit the gateway's debug logging: CORTI_DEBUG makes corti-bridge
@@ -613,6 +627,9 @@ export function runAdvisor(text, opts = {}) {
     // openai-mode advisorWanted("openai", false) sees CORTI_ADVISOR=off → no injection.
     // Primary guard remains CORTI_ADVISOR_NOINJECT (the token stamp → skipAdvisor:true).
     env.CORTI_ADVISOR = "off";
+    // The executor's CLAUDE.md files already reach the advisor inside the transcript, framed as
+    // quoted context; loaded again by the child they would arrive as instructions to the advisor.
+    env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
     // maxBuffer bounds the child's combined stdout. The advisor is an Opus-tier model
     // emitting --output-format json (an array of every event); even without inherited debug
     // logging, that stream can exceed a few MB on a long consult. 32MB is generous headroom —
@@ -621,6 +638,7 @@ export function runAdvisor(text, opts = {}) {
     // err.code if this is ever too small again.
     const child = execFile(cmd, args, {
       env,
+      cwd: advisorCwd(opts.cwd),
       timeout: ADVISOR_TIMEOUT_MS,
       signal: opts.signal,
       maxBuffer: 32 * 1024 * 1024,
@@ -991,7 +1009,7 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
         { ...body, messages: restoreAdvisorGuidance(parentSessionId, body.messages) },
         { maxTokens: advisorMaxTokens() },
       );
-      const out = await call(text, { parentSessionId });
+      const out = await call(text, { parentSessionId, cwd: executorCwd(body) });
       // A bare string is a test stub (backward compat) — treat as success.
       const res = typeof out === "string" ? { ok: true, text: out } : out;
       let guidance;

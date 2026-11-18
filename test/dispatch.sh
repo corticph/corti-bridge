@@ -217,6 +217,8 @@ cat > advisor-stub.sh <<'ADVSTUB'
 # Keep the transcript when asked (C1-CARRY asserts on what the advisor was actually shown);
 # discard it otherwise, so the other suites stay unaffected.
 if [ -n "${ADVISOR_STUB_CAPTURE:-}" ]; then cat >> "$ADVISOR_STUB_CAPTURE"; else cat >/dev/null; fi
+# ADVISOR-CWD: where the child was started and whether it may load CLAUDE.md files.
+[ -n "${ADVISOR_STUB_ENVCAP:-}" ] && printf 'cwd=%s mds=%s\n' "$(pwd -P)" "${CLAUDE_CODE_DISABLE_CLAUDE_MDS:-}" >> "$ADVISOR_STUB_ENVCAP"
 printf '{"ok":true,"text":"stub advisor advice"}'
 ADVSTUB
 chmod +x advisor-stub.sh
@@ -716,6 +718,7 @@ CORTI_BASE_URL="https://127.0.0.1:$C1CARRYUP/v1" \
 CORTI_PORT="$C1_CARRY_PORT" \
 CORTI_ADVISOR_STUB="$SCRATCH/advisor-stub.sh" \
 ADVISOR_STUB_CAPTURE="$CARRY_ADVISOR_IN" \
+ADVISOR_STUB_ENVCAP="$SCRATCH/carry-advisor-env.txt" \
 CORTI_DEBUG=1 \
 CORTI_DEBUG_DIR="$SCRATCH/carry-logs" \
 NODE_TLS_REJECT_UNAUTHORIZED=0 \
@@ -808,6 +811,28 @@ check "C1-SIDECALL: no executor advisor prompt is prepended" \
   "$(carry_upstream "$SIDELOG" 1 | grep -c 'You have access to an .advisor. tool')" "0"
 check "C1-SIDECALL: the turn still completes normally" \
   "$(printf '%s' "$SIDERESP" | grep -c '^event: message_stop')" "1"
+set -e
+
+# --- ADVISOR-CWD: the advisor child runs in the executor directory (from the harness environment
+# block), never the gateway one, and never loads CLAUDE.md files of its own.
+EXECDIR="$SCRATCH/executor-project"
+mkdir -p "$EXECDIR"
+EXECDIR_REAL=$(cd "$EXECDIR" && pwd -P)
+GWDIR_REAL=$(pwd -P)
+TMPDIR_REAL=$(node -e 'process.stdout.write(require("fs").realpathSync(require("os").tmpdir()))')
+cwd_body() { printf '%s' '{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"system","content":"# Environment\n - Primary working directory: '"$1"'\n"},{"role":"user","content":"advise me"}]}'; }
+: > "$SCRATCH/carry-advisor-env.txt"
+curl -s -m 20 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: cwd-sess-1' \
+  -d "$(cwd_body "$EXECDIR")" "$C1CARRYG/v1/messages" >/dev/null 2>&1 || true
+curl -s -m 20 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: cwd-sess-2' \
+  -d "$(cwd_body "$SCRATCH/no-such-dir")" "$C1CARRYG/v1/messages" >/dev/null 2>&1 || true
+set +e
+check "ADVISOR-CWD: the child runs in the executor directory" \
+  "$(sed -n 1p "$SCRATCH/carry-advisor-env.txt")" "cwd=$EXECDIR_REAL mds=1"
+check "ADVISOR-CWD: a missing directory falls back to the temp dir" \
+  "$(sed -n 2p "$SCRATCH/carry-advisor-env.txt")" "cwd=$TMPDIR_REAL mds=1"
+check "ADVISOR-CWD: never the gateway directory" \
+  "$(grep -c "cwd=$GWDIR_REAL " "$SCRATCH/carry-advisor-env.txt")" "0"
 set -e
 
 kill "$C1_CARRY_GW_PID" "$C1CARRYSTUB_PID" 2>/dev/null || :

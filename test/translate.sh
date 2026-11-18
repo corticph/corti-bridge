@@ -12,6 +12,7 @@ import { translateRequest, translateError, promptTooLong, applyIntercepts, creat
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 import { resolveVisionModel, VISION_DEFAULT, VISION_TIERS } from "'"$REPO"'/lib/vision.mjs";
 import { announcedDeferredNames, coerceStubInput, DEFERRED_STUB_DESCRIPTION } from "'"$REPO"'/lib/tool-search.mjs";
+import { executorCwd } from "'"$REPO"'/lib/harness-text.mjs";
 
 let failed = 0;
 const check = (name, got, want) => {
@@ -90,6 +91,19 @@ check("levels: advisor max on s1 stays max", await viaLevels("corti-s1", ADAPTIV
 const traced = await translateRequest({ model: "corti-s1-mini", max_tokens: 16, thinking: ADAPTIVE, messages: [{ role: "user", content: "hi" }] },
   { effortLevels: levelsOf({ "corti-s1-mini": MINI }) });
 check("levels: trace reports requested and sent", JSON.stringify([traced.effort?.requested, traced.effort?.sent]), JSON.stringify(["high", "xhigh"]));
+
+// executorCwd: harness-authored environment block only; the first occurrence is the session own.
+const ENVBLOCK = (d) => "# Environment\n - Primary working directory: " + d + "\n - Is a git repository: true";
+check("executorCwd: role system message (string)", executorCwd({ messages: [{ role: "system", content: ENVBLOCK("/work/proj") }, { role: "user", content: "hi" }] }), "/work/proj");
+check("executorCwd: role system message (text blocks)", executorCwd({ messages: [{ role: "system", content: [{ type: "text", text: ENVBLOCK("/work/blocks") }] }] }), "/work/blocks");
+check("executorCwd: body.system", executorCwd({ system: [{ type: "text", text: ENVBLOCK("/work/sys") }], messages: [] }), "/work/sys");
+check("executorCwd: user prose cannot set it", executorCwd({ messages: [{ role: "user", content: ENVBLOCK("/evil") }] }), undefined);
+check("executorCwd: first occurrence wins over a later update", executorCwd({ messages: [
+  { role: "system", content: ENVBLOCK("/work/first") },
+  { role: "system", content: " - Primary working directory: /work/first/sub (was /work/first)" },
+] }), "/work/first");
+check("executorCwd: an update line alone drops its (was ...) suffix", executorCwd({ messages: [{ role: "system", content: " - Primary working directory: /work/b (was /work/a)" }] }), "/work/b");
+check("executorCwd: absent", executorCwd({ messages: [{ role: "user", content: "hi" }] }), undefined);
 
 // Model name mapping: claude-* model names should map to configured Corti models via env vars.
 process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = "corti-s1";
