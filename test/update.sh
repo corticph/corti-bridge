@@ -45,7 +45,7 @@ git -C "$SCRATCH/up" push -q origin main
 git clone -q "$SCRATCH/origin.git" "$SCRATCH/clone"
 
 # A stub claude: on PATH, exits cleanly, prints a marker so a forbidden fall-through is detectable.
-printf '#!/bin/sh\necho "STUB-CLAUDE $*"\necho "STUB-ENV auto-mode-server=${CLAUDE_CODE_AUTO_MODE_SERVER-unset}"\necho "STUB-ENV auto-mode-model=${CLAUDE_CODE_AUTO_MODE_MODEL-unset}"\nexit 0\n' > "$SCRATCH/bin/claude"
+printf '#!/bin/sh\necho "STUB-CLAUDE $*"\necho "STUB-ENV auto-mode-server=${CLAUDE_CODE_AUTO_MODE_SERVER-unset}"\necho "STUB-ENV auto-mode-model=${CLAUDE_CODE_AUTO_MODE_MODEL-unset}"\necho "STUB-ENV stream-idle=${CLAUDE_STREAM_IDLE_TIMEOUT_MS-unset} force-idle=${API_FORCE_IDLE_TIMEOUT-unset}"\nexit 0\n' > "$SCRATCH/bin/claude"
 chmod +x "$SCRATCH/bin/claude"
 
 CLONE="$SCRATCH/clone"
@@ -348,6 +348,11 @@ check "launch: an explicit CLAUDE_CODE_AUTO_MODE_SERVER is kept" \
     "$(CLAUDE_CODE_AUTO_MODE_SERVER=1 CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" 2>/dev/null | grep -c 'auto-mode-server=1$' || :)" "1"
 check "launch: anthropic mode also routes the review client-side" \
     "$(unset CLAUDE_CODE_AUTO_MODE_SERVER; CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" --anthropic 2>/dev/null | grep -c 'auto-mode-server=0$' || :)" "1"
+# An advisor run is silent for minutes; without these Claude Code drops the stream at 300s and resends.
+check "launch: the client waits through a long advisor run" \
+    "$(unset CLAUDE_STREAM_IDLE_TIMEOUT_MS API_FORCE_IDLE_TIMEOUT; CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" 2>/dev/null | grep -c 'stream-idle=900000 force-idle=0$' || :)" "1"
+check "launch: explicit client timeouts are kept" \
+    "$(CLAUDE_STREAM_IDLE_TIMEOUT_MS=1200000 API_FORCE_IDLE_TIMEOUT=1 CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" 2>/dev/null | grep -c 'stream-idle=1200000 force-idle=1$' || :)" "1"
 # Corti's /anthropic drops reasoning, so only that mode moves the classifier to the instant haiku tier.
 check "launch: anthropic mode classifies on the haiku tier" \
     "$(unset CLAUDE_CODE_AUTO_MODE_MODEL; ANTHROPIC_DEFAULT_HAIKU_MODEL=test-instant CORTI_NO_UPDATE_CHECK=1 sh "$BRIDGE" --anthropic 2>/dev/null | grep -c 'auto-mode-model=test-instant$' || :)" "1"
