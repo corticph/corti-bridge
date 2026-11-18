@@ -332,10 +332,10 @@ const ADVISOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-prompt.txt");
 const ADVISOR_EXECUTOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-executor-prompt.txt");
 // The advisor is a headless Opus-tier `corti-bridge -p` reasoning over a large serialized
 // transcript — a single consult can legitimately take minutes, not seconds. 60s was
-// observed timing out in real sessions. 12 minutes is the floor; raise CORTI_ADVISOR_TIMEOUT_MS
+// observed timing out in real sessions. 8 minutes is the floor; raise CORTI_ADVISOR_TIMEOUT_MS
 // to extend further. The gateway's stream-idle watchdog is suppressed for the advisor
 // handoff (see gateway.mjs deadlineCheck / advisorHandoff) so this is the real ceiling.
-const ADVISOR_TIMEOUT_MS = Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 12 * 60_000;
+const ADVISOR_TIMEOUT_MS = Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 8 * 60_000;
 const ADVISOR_MODEL = process.env.CORTI_ADVISOR_MODEL || "opus";
 // Soft per-call output cap, surfaced to the advisor via the serialized transcript's budget
 // line. The official advisor tool sets a hard `max_tokens` on the tool def; corti-bridge -p
