@@ -8,7 +8,7 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
-import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache, _resetImageCache, estimateTokens } from "'"$REPO"'/translate.mjs";
+import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, consultCarry, splitConsult, consultAnchor, recordConsults, _resetWebSearchCache, _resetImageCache, estimateTokens } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 import { resolveVisionModel, VISION_DEFAULT, VISION_TIERS } from "'"$REPO"'/lib/vision.mjs";
 import { announcedDeferredNames, coerceStubInput, DEFERRED_STUB_DESCRIPTION } from "'"$REPO"'/lib/tool-search.mjs";
@@ -532,6 +532,125 @@ const lt2 = createStreamTranslator({}, () => {});
 lt2.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "tu_first", type: "function", function: { name: "run_bash", arguments: "{}" } }] } }] });
 lt2.feed({ choices: [{ index: 0, delta: { content: "after the call" } }] });
 check("A4: firstBlock reports a leading tool call by id", JSON.stringify(lt2.firstBlock), JSON.stringify({ type: "tool", id: "tu_first" }));
+
+// Block G6 — CONT-CACHE: a continuation extends the upstream prompt (tools first, then system and
+// history), and the next turn rebuilt by restoreAdvisorGuidance extends the continuation.
+const c2ev = [];
+const c2t = createStreamTranslator({ reasoningMode: "thinking", onAdvisorToolUse: () => {} }, (e, d) => c2ev.push([e, d]));
+c2t.feed({ choices: [{ index: 0, delta: { reasoning: "plan" } }] });
+c2t.feed({ choices: [{ index: 0, delta: { content: "Asking the advisor." } }] });
+c2t.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c2_adv", type: "function", function: { name: "consult_advisor", arguments: "{}" } }] } }] });
+c2t.feed({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+const C2SIG = "Y29ydGktcHJveHk=";
+const th = (t) => ({ type: "thinking", thinking: t, signature: C2SIG });
+const tx = (t) => ({ type: "text", text: t });
+check("CONT-CACHE: blocks hold what the client was sent, the suppressed consult excluded",
+  JSON.stringify(c2t.blocks), JSON.stringify([th("plan"), tx("Asking the advisor.")]));
+const c2tool = createStreamTranslator({}, () => {});
+c2tool.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "tb1", type: "function", function: { name: "run_bash", arguments: "{\"cmd\":" } }] } }] });
+c2tool.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: "\"ls\"}" } }] } }] });
+check("CONT-CACHE: blocks carry a tool call with its parsed input",
+  JSON.stringify(c2tool.blocks), JSON.stringify([{ type: "tool_use", id: "tb1", name: "run_bash", input: { cmd: "ls" } }]));
+
+const tu = { type: "tool_use", id: "x1", name: "run_bash", input: {} };
+check("CONT-CACHE: consultCarry keeps thinking and text up to the pre-call text",
+  JSON.stringify(consultCarry([th("a"), tx("one"), tu, tx("two"), th("late")], "two")), JSON.stringify([th("a"), tx("one"), tx("two")]));
+check("CONT-CACHE: consultCarry carries only thinking when the round wrote no text",
+  JSON.stringify(consultCarry([th("a"), tu], "")), JSON.stringify([th("a")]));
+check("CONT-CACHE: consultCarry treats an unmatched pre-call text as none",
+  JSON.stringify(consultCarry([th("a"), tx("one")], "other")), JSON.stringify([th("a")]));
+check("CONT-CACHE: consultCarry tolerates a missing block list", JSON.stringify(consultCarry(undefined, "x")), "[]");
+const sc = splitConsult([th("a"), tx("lead"), tu, tx("last"), { type: "tool_use", id: "adv9", name: "consult_advisor", input: {} }]);
+check("CONT-CACHE: splitConsult takes the consult out and reports its id", sc.consultId + "/" + sc.blocks.length, "adv9/4");
+check("CONT-CACHE: splitConsult reports the anchors the stream translator would",
+  JSON.stringify([sc.lastText, sc.firstBlock]), JSON.stringify(["last", { type: "text", text: "lead" }]));
+check("CONT-CACHE: splitConsult without a consult", splitConsult([tx("hi")]).consultId, null);
+
+check("CONT-CACHE: consultAnchor follows the last carried block",
+  JSON.stringify(consultAnchor([th("a"), tx("pre")], [tx("x")])), JSON.stringify({ text: "pre", before: false }));
+check("CONT-CACHE: consultAnchor follows carried thinking when the round wrote no text",
+  JSON.stringify(consultAnchor([th("a")], [tx("x")])), JSON.stringify({ thinking: "a", before: false }));
+check("CONT-CACHE: consultAnchor precedes the continuation when nothing was carried",
+  JSON.stringify(consultAnchor([], [th("b"), tx("x")])), JSON.stringify({ thinking: "b", before: true }));
+check("CONT-CACHE: consultAnchor has nothing to anchor on", consultAnchor([], []), null);
+
+const c2tools = () => [{ name: "run_bash", description: "run", input_schema: { type: "object", properties: { cmd: { type: "string" } } } }];
+const c2base = () => ({ model: "corti-s1", max_tokens: 64, system: "agent", tools: c2tools(), messages: [{ role: "user", content: "fix it" }] });
+const c2pair = (id, carried, advice) => [
+  { role: "assistant", content: [...carried, { type: "tool_use", id, name: "consult_advisor", input: {} }] },
+  { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "<advisor_guidance>\n" + advice + "\n</advisor_guidance>", is_error: false }] },
+];
+const j = (v) => JSON.stringify(v);
+const c2skip = (sid) => ({ skipAdvisor: true, skipImages: true, parentSessionId: sid, forwardThinking: true });
+const c2open = (sid) => ({ mode: "openai", parentSessionId: sid, forwardThinking: true });
+// One consult turn as gateway.mjs runs it, then the next turn as the harness replays it (one
+// assistant message, advisor blocks dropped). rounds: blocks before each consult; last: the answer.
+const c2run = async (sid, rounds, last) => {
+  _resetAdvisorGuidance();
+  const first = c2base();
+  const up1 = (await translateRequest(first, c2open(sid))).request;
+  let h = [...first.messages];
+  const conts = [];
+  const answered = [];
+  for (let i = 0; i < rounds.length; i++) {
+    const r = rounds[i];
+    const pre = [...r].reverse().find((b) => b.type === "text")?.text ?? "";
+    const carried = consultCarry(r, pre);
+    h = [...h, ...c2pair("adv" + i, carried, "advice " + i)];
+    conts.push((await translateRequest({ ...first, messages: h }, c2skip(sid))).request);
+    answered.push({ id: "adv" + i, carried, advice: "advice " + i, after: i + 1 < rounds.length ? rounds[i + 1] : last });
+  }
+  recordConsults(sid, answered);
+  const next = c2base();
+  const tool = last.find((b) => b.type === "tool_use");
+  next.messages.push(
+    { role: "assistant", content: [...rounds.flat(), ...last] },
+    tool ? { role: "user", content: [{ type: "tool_result", tool_use_id: tool.id, content: "ok" }] } : { role: "user", content: "more" },
+  );
+  const nextUp = (await translateRequest(next, c2open(sid))).request;
+  const lastCont = conts[conts.length - 1];
+  const extendsPrev = conts.every((c, i) => j(c.messages.slice(0, (i ? conts[i - 1] : up1).messages.length)) === j((i ? conts[i - 1] : up1).messages));
+  return {
+    up1, conts, nextUp,
+    toolsSame: conts.every((c) => j(c.tools) === j(up1.tools)) && j(nextUp.tools) === j(up1.tools),
+    extendsPrev,
+    nextExtends: j(nextUp.messages.slice(0, lastCont.messages.length)) === j(lastCont.messages),
+  };
+};
+const bash = (id) => ({ type: "tool_use", id, name: "run_bash", input: { cmd: "ls" } });
+const c2cases = [
+  ["pre-call text, two rounds", [[th("plan one"), tx("Asking the advisor.")], [th("plan two"), tx("Checking once more.")]], [tx("Done."), bash("tn1")]],
+  ["the same pre-call text twice", [[th("plan one"), tx("Asking the advisor.")], [th("plan two"), tx("Asking the advisor.")]], [tx("Done.")]],
+  ["thinking only, continuation thinks then calls a tool", [[th("plan")]], [th("after advice"), bash("tn2")]],
+  ["thinking only, continuation thinks then answers", [[th("plan")]], [th("after advice"), tx("Done.")]],
+  ["a bare consult, continuation thinks first", [[]], [th("after advice"), tx("Done.")]],
+  ["two thinking-only rounds", [[th("plan one")], [th("plan two")]], [tx("Done.")]],
+];
+for (const [name, rounds, last] of c2cases) {
+  const r = await c2run("c2-" + name, rounds, last);
+  check(`CONT-CACHE (${name}): tools byte-identical on every request`, r.toolsSame, true);
+  check(`CONT-CACHE (${name}): each continuation extends the request before it`, r.extendsPrev, true);
+  check(`CONT-CACHE (${name}): next turn extends the last continuation`, r.nextExtends, true);
+}
+check("CONT-CACHE: the first call still offers consult_advisor",
+  (await c2run("c2-offer", [[tx("x")]], [tx("y")])).up1.tools.some((t) => t.function.name === "consult_advisor"), true);
+
+// A tool call beside the consult is not carried, so that next turn diverges; it must still
+// translate and keep the advice.
+const par = await c2run("c2-par", [[tx("Running and asking."), bash("tp1")]], [tx("Done.")]);
+check("CONT-CACHE: a parallel tool call still restores the advice next turn",
+  j(par.nextUp.messages).includes("advice 0"), true);
+
+// Sent bare, the consult does not extend into the next turn; guards that the check above can fail.
+_resetAdvisorGuidance();
+const bareFirst = c2base();
+await translateRequest(bareFirst, c2open("c2-bare"));
+const bareCont = (await translateRequest({ ...bareFirst, messages: [...bareFirst.messages, ...c2pair("adv0", [], "advice 0")] }, c2skip("c2-bare"))).request;
+recordConsults("c2-bare", [{ id: "adv0", carried: [th("plan"), tx("Asking.")], advice: "advice 0", after: [tx("Done.")] }]);
+const bareNext = (await translateRequest({ ...c2base(), messages: [{ role: "user", content: "fix it" }, { role: "assistant", content: [th("plan"), tx("Asking."), tx("Done.")] }, { role: "user", content: "more" }] }, c2open("c2-bare"))).request;
+check("CONT-CACHE: a consult sent without its round does not extend into the next turn",
+  j(bareNext.messages.slice(0, bareCont.messages.length)) === j(bareCont.messages), false);
+_resetAdvisorGuidance();
 
 // Block H — C6: prior-turn advisor advice round-trips into history instead of being dropped.
 // advisor_tool_result is NOT in SERVER_BLOCK_TYPES (only server_tool_use is); before the fix it

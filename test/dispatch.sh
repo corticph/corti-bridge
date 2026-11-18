@@ -813,6 +813,336 @@ set -e
 kill "$C1_CARRY_GW_PID" "$C1CARRYSTUB_PID" 2>/dev/null || :
 wait "$C1_CARRY_GW_PID" "$C1CARRYSTUB_PID" 2>/dev/null || :
 
+# --- C1-NESTED / CAP / NESTED-JSON / PARALLEL: a consult inside a continuation runs another
+# round under the same message, and every request extends the prefix of the one before it.
+cat > c1neststub.mjs <<'NESTSTUB'
+import fs from "node:fs";
+import https from "node:https";
+let capCalls = 0;
+const sse = (res, frames) => {
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  for (const f of frames) res.write(`data: ${JSON.stringify(f)}\n\n`);
+  res.end("data: [DONE]\n\n");
+};
+const consult = (id) => [
+  { choices: [{ index: 0, delta: { role: "assistant", content: "Consulting." } }] },
+  { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id, type: "function", function: { name: "consult_advisor", arguments: "" } }] } }] },
+  { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 1, completion_tokens: 1 } },
+];
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      if (body.includes("CAPME")) return sse(res, consult(`call_cap${++capCalls}`));
+      // TWINME: two consults in one assistant message.
+      if (body.includes("TWINME") && body.includes('"tool_call_id":"call_t')) return sse(res, [
+        { choices: [{ index: 0, delta: { role: "assistant", content: "TWIN ANSWER" } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } },
+      ]);
+      if (body.includes("TWINME")) return sse(res, [
+        { choices: [{ index: 0, delta: { role: "assistant", content: "Asking twice." } }] },
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_t1", type: "function", function: { name: "consult_advisor", arguments: "{}" } }] } }] },
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 1, id: "call_t2", type: "function", function: { name: "consult_advisor", arguments: "{}" } }] } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 1, completion_tokens: 1 } },
+      ]);
+      // PARALLELME: the consult arrives beside an ordinary tool call.
+      if (body.includes("PARALLELME") && body.includes('"tool_call_id":"call_p1"')) return sse(res, [
+        { choices: [{ index: 0, delta: { role: "assistant", content: "PAR ANSWER" } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } },
+      ]);
+      if (body.includes("PARALLELME")) return sse(res, [
+        { choices: [{ index: 0, delta: { role: "assistant", content: "Running and asking." } }] },
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_p0", type: "function", function: { name: "run_bash", arguments: "{}" } }] } }] },
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 1, id: "call_p1", type: "function", function: { name: "consult_advisor", arguments: "" } }] } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 1, completion_tokens: 1 } },
+      ]);
+      // JSONME: the continuations answer as one JSON completion, the non-streamed path.
+      const json = (message, finish) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "j", choices: [{ index: 0, message, finish_reason: finish }], usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+      };
+      if (body.includes("JSONME") && body.includes('"tool_call_id":"call_j2"'))
+        return json({ role: "assistant", content: "JSON ANSWER" }, "stop");
+      if (body.includes("JSONME") && body.includes('"tool_call_id":"call_j1"'))
+        return json({ role: "assistant", content: "Once more.", tool_calls: [{ id: "call_j2", type: "function", function: { name: "consult_advisor", arguments: "{}" } }] }, "tool_calls");
+      if (body.includes("JSONME")) return sse(res, consult("call_j1"));
+      if (body.includes('"tool_call_id":"call_n2"')) return sse(res, [
+        { choices: [{ index: 0, delta: { role: "assistant", content: "NESTED ANSWER" } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } },
+      ]);
+      if (body.includes('"tool_call_id":"call_n1"')) return sse(res, consult("call_n2"));
+      return sse(res, consult("call_n1"));
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`C1NESTPORT=${s.address().port}`));
+NESTSTUB
+
+node c1neststub.mjs > c1neststub.out 2>&1 &
+C1NESTSTUB_PID=$!
+C1NESTUP=""
+while [ -z "$C1NESTUP" ]; do C1NESTUP=$(sed -n 's/^C1NESTPORT=//p' c1neststub.out); done
+
+C1_NEST_PORT=4710
+mkdir -p "$SCRATCH/nest-logs"
+NEST_ADVISOR_IN="$SCRATCH/nest-advisor-input.txt"
+: > "$NEST_ADVISOR_IN"
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > c1nestgateway.mjs
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$C1NESTUP/v1" \
+CORTI_PORT="$C1_NEST_PORT" \
+CORTI_ADVISOR_STUB="$SCRATCH/advisor-stub.sh" \
+ADVISOR_STUB_CAPTURE="$NEST_ADVISOR_IN" \
+CORTI_DEBUG=1 \
+CORTI_DEBUG_DIR="$SCRATCH/nest-logs" \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node c1nestgateway.mjs > c1nestgw.out 2>&1 &
+C1_NEST_GW_PID=$!
+wait_banner c1nestgw.out || { echo "FAIL C1-NESTED gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+
+C1NESTG="http://127.0.0.1:$C1_NEST_PORT"
+NESTRESP=$(curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: nest-sess-1' \
+  -d "$C1BODY" "$C1NESTG/v1/messages" 2>&1 || true)
+NESTSPAWNS=$(grep -c '<transcript>' "$NEST_ADVISOR_IN" || true)
+# Turn 2: what the harness replays — every text block of turn 1 in one message, advisor blocks gone.
+NESTBODY2='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"advise me"},{"role":"assistant","content":[{"type":"text","text":"Consulting."},{"type":"text","text":"Consulting."},{"type":"text","text":"NESTED ANSWER"}]},{"role":"user","content":"TURN2 thanks"}]}'
+curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: nest-sess-1' \
+  -d "$NESTBODY2" "$C1NESTG/v1/messages" > /dev/null 2>&1 || true
+CAPBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"CAPME"}]}'
+CAPRESP=$(curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: nest-sess-2' \
+  -d "$CAPBODY" "$C1NESTG/v1/messages" 2>&1 || true)
+CAPSPAWNS=$(( $(grep -c '<transcript>' "$NEST_ADVISOR_IN" || true) - NESTSPAWNS ))
+JSONBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"JSONME"}]}'
+JSONRESP=$(curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: nest-sess-3' \
+  -d "$JSONBODY" "$C1NESTG/v1/messages" 2>&1 || true)
+JSONSPAWNS=$(( $(grep -c '<transcript>' "$NEST_ADVISOR_IN" || true) - NESTSPAWNS - CAPSPAWNS ))
+TWINBEFORE=$(grep -c '<transcript>' "$NEST_ADVISOR_IN" || true)
+TWINBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"TWINME"}]}'
+TWINRESP=$(curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: nest-sess-5' \
+  -d "$TWINBODY" "$C1NESTG/v1/messages" 2>&1 || true)
+TWINSPAWNS=$(( $(grep -c '<transcript>' "$NEST_ADVISOR_IN" || true) - TWINBEFORE ))
+PARBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"PARALLELME"}]}'
+PARRESP=$(curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: nest-sess-4' \
+  -d "$PARBODY" "$C1NESTG/v1/messages" 2>&1 || true)
+
+# Every upstream request body in a session log, in order, as JSON lines.
+nest_bodies() {
+  cat "$SCRATCH"/nest-logs/*"$1"*.log 2>/dev/null | python3 -c '
+import sys, json
+t = sys.stdin.read()
+for sec in t.split("UPSTREAM-REQUEST")[1:]:
+    print(json.dumps(json.JSONDecoder().raw_decode(sec.split("body:", 1)[1].lstrip())[0]))
+'
+}
+NESTBODIES=$(nest_bodies nest-sess-1)
+
+set +e
+check "C1-NESTED: the advisor ran once per consult" "$NESTSPAWNS" "2"
+check "C1-NESTED: both consults rendered" \
+  "$(printf '%s' "$NESTRESP" | grep -c '"type":"server_tool_use"')/$(printf '%s' "$NESTRESP" | grep -c '"type":"advisor_tool_result"')" "2/2"
+check "C1-NESTED: the answer after the second consult streams through" \
+  "$(printf '%s' "$NESTRESP" | grep -c 'NESTED ANSWER')" "1"
+check "C1-NESTED: one message_start, one message_stop" \
+  "$(printf '%s' "$NESTRESP" | grep -c 'event: message_start')/$(printf '%s' "$NESTRESP" | grep -c 'event: message_stop')" "1/1"
+check "C1-NESTED: no consult_advisor call reaches the client" \
+  "$(printf '%s' "$NESTRESP" | grep -c '"name":"consult_advisor"')" "0"
+check "C1-NESTED: block indexes run 0..n-1 across rounds" \
+  "$(printf '%s' "$NESTRESP" | python3 -c '
+import sys, json
+idx = [json.loads(l[5:])["index"] for l in sys.stdin.read().splitlines() if l.startswith("data:") and "\"content_block_start\"" in l]
+print("ok" if idx == list(range(len(idx))) and len(idx) == 7 else idx)
+')" "ok"
+check "C1-NESTED: first call, two continuations, then turn 2 went upstream" \
+  "$(printf '%s\n' "$NESTBODIES" | grep -c .)" "4"
+check "C1-NESTED: every continuation sends the first call tools byte for byte" \
+  "$(printf '%s\n' "$NESTBODIES" | python3 -c '
+import sys, json
+b = [json.loads(l) for l in sys.stdin.read().splitlines() if l.strip()]
+names = [t["function"]["name"] for t in b[0]["tools"]]
+same = all(json.dumps(x["tools"]) == json.dumps(b[0]["tools"]) for x in b[1:3])
+print("consult_advisor" in names and same)
+')" "True"
+check "C1-NESTED: each continuation extends the previous request" \
+  "$(printf '%s\n' "$NESTBODIES" | python3 -c '
+import sys, json
+b = [json.loads(l) for l in sys.stdin.read().splitlines() if l.strip()]
+d = lambda m: json.dumps(m)
+print(all(d(b[i+1]["messages"][:len(b[i]["messages"])]) == d(b[i]["messages"]) for i in range(2)))
+')" "True"
+check "C1-NESTED: a continuation carries the text written before its consult" \
+  "$(printf '%s\n' "$NESTBODIES" | sed -n 2p | python3 -c '
+import sys, json
+m = json.loads(sys.stdin.read())["messages"]
+print([x.get("content") for x in m if x.get("role") == "assistant" and x.get("tool_calls")])
+')" "['Consulting.']"
+check "C1-NESTED: turn 2 extends the last continuation byte for byte" \
+  "$(printf '%s\n' "$NESTBODIES" | python3 -c '
+import sys, json
+b = [json.loads(l) for l in sys.stdin.read().splitlines() if l.strip()]
+d = lambda m: json.dumps(m)
+print(d(b[3]["tools"]) == d(b[2]["tools"]) and d(b[3]["messages"][:len(b[2]["messages"])]) == d(b[2]["messages"]))
+')" "True"
+check "C1-CAP: three advisor runs, then no more" "$CAPSPAWNS" "3"
+check "C1-CAP: the fourth consult gets max_uses_exceeded" \
+  "$(printf '%s' "$CAPRESP" | grep -c '"error_code":"max_uses_exceeded"')" "1"
+check "C1-CAP: four consults rendered" \
+  "$(printf '%s' "$CAPRESP" | grep -c '"type":"server_tool_use"')" "4"
+check "C1-CAP: the fifth consult reaches the client as a tool call" \
+  "$(printf '%s' "$CAPRESP" | grep -c '"name":"consult_advisor"')" "1"
+check "C1-CAP: the turn ends on tool_use" \
+  "$(printf '%s' "$CAPRESP" | grep -A1 'event: message_delta' | grep -c '"stop_reason":"tool_use"')" "1"
+check "C1-NESTED-JSON: a nested consult in a JSON continuation runs the advisor again" "$JSONSPAWNS" "2"
+check "C1-NESTED-JSON: the answer streams through, the consult does not" \
+  "$(printf '%s' "$JSONRESP" | grep -c 'JSON ANSWER')/$(printf '%s' "$JSONRESP" | grep -c '"name":"consult_advisor"')" "1/0"
+check "C1-NESTED-JSON: one terminal message_delta and message_stop" \
+  "$(printf '%s' "$JSONRESP" | grep -c 'event: message_delta')/$(printf '%s' "$JSONRESP" | grep -c 'event: message_stop')" "1/1"
+check "C1-NESTED-JSON: block indexes run 0..n-1 across rounds" \
+  "$(printf '%s' "$JSONRESP" | python3 -c '
+import sys, json
+idx = [json.loads(l[5:])["index"] for l in sys.stdin.read().splitlines() if l.startswith("data:") and "\"content_block_start\"" in l]
+print("ok" if idx == list(range(len(idx))) and len(idx) == 7 else idx)
+')" "ok"
+check "C1-PARALLEL: a consult beside a tool call still advises and answers" \
+  "$(printf '%s' "$PARRESP" | grep -c 'stub advisor advice')/$(printf '%s' "$PARRESP" | grep -c 'PAR ANSWER')" "1/1"
+check "C1-PARALLEL: the other tool call reaches the client, the consult does not" \
+  "$(printf '%s' "$PARRESP" | grep -c '"name":"run_bash"')/$(printf '%s' "$PARRESP" | grep -c '"name":"consult_advisor"')" "1/0"
+check "C1-TWIN: two consults in one message run the advisor once" "$TWINSPAWNS" "1"
+check "C1-TWIN: one advisor block pair, then the answer" \
+  "$(printf '%s' "$TWINRESP" | grep -c '"type":"server_tool_use"')/$(printf '%s' "$TWINRESP" | grep -c '"type":"advisor_tool_result"')/$(printf '%s' "$TWINRESP" | grep -c 'TWIN ANSWER')" "1/1/1"
+check "C1-TWIN: neither consult reaches the client; one message_stop" \
+  "$(printf '%s' "$TWINRESP" | grep -c '"name":"consult_advisor"')/$(printf '%s' "$TWINRESP" | grep -c 'event: message_stop')" "0/1"
+check "C1-PARALLEL: one message_stop" "$(printf '%s' "$PARRESP" | grep -c 'event: message_stop')" "1"
+set -e
+
+# ADVISOR-PINGS: pings keep flowing while the advisor runs. Claude Code shows "Waiting for API
+# response" after ~90s without bytes; its SDK drops pings before the UI, so "Advising" stays.
+cat > pings-advisor.sh <<'PINGADV'
+#!/bin/sh
+cat >/dev/null
+sleep 2
+printf '{"ok":true,"text":"stub advisor advice"}'
+PINGADV
+chmod +x pings-advisor.sh
+sed -e 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  -e 's#^const PING_INTERVAL_MS = .*#const PING_INTERVAL_MS = 300;#' \
+  "$REPO/gateway.mjs" > c1pinggateway.mjs
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$C1NESTUP/v1" \
+CORTI_PORT=4722 \
+CORTI_ADVISOR_STUB="$SCRATCH/pings-advisor.sh" \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node c1pinggateway.mjs > c1pinggw.out 2>&1 &
+C1_PING_GW_PID=$!
+wait_banner c1pinggw.out || { echo "FAIL ADVISOR-PINGS gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+PINGRESP=$(curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: ping-sess' \
+  -d "$C1BODY" "http://127.0.0.1:4722/v1/messages" 2>&1 || true)
+set +e
+check "ADVISOR-PINGS: pings flow between each advisor call and its result" \
+  "$(printf '%s' "$PINGRESP" | python3 -c '
+import sys, re
+t = sys.stdin.read()
+ev = re.findall(r"^event: (\S+)\ndata: (.*)$", t, re.M)
+ok, open_srv, gaps = True, False, []
+for name, data in ev:
+    if name == "content_block_start" and "\"server_tool_use\"" in data: open_srv, n = True, 0
+    elif name == "ping" and open_srv: n += 1
+    elif name == "content_block_start" and "\"advisor_tool_result\"" in data: gaps.append(n); open_srv = False
+print(len(gaps) == 2 and all(g >= 2 for g in gaps))
+')" "True"
+check "ADVISOR-PINGS: the turn still answers" "$(printf '%s' "$PINGRESP" | grep -c 'NESTED ANSWER')" "1"
+set -e
+kill "$C1_PING_GW_PID" 2>/dev/null || :
+wait "$C1_PING_GW_PID" 2>/dev/null || :
+
+kill "$C1_NEST_GW_PID" "$C1NESTSTUB_PID" 2>/dev/null || :
+wait "$C1_NEST_GW_PID" "$C1NESTSTUB_PID" 2>/dev/null || :
+
+# --- HANGUP: a client that hangs up mid-turn must be noticed. The body is read before the handlers
+# attach, so only res 'close' reports the hang-up; the gateway then skips the continuation, kills
+# the advisor child, and (pass-through) cancels the upstream request.
+cat > hangup-advisor.sh <<'HANGADV'
+#!/bin/sh
+cat >/dev/null
+sleep 4
+: > "$HANGUP_ADVISOR_DONE"
+printf '{"ok":true,"text":"late advice"}'
+HANGADV
+chmod +x hangup-advisor.sh
+
+cat > hangupstub.mjs <<'HANGSTUB'
+import fs from "node:fs";
+import https from "node:https";
+const s = https.createServer(
+  { key: fs.readFileSync("key.pem"), cert: fs.readFileSync("cert.pem") },
+  (req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString();
+      fs.appendFileSync("hangup-upstream.log", `${req.url} ${body.includes('"tool_call_id"') ? "continuation" : "first"}\n`);
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (req.url.startsWith("/anthropic")) {
+        // Pass-through: hold the response open and record when the gateway cancels it.
+        res.on("close", () => fs.appendFileSync("hangup-upstream.log", "passthrough cancelled\n"));
+        return void res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"corti-s1","usage":{"input_tokens":1,"output_tokens":1}}}\n\n');
+      }
+      res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_hang","type":"function","function":{"name":"consult_advisor","arguments":""}}]}}]}\n\n');
+      res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n');
+      res.end("data: [DONE]\n\n");
+    });
+  },
+);
+s.listen(0, "127.0.0.1", () => console.log(`HANGPORT=${s.address().port}`));
+HANGSTUB
+
+: > hangup-upstream.log
+node hangupstub.mjs > hangupstub.out 2>&1 &
+HANGSTUB_PID=$!
+HANGUP=""
+while [ -z "$HANGUP" ]; do HANGUP=$(sed -n 's/^HANGPORT=//p' hangupstub.out); done
+
+mkdir -p "$SCRATCH/hangup-logs"
+HANGUP_ADVISOR_DONE="$SCRATCH/hangup-advisor-done"
+rm -f "$HANGUP_ADVISOR_DONE"
+sed 's#^const BASE_URL_PATTERN = .*#const BASE_URL_PATTERN = /^https:\\/\\/127\\.0\\.0\\.1:[0-9]+\\/v1$/;#' \
+  "$REPO/gateway.mjs" > hangupgateway.mjs
+CORTI_BEARER=test \
+CORTI_BASE_URL="https://127.0.0.1:$HANGUP/v1" \
+CORTI_PORT=4720 \
+CORTI_ADVISOR_STUB="$SCRATCH/hangup-advisor.sh" \
+HANGUP_ADVISOR_DONE="$HANGUP_ADVISOR_DONE" \
+CORTI_DEBUG=1 \
+CORTI_DEBUG_DIR="$SCRATCH/hangup-logs" \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node hangupgateway.mjs > hangupgw.out 2>&1 &
+HANGUP_GW_PID=$!
+wait_banner hangupgw.out || { echo "FAIL HANGUP gateway did not start" >&2; FAILED=$((FAILED + 1)); }
+
+# Hang up 1s into the 4s advisor run, then give the advisor time it would have needed to finish.
+curl -s -m 1 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: hangup-sess' \
+  -d "$C1BODY" "http://127.0.0.1:4720/v1/messages" > /dev/null 2>&1 || true
+curl -s -m 1 -N -H 'content-type: application/json' -H 'x-api-key: x' \
+  -d "$C1BODY" "http://127.0.0.1:4720/anthropic/v1/messages" > /dev/null 2>&1 || true
+sleep 6
+
+set +e
+check "HANGUP: the gateway records the hang-up during the advisor run" \
+  "$(cat "$SCRATCH"/hangup-logs/*hangup-sess*.log 2>/dev/null | grep -c 'client-abort')" "1"
+check "HANGUP: no continuation is sent for a client that left" \
+  "$(grep -c '^/v1/chat/completions continuation' hangup-upstream.log)" "0"
+check "HANGUP: the advisor child is stopped, not left to finish" \
+  "$([ -e "$HANGUP_ADVISOR_DONE" ] && echo finished || echo stopped)" "stopped"
+check "HANGUP: a pass-through request is cancelled upstream" \
+  "$(grep -c '^passthrough cancelled' hangup-upstream.log)" "1"
+set -e
+
+kill "$HANGUP_GW_PID" "$HANGSTUB_PID" 2>/dev/null || :
+wait "$HANGUP_GW_PID" "$HANGSTUB_PID" 2>/dev/null || :
+
 # --- C1-ERRFRAME: the continuation upstream answers 200 and then streams an *error frame*
 # mid-turn. feed() would terminate the translator with a bare `error` event and no terminal
 # frame, and the turn would settle as a clean success — stranding the advice exactly like the

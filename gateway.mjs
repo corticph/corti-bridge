@@ -15,9 +15,11 @@ import {
   createStreamTranslator,
   estimateTokens,
   promptTooLong,
-  recordAdvisorGuidance,
+  consultCarry,
+  recordConsults,
   restoreAdvisorGuidance,
   runAdvisor,
+  splitConsult,
   translateCompletion,
   translateError,
   translateModels,
@@ -87,15 +89,8 @@ const HEADERS_TIMEOUT_MS = !Number.isFinite(_headersTimeout)
     ? _headersTimeout
     : STREAM_IDLE_MS;
 const NONSTREAM_TIMEOUT_MS = 600_000;
-// The advisor continuation is bounded by what is left of NONSTREAM_TIMEOUT_MS after the advisor
-// phase, not by a fresh full budget: a ceiling measured from the continuation's own start expires
-// long after the client has stopped listening, so the graceful failure note would land nowhere.
-// GRACE leaves room to write that note; MIN keeps a slow advisor from starving the continuation.
-// MIN can outlast the client's own patience after a near-ceiling consult — that case is bounded
-// by client-disconnect detection (req 'close' -> clientGone -> finalize), and letting a late
-// continuation try beats failing it instantly with a note nobody is left to read.
-const CONTINUATION_GRACE_MS = 10_000;
-const CONTINUATION_MIN_MS = 60_000;
+// Advisor runs per turn, after which a consult gets the official max_uses_exceeded result.
+const ADVISOR_MAX_USES = 3;
 const SHUTDOWN_GRACE_MS = 5_000;
 // Upstream's own 400 stays authoritative; this bound only catches absurd bodies. It derives
 // from the exported window at launch so the gate tracks the catalog without a hand-set literal.
@@ -376,7 +371,8 @@ async function handlePassthrough(req, res, reqPath) {
   inFlight.add(closer);
   res.on("close", () => inFlight.delete(closer));
 
-  req.on("close", () => {
+  // The body is read before this runs, so req 'close' has already fired; res 'close' is the hang-up.
+  res.on("close", () => {
     if (!res.writableEnded) proxyReq.destroy();
   });
 
@@ -676,9 +672,9 @@ async function handleMessages(req, res, body) {
   let lastActivity = Date.now();
   let lastPing = 0;
   let translator = null;
-  // The continuation's own stream translator, once it starts streaming. endContinuationFailure
-  // reads it to place its note after whatever the continuation already emitted; assigned once,
-  // never reassigned, so the index it reports is always the live one.
+  // The current round's continuation translator, once it starts streaming. endContinuationFailure
+  // reads it to place its note after whatever that continuation already emitted; reset at the
+  // start of each round, so the index it reports always belongs to the live one.
   let contTranslator = null;
   // Next free block index for a continuation that emitted without a translator (the non-SSE
   // one-shot path). Keeps the note's placement keyed to what was actually emitted rather than to
@@ -761,9 +757,13 @@ async function handleMessages(req, res, body) {
     }, delay);
   };
 
-  req.on("close", () => {
+  // The body is read before this runs, so req 'close' has already fired; res 'close' is the hang-up.
+  // A consult in progress is cut short too: nobody is left to read its advice.
+  const clientAbort = new AbortController();
+  res.on("close", () => {
     if (!res.writableEnded) {
       clientGone = true;
+      clientAbort.abort();
       finalize("client-abort");
     }
   });
@@ -878,149 +878,167 @@ async function handleMessages(req, res, body) {
     onPromptTokens: (n) => recordPromptTokens(calKey, est, n),
   };
 
-  // Hold-and-continue advisor: when the turn ends on a consult_advisor tool_use, the translator
-  // fires this hook instead of terminating. We emit a synthetic server_tool_use + advisor_tool_result
-  // inline (the shape the harness renders as "Advising…"), run the advisor, then make a second
-  // upstream call with the consult_advisor tool_use + a real client tool_result appended so the
-  // model reads the advice and actually answers the user. The gateway owns the terminal events.
-  // Only wire the hook when the intercept actually offered the tool: a toolless side call was
-  // never given the advisor, so it must not be able to hold a turn open for one either.
+  /**
+   * Hold-and-continue advisor: when the turn ends on a consult_advisor tool_use, the translator
+   * fires this hook instead of terminating. We emit a synthetic server_tool_use + advisor_tool_result
+   * inline (the shape the harness renders as "Advising…"), run the advisor, then make a second
+   * upstream call with the consult_advisor tool_use + a real client tool_result appended so the
+   * model reads the advice and actually answers the user. The gateway owns the terminal events.
+   *
+   * A continuation that ends on a consult of its own starts another round of the same, up to
+   * ADVISOR_MAX_USES advisor runs. Every continuation keeps the first call's tools byte for byte,
+   * consult_advisor included, so each request extends the cached prefix of the one before it.
+   *
+   * Only wire the hook when the intercept actually offered the tool: a toolless side call was
+   * never given the advisor, so it must not be able to hold a turn open for one either.
+   */
   const advisorOffered = anthropicBody.tools?.some((t) => t?.name === "consult_advisor");
   let advisorHandled = false;
-  const onAdvisorToolUse = async ({ id }) => {
-    if (advisorHandled || finalized || clientGone) return;
-    advisorHandled = true;
-    // Captured while it is still the newest block: the sentence the model would otherwise read
-    // next turn as an unkept promise, and the anchor the advice is re-inserted against.
-    const preCallText = translator?.lastText ?? "";
-    // Serialize the executor's full request (system + tools + transcript + budget line) for the
-    // advisor. The tool input is empty — the executor signals timing only; the harness forwards
-    // context automatically, per the official advisor tool design.
+  // State of the current round, read by endContinuationFailure.
+  let resIdx = 0;
+  let advisorResult;
+
+  /** Advisor succeeded but the continuation (proxy's own 2nd call) failed: a proxy-internal
+   *  event, not an advisor failure. A text note ends the turn — no second advisor_tool_result
+   *  (spec: one per call).
+   *
+   *  The note carries the advice verbatim. The harness does not replay server_tool_use /
+   *  advisor_tool_result blocks into the next request's history, so the advisor's text exists
+   *  only in the UI: a note pointing at "the advice above" points at nothing, and the model
+   *  answers the next turn from a context where the consult left no trace at all. */
+  const endContinuationFailure = (reason, tag) => {
+    // contTranslator.terminated: the continuation already closed the turn (e.g. a socket error
+    // arriving after [DONE]); a second message_delta/message_stop would be malformed.
+    if (finalized || res.writableEnded || contTranslator?.terminated) return;
+    diagnostics.push(`advisor continuation failed: ${reason}`);
+    const note = advisorResult?.ok
+      ? `[advisor consulted, but the follow-up response failed (${reason}). The guidance is repeated here because it is not retained in the conversation history otherwise.]\n\n<advisor_guidance>\n${advisorResult.text}\n</advisor_guidance>`
+      : `[advisor consulted, but no advice was returned (${advisorResult?.code ?? "unavailable"}) and the follow-up response also failed (${reason}). Proceed without advice.]`;
+    // Whatever the continuation already streamed stays intact: close its open block and take
+    // the next free index. The captured resIdx is only correct before the continuation emits.
+    contTranslator?.closeOpen();
+    const idx = contTranslator ? contTranslator.nextBlockIndex : Math.max(resIdx + 1, contNextIndex);
+    writeEvent("content_block_start", { type: "content_block_start", index: idx, content_block: { type: "text", text: "" } });
+    writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: note } });
+    writeEvent("content_block_stop", { type: "content_block_stop", index: idx });
+    writeEvent("message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { input_tokens: estimatedInput, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    writeEvent("message_stop", { type: "message_stop" });
+    res.end();
+    finalize(tag);
+  };
+
+  // Failures map to official advisor_tool_result_error codes; the executor sees the error and
+  // continues without advice, never a fake success.
+  const runAdvisorRound = async (round, consultId, history, carried) => {
+    if (round > ADVISOR_MAX_USES) return { ok: false, code: "max_uses_exceeded" };
+    // Serialize the executor's full request (system + tools + transcript + budget line), up to
+    // and including what it wrote before this consult. The tool input is empty — the executor
+    // signals timing only; the harness forwards context automatically, per the official design.
     // Restored history: shown the excised version, the advisor confirms the executor's false
     // "I never called it" rather than correcting it.
+    const shown = carried.length ? [...history, { role: "assistant", content: carried }] : history;
     const { text: advisorInput, elidedCount } = serializeAdvisorInput(
-      { ...anthropicBody, messages: restoreAdvisorGuidance(parentSessionId, anthropicBody.messages) },
+      { ...anthropicBody, messages: restoreAdvisorGuidance(parentSessionId, shown) },
       { maxTokens: Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2048 },
     );
     const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
-    diagnostics.push(`advisor hold-and-continue: id=${id} transcript=${advisorInput.length} chars${elidedStr}`);
-
-    // 1. Emit the synthetic server-tool advisor blocks inline (rendered by the harness, not
-    //    round-tripped to Corti — the continuation call below carries the client-tool shape).
-    const srvIdx = translator ? translator.nextBlockIndex : 0;
-    const resIdx = srvIdx + 1;
-    writeEvent("content_block_start", {
-      type: "content_block_start", index: srvIdx,
-      content_block: { type: "server_tool_use", id, name: "advisor", input: {} },
-    });
-    writeEvent("content_block_stop", { type: "content_block_stop", index: srvIdx });
-
-    /** Advisor succeeded but the continuation (proxy's own 2nd call) failed: a proxy-internal
-     *  event, not an advisor failure. A text note ends the turn — no second advisor_tool_result
-     *  (spec: one per call).
-     *
-     *  The note carries the advice verbatim. The harness does not replay server_tool_use /
-     *  advisor_tool_result blocks into the next request's history, so the advisor's text exists
-     *  only in the UI: a note pointing at "the advice above" points at nothing, and the model
-     *  answers the next turn from a context where the consult left no trace at all. */
-    const endContinuationFailure = (reason, tag) => {
-      // contTranslator.terminated: the continuation already closed the turn (e.g. a socket error
-      // arriving after [DONE]); a second message_delta/message_stop would be malformed.
-      if (finalized || res.writableEnded || contTranslator?.terminated) return;
-      diagnostics.push(`advisor continuation failed: ${reason}`);
-      const note = advisorResult?.ok
-        ? `[advisor consulted, but the follow-up response failed (${reason}). The guidance is repeated here because it is not retained in the conversation history otherwise.]\n\n<advisor_guidance>\n${advisorResult.text}\n</advisor_guidance>`
-        : `[advisor consulted, but no advice was returned (${advisorResult?.code ?? "unavailable"}) and the follow-up response also failed (${reason}). Proceed without advice.]`;
-      // Whatever the continuation already streamed stays intact: close its open block and take
-      // the next free index. The captured resIdx is only correct before the continuation emits.
-      contTranslator?.closeOpen();
-      const idx = contTranslator ? contTranslator.nextBlockIndex : Math.max(resIdx + 1, contNextIndex);
-      writeEvent("content_block_start", { type: "content_block_start", index: idx, content_block: { type: "text", text: "" } });
-      writeEvent("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: note } });
-      writeEvent("content_block_stop", { type: "content_block_stop", index: idx });
-      writeEvent("message_delta", {
-        type: "message_delta",
-        delta: { stop_reason: "end_turn", stop_sequence: null },
-        usage: { input_tokens: estimatedInput, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-      });
-      writeEvent("message_stop", { type: "message_stop" });
-      res.end();
-      finalize(tag);
-    };
-
-    // 2. Run the advisor on the serialized transcript. Non-blocking UI: "Advising" shows while this runs.
-    // runAdvisor returns {ok:true,text} or {ok:false,code} (official advisor_tool_result_error
-    // error_code: execution_time_exceeded | unavailable | overloaded | too_many_requests |
-    // prompt_too_long | model_not_found). On failure the harness renders "Advisor declined to
-    // advise" and the executor continues without advice — never a fake success string.
-    let advisorResult;
+    diagnostics.push(`advisor hold-and-continue: id=${consultId} transcript=${advisorInput.length} chars${elidedStr} round=${round}`);
     try {
-      const out = await runAdvisor(advisorInput, { parentSessionId });
+      const out = await runAdvisor(advisorInput, { parentSessionId, signal: clientAbort.signal });
       // Bare string = injected test stub; treat as success for backward compat.
-      advisorResult = typeof out === "string" ? { ok: true, text: out } : out;
-      if (!advisorResult) advisorResult = { ok: false, code: "unavailable" };
+      const result = typeof out === "string" ? { ok: true, text: out } : out;
+      return result ?? { ok: false, code: "unavailable" };
     } catch (err) {
       diagnostics.push(`advisor spawn failed: ${err?.message ?? err}`);
-      advisorResult = { ok: false, code: "unavailable" };
+      return { ok: false, code: "unavailable" };
     }
+  };
 
-    if (finalized || clientGone) return;
-    // The result block the client sees: success (advisor_result) or error (advisor_tool_result_error).
-    // The error variant lets the harness render the expected "Advisor declined to advise on this
-    // request" line instead of a success with an empty/no-response string. The success text is the
-    // RAW advisor output (the official advisor_result carries the advisor's text verbatim, no prefix).
-    const resultContent = advisorResult.ok
-      ? { type: "advisor_result", text: advisorResult.text, stop_reason: "end_turn" }
-      : { type: "advisor_tool_result_error", error_code: advisorResult.code };
-    writeEvent("content_block_start", {
-      type: "content_block_start", index: resIdx,
-      content_block: { type: "advisor_tool_result", tool_use_id: id, content: resultContent },
-    });
-    writeEvent("content_block_stop", { type: "content_block_stop", index: resIdx });
-    diagnostics.push(
-      advisorResult.ok
-        ? `advisor ok: ${advisorResult.text.length} chars`
-        : `advisor failed: ${advisorResult.code}${advisorResult.detail ? ` — ${advisorResult.detail}` : ""}`,
-    );
+  const onAdvisorToolUse = async ({ id }) => {
+    if (advisorHandled || finalized || clientGone) return;
+    advisorHandled = true;
+    // What emitted this round's consult (the first call's translator, then each continuation's),
+    // the consult's id, and the upstream history the round's continuation extends.
+    let source = translator;
+    let consultId = id;
+    let history = anthropicBody.messages || [];
+    // Answered consults, recorded for A4 when the turn ends (recordConsults).
+    const answered = [];
+    const recordAnswered = () => recordConsults(parentSessionId, answered);
 
-    // 3. Continuation: a second, non-streaming upstream call. The history gains the model's
-    //    consult_advisor tool_use + a client tool_result holding the advice (or the failure note),
-    //    so the model reads the result and answers. We translate that response and stream it back
-    //    as content blocks under the SAME message (the harness sees one continuous turn).
-    //    On failure the tool_result carries an unavailable note so the executor knows advice was
-    //    unavailable and proceeds without it (the official "continues without further advice").
-    //    Model-facing text wraps the advice in <advisor_guidance> — a distinct channel the
-    //    executor treats as first-class advice, not ordinary tool output (reconstruction §3.3).
-    const continuationText = advisorResult.ok
-      ? `<advisor_guidance>\n${advisorResult.text}\n</advisor_guidance>`
-      : `<advisor_guidance>\nadvisor unavailable (${advisorResult.code})\n</advisor_guidance>`;
-    // The advisor child is done; the continuation is a normal upstream request. Release the
-    // handoff (the advisor phase is over) but assert continuationActive so the 5-minute stream-idle
-    // watchdog stays suppressed — the continuation can legitimately run for minutes (the model
-    // reads the advice and answers), and a 5-minute silence kill would drop a live generation. The
-    // continuation's own req.setTimeout is the real ceiling. Reset the silence clock so any
-    // watchdog that does apply measures from the continuation's start, not the advisor run.
-    translator?.releaseAdvisor?.();
-    continuationActive = true;
-    lastActivity = Date.now();
     try {
-      await continueAfterAdvisor(id, continuationText, resIdx);
-      // The harness drops the consult from history; anchor the advice on a block that survives
-      // beside it — what preceded the call, else the first block the continuation emitted.
-      if (advisorResult.ok) {
-        const first = contTranslator?.firstBlock;
-        const anchor = preCallText ? { text: preCallText }
-          : first?.type === "text" ? { text: first.text, before: true }
-          : first?.type === "tool" ? { toolUseId: first.id, before: true }
-          : null;
-        if (anchor) recordAdvisorGuidance(parentSessionId, anchor, advisorResult.text, id);
+      for (let round = 1; ; round++) {
+        // Captured while it is still the newest block: the sentence the model would otherwise read
+        // next turn as an unkept promise, and the anchor the advice is re-inserted against.
+        const preCallText = source?.lastText ?? "";
+        const carried = consultCarry(source?.blocks, preCallText);
+
+        // 1. Emit the synthetic server-tool advisor blocks inline (rendered by the harness, not
+        //    round-tripped to Corti — the continuation call below carries the client-tool shape).
+        const srvIdx = source ? source.nextBlockIndex : 0;
+        resIdx = srvIdx + 1;
+        writeEvent("content_block_start", {
+          type: "content_block_start", index: srvIdx,
+          content_block: { type: "server_tool_use", id: consultId, name: "advisor", input: {} },
+        });
+        writeEvent("content_block_stop", { type: "content_block_stop", index: srvIdx });
+
+        // 2. Run the advisor. Non-blocking UI: "Advising" shows while this runs.
+        advisorResult = await runAdvisorRound(round, consultId, history, carried);
+        if (finalized || clientGone) return;
+        // An error renders as "Advisor declined to advise"; success carries the raw advisor text,
+        // as the official advisor_result does.
+        const resultContent = advisorResult.ok
+          ? { type: "advisor_result", text: advisorResult.text, stop_reason: "end_turn" }
+          : { type: "advisor_tool_result_error", error_code: advisorResult.code };
+        writeEvent("content_block_start", {
+          type: "content_block_start", index: resIdx,
+          content_block: { type: "advisor_tool_result", tool_use_id: consultId, content: resultContent },
+        });
+        writeEvent("content_block_stop", { type: "content_block_stop", index: resIdx });
+        diagnostics.push(
+          advisorResult.ok
+            ? `advisor ok: ${advisorResult.text.length} chars`
+            : `advisor failed: ${advisorResult.code}${advisorResult.detail ? ` — ${advisorResult.detail}` : ""}`,
+        );
+
+        // 3. Continuation under the same message: history gains the round, its consult and the advice
+        //    in <advisor_guidance>, which the executor reads as advice, not tool output (§3.3).
+        const continuationText = advisorResult.ok
+          ? `<advisor_guidance>\n${advisorResult.text}\n</advisor_guidance>`
+          : `<advisor_guidance>\nadvisor unavailable (${advisorResult.code})\n</advisor_guidance>`;
+        history = [
+          ...history,
+          { role: "assistant", content: [...carried, { type: "tool_use", id: consultId, name: "consult_advisor", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: consultId, content: continuationText, is_error: false }] },
+        ];
+        // Advisor phase over: keep the stream-idle watchdog off (the continuation's own deadline is
+        // its ceiling) and measure silence from here.
+        source?.releaseAdvisor?.();
+        continuationActive = true;
+        lastActivity = Date.now();
+        // A round past the cap took no advice, so its continuation cannot hold the turn for
+        // another: a further consult reaches the harness, and the next request's rewrite answers it.
+        const next = await continueAfterAdvisor(history, resIdx, round <= ADVISOR_MAX_USES);
+        if (advisorResult.ok) answered.push({ id: consultId, carried, advice: advisorResult.text, after: next.source?.blocks });
+        if (!next.consultId) break;
+        diagnostics.push(`advisor nested consult: id=${next.consultId} after round ${round}`);
+        source = next.source;
+        consultId = next.consultId;
       }
-      // Reached only once the continuation's upstream turn is complete and every frame is
+      recordAnswered();
+      // Reached only once the last continuation's upstream turn is complete and every frame is
       // written. Ending the turn here rather than inside the stream handler keeps settlement on
       // the critical path: a continuation that never settles can no longer finalize silently.
       if (!res.writableEnded) res.end();
       finalize("advisor-continuation");
     } catch (err) {
+      // Earlier rounds' continuations reached the client, so their consults are in its history.
+      recordAnswered();
       endContinuationFailure(err?.message ?? String(err), err?.contTag ?? "advisor-continuation-failed");
       // endContinuationFailure declines when the turn is already closed. Finalize regardless, or
       // a request whose note could not be written waits for the watchdog and is logged under it.
@@ -1035,20 +1053,30 @@ async function handleMessages(req, res, body) {
   if (advisorOffered) ctx.onAdvisorToolUse = onAdvisorToolUse;
 
   /**
-   * Second upstream call: appends the consult_advisor tool_use + tool_result and asks the model
-   * to continue. Streaming, like the first call, so Corti emits bytes as it generates rather than
-   * buffering the whole answer (its buffered endpoint 500'd on large sessions).
+   * Continuation call: `history` already ends on the round's consult_advisor tool_use +
+   * tool_result, and the model is asked to continue. Streaming, like the first call, so Corti
+   * emits bytes as it generates rather than buffering the whole answer (its buffered endpoint
+   * 500'd on large sessions).
    *
-   * Resolves once the upstream turn is complete and every client frame is written; rejects with a
-   * `contTag`-carrying error otherwise. It never ends the client response itself — the caller
-   * does, so settlement sits on the critical path instead of being a side effect nobody awaits.
+   * Resolves with `{ source, consultId }` once the upstream turn is complete and every client
+   * frame is written: `source` is what this continuation emitted (the next round's anchors) and
+   * `consultId` is set when it ended on a consult of its own, which only `allowNested` holds open.
+   * Rejects with a `contTag`-carrying error otherwise. It never ends the client response itself —
+   * the caller does, so settlement sits on the critical path instead of being a side effect.
    */
-  const continueAfterAdvisor = (toolUseId, advisorText, resIdx) => {
+  const continueAfterAdvisor = (history, resIdx, allowNested) => {
+    // Whatever the previous round emitted is not this round's to report or to close.
+    contTranslator = null;
+    contNextIndex = 0;
+    let roundSource = null;
+    let nestedId = null;
     // Emit a translated completion (a non-SSE upstream response) as a one-shot SSE turn that
     // resumes after the synthetic advisor blocks. Reused by the drain path for JSON upstreams.
-    const emitContinuationCompletion = (msg) => {
+    // A round that ends on a nested consult writes no terminal events: the next round owns them.
+    const emitContinuationCompletion = (msg, content, terminal) => {
       let idx = resIdx + 1;
-      for (const block of msg.content) {
+      contNextIndex = idx;
+      for (const block of content) {
         const skeleton =
           block.type === "tool_use" ? { ...block, input: {} } :
           block.type === "thinking" ? { type: "thinking", thinking: "", signature: "" } :
@@ -1065,6 +1093,7 @@ async function handleMessages(req, res, body) {
         idx++;
         contNextIndex = idx;
       }
+      if (!terminal) return;
       writeEvent("message_delta", {
         type: "message_delta",
         delta: { stop_reason: msg.stop_reason ?? "end_turn", stop_sequence: msg.stop_sequence ?? null },
@@ -1084,32 +1113,18 @@ async function handleMessages(req, res, body) {
         if (err) return reject(err);
         // Logged before the caller finalizes, so it lands in the RESPONSE entry's diagnostics.
         diagnostics.push("advisor continuation settled: upstream turn complete");
-        resolve();
+        resolve({ source: roundSource ?? contTranslator, consultId: nestedId });
       };
       const settleFailed = (reason, tag) => settle(Object.assign(Error(reason), { contTag: tag }));
 
-      const contMessages = [...(anthropicBody.messages || [])];
-      contMessages.push({
-        role: "assistant",
-        content: [{ type: "tool_use", id: toolUseId, name: "consult_advisor", input: {} }],
-      });
-      contMessages.push({
-        role: "user",
-        content: [{ type: "tool_result", tool_use_id: toolUseId, content: advisorText, is_error: false }],
-      });
-      // The first translateRequest mutated anthropicBody.tools to include consult_advisor; the
-      // spread carries that by reference. Strip it so the model can't call consult_advisor from
-      // the continuation — onAdvisorToolUse is unset there, so a nested consult would emit a real
-      // tool_use the harness has no implementation for (an "Unknown tool" error, no answer).
-      const contTools = Array.isArray(anthropicBody.tools)
-        ? anthropicBody.tools.filter((t) => t && t.name !== "consult_advisor")
-        : anthropicBody.tools;
-      const contAnthropic = { ...anthropicBody, tools: contTools, messages: contMessages, stream: true };
+      // The first call's tools, consult_advisor included: Corti renders tools ahead of the system
+      // prompt and history, so any change to them re-bills the whole prompt.
+      const contAnthropic = { ...anthropicBody, messages: history, stream: true };
       // skipAdvisor: re-running interceptConsultAdvisor would match the tool_result we just
       // synthesized and spawn runAdvisor a second time. The continuation is ours, not a fresh
       // client request, so the advisor intercept must not touch it.
-      // parentSessionId only re-inserts *prior* consults, so the continuation reads the history
-      // the first call did; this turn's own consult is not recorded until the continuation settles.
+      // parentSessionId only re-inserts *prior* turns' consults; this turn's are in `history`
+      // already and are not recorded until the turn ends.
       translateRequest(contAnthropic, { skipAdvisor: true, skipImages: true, parentSessionId, forwardThinking: FORWARD_THINKING })
         .then((out) => {
           const contTranslated = out.request;
@@ -1169,12 +1184,17 @@ async function handleMessages(req, res, body) {
                 logContResponse();
                 if (finalized || clientGone) return settle();
                 try {
-                  emitContinuationCompletion(
-                    // onPromptTokens dropped: the continuation's prompt carries the advisor's
-                    // answer on top of the body `est` was measured from, so the pair would not
-                    // compare like with like.
-                    translateCompletion(JSON.parse(Buffer.concat(chunks).toString()), { ...ctx, onPromptTokens: undefined }),
-                  );
+                  // onPromptTokens dropped: this prompt also carries the advice, so it does not
+                  // pair with the estimate `est` was measured from.
+                  const msg = translateCompletion(JSON.parse(Buffer.concat(chunks).toString()), { ...ctx, onPromptTokens: undefined });
+                  const split = allowNested ? splitConsult(msg.content) : null;
+                  if (split?.consultId) {
+                    emitContinuationCompletion(msg, split.blocks, false);
+                    nestedId = split.consultId;
+                    roundSource = { ...split, nextBlockIndex: contNextIndex };
+                  } else {
+                    emitContinuationCompletion(msg, msg.content, true);
+                  }
                   proxyReq = null; // response is complete; don't let finalize() tear down a reusable socket
                   settle();
                 } catch (e) {
@@ -1185,11 +1205,14 @@ async function handleMessages(req, res, body) {
               return;
             }
 
-            // Streaming SSE: a fresh translator seeded at resIdx + 1. message_start is suppressed
-            // (the harness already saw one for this turn — two would be malformed); onAdvisorToolUse
-            // is unset so done() emits the terminal message_stop instead of re-handing the turn
-            // to a now-defunct advisor hook.
-            const contCtx = { ...ctx, messageStarted: true, onAdvisorToolUse: undefined, onPromptTokens: undefined };
+            // A fresh translator at resIdx + 1 with no second message_start. A nested consult is only
+            // noted: the next round writes the terminal events. Without allowNested it reaches the harness.
+            const contCtx = {
+              ...ctx,
+              messageStarted: true,
+              onAdvisorToolUse: allowNested ? ({ id: nested }) => { nestedId = nested; } : undefined,
+              onPromptTokens: undefined,
+            };
             contTranslator = createStreamTranslator(contCtx, writeEvent, resIdx + 1);
             // Point backpressure at the continuation's stream: writeEvent pauses/resumes
             // `upstreamRes` when res.write() returns false, and upstreamRes still holds the
@@ -1282,10 +1305,9 @@ async function handleMessages(req, res, body) {
             });
           });
           proxyReq = req;
-          // Absolute, not idle: what bounds this call is the client's own patience, and the advisor
-          // phase already spent part of it. An idle timer measured from here would expire long
-          // after the client gave up, so a hung continuation would never get the failure note.
-          const budget = Math.max(CONTINUATION_MIN_MS, NONSTREAM_TIMEOUT_MS - (Date.now() - started) - CONTINUATION_GRACE_MS);
+          // Absolute, from this continuation's own start: Claude Code waits on events, not on the
+          // turn's age, so every round gets the same ceiling against a hung upstream.
+          const budget = NONSTREAM_TIMEOUT_MS;
           deadline = setTimeout(() => {
             // Settle first: destroying the request races the 'close' and 'error' handlers, and
             // first-settle wins — reporting the teardown would shadow the budget reason in the
@@ -1354,10 +1376,6 @@ async function handleMessages(req, res, body) {
     // only by the watchdog kill, which the advisor continuation is now exempt from.
     if (Date.now() - lastPing < PING_INTERVAL_MS) return;
     lastPing = Date.now();
-    // While the translator handed the turn to the advisor hook, the stream is idle by
-    // design (runAdvisor is spawning). Pings here render as a thinking-spinner line that
-    // displaces the "Advising" indicator, so suppress them for the duration of the handoff.
-    if (translator?.advisorHandoff) return;
     const buf = Buffer.from(`event: ping\ndata: {"type":"ping"}\n\n`);
     collectEmitted(buf);
     res.write(buf);
@@ -1387,13 +1405,13 @@ async function handleMessages(req, res, body) {
 
   const deadlineCheck = () => {
     // The advisor handoff owns the turn: runAdvisor is a headless `corti-bridge -p` child that
-    // can legitimately run for minutes (see ADVISOR_TIMEOUT_MS). While it owns the turn the SSE
-    // stream is idle by design — pings are suppressed (writePing, below) so they don't displace
-    // the "Advising" indicator, and the stream-idle watchdog must stay its hand too. Without
-    // this guard a consult that exceeds STREAM_IDLE_MS (5m) would fire "upstream stalled"
-    // mid-advisor and kill the turn before the advisor finishes. The advisor's own timeout
-    // (ADVISOR_TIMEOUT_MS) is the real ceiling here.
-    if (translator?.advisorHandoff) return; // hook owns the turn; ADVISOR_TIMEOUT_MS is the ceiling
+    // can legitimately run for minutes (see ADVISOR_TIMEOUT_MS), so the stream-idle watchdog must
+    // stay its hand; the advisor's own timeout is the real ceiling. Pings keep flowing: Claude Code
+    // shows "Waiting for API response" after ~90s without bytes, and its SDK drops pings before the UI.
+    if (translator?.advisorHandoff) {
+      if (headersSentToClient) writePing();
+      return;
+    }
     // An advisor child (wantsNoAdvisor) is its own handleMessages whose translator never sets
     // advisorHandoff, so the guard above doesn't cover it. The same ADVISOR_TIMEOUT_MS ceiling
     // applies — applied at the child's execFile layer. Exempt the child from this 5-minute watchdog
@@ -1402,8 +1420,7 @@ async function handleMessages(req, res, body) {
     const silence = Date.now() - lastActivity;
     // The advisor continuation can legitimately go quiet for minutes mid-generation — Corti has
     // stalled well past STREAM_IDLE_MS between tokens — so it is exempt from the kill; its own
-    // deadline is the ceiling. Pings still go out: the advisor phase is over, so they no longer
-    // displace the "Advising" indicator, and the client needs to see the turn is still alive.
+    // deadline is the ceiling. Pings still go out, so Claude Code does not show the turn as stalled.
     if (continuationActive) {
       if (silence >= PING_INTERVAL_MS && headersSentToClient) writePing();
       return;

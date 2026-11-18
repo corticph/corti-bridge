@@ -332,10 +332,10 @@ const ADVISOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-prompt.txt");
 const ADVISOR_EXECUTOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-executor-prompt.txt");
 // The advisor is a headless Opus-tier `corti-bridge -p` reasoning over a large serialized
 // transcript — a single consult can legitimately take minutes, not seconds. 60s was
-// observed timing out in real sessions. 8 minutes is the floor; raise CORTI_ADVISOR_TIMEOUT_MS
+// observed timing out in real sessions. 12 minutes is the floor; raise CORTI_ADVISOR_TIMEOUT_MS
 // to extend further. The gateway's stream-idle watchdog is suppressed for the advisor
 // handoff (see gateway.mjs deadlineCheck / advisorHandoff) so this is the real ceiling.
-const ADVISOR_TIMEOUT_MS = Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 8 * 60_000;
+const ADVISOR_TIMEOUT_MS = Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 12 * 60_000;
 const ADVISOR_MODEL = process.env.CORTI_ADVISOR_MODEL || "opus";
 // Soft per-call output cap, surfaced to the advisor via the serialized transcript's budget
 // line. The official advisor tool sets a hard `max_tokens` on the tool def; corti-bridge -p
@@ -367,6 +367,15 @@ function advisorProcessedMap(sessionId) {
 
 export function _resetAdvisorProcessed() { advisorProcessedBySession.clear(); }
 
+// Store key for an anchor; restoreAdvisorGuidance computes the same key per history block. Tool
+// ids round-trip because tool_result pairing needs them; thinking round-trips verbatim.
+export function anchorKey(anchor) {
+  return anchor?.toolUseId ? `u:${anchor.toolUseId}`
+    : anchor?.text ? `t:${anchor.text}`
+    : anchor?.thinking ? `h:${anchor.thinking}`
+    : "";
+}
+
 /** Per-session record of answered consults, keyed by a block that survives beside each one. The
  *  harness renders the server_tool_use / advisor_tool_result pair but never replays it, so without
  *  this the model reads its own "calling the advisor now" as a promise it never kept. */
@@ -374,12 +383,10 @@ const ADVISOR_GUIDANCE_CAP = 64;
 const ADVISOR_GUIDANCE_PER_SESSION = 32;
 const advisorGuidanceBySession = new Map();
 
-// Anchor is `{ text }` or `{ toolUseId }` (ids round-trip because tool_result pairing needs them,
-// so they cover a consult followed straight by a tool call); `before` says which side it sat on.
+// Anchor is `{ text }`, `{ thinking }` or `{ toolUseId }` (see anchorKey); `before` says which
+// side of the anchor block the consult sat on.
 export function recordAdvisorGuidance(sessionId, anchor, advice, consultId) {
-  const key = anchor?.toolUseId ? `u:${anchor.toolUseId}`
-    : anchor?.text ? `t:${anchor.text}`
-    : "";
+  const key = anchorKey(anchor);
   if (!sessionId || !key || !advice || !consultId) return;
   let map = advisorGuidanceBySession.get(sessionId);
   if (!map) {
@@ -428,6 +435,7 @@ export function restoreAdvisorGuidance(sessionId, messages) {
     };
     for (const b of blocksOf(msg.content)) {
       const key = b?.type === "text" && typeof b.text === "string" ? `t:${b.text}`
+        : b?.type === "thinking" && typeof b.thinking === "string" ? `h:${b.thinking}`
         : b?.type === "tool_use" && typeof b.id === "string" ? `u:${b.id}`
         : null;
       const rec = key && !used.has(key) ? store.get(key) : null;
@@ -451,6 +459,67 @@ export function restoreAdvisorGuidance(sessionId, messages) {
 }
 
 export function _resetAdvisorGuidance() { advisorGuidanceBySession.clear(); }
+
+/** The blocks of a round that belong in the continuation's consult message: what
+ *  restoreAdvisorGuidance will put before the consult next turn, so the two prompts share a
+ *  prefix. Thinking and text up to the pre-call text, or only thinking when the round wrote none.
+ *  A tool call beside the consult is not carried: it would go upstream with no result. */
+export function consultCarry(blocks, preCallText) {
+  const list = Array.isArray(blocks) ? blocks : [];
+  const end = preCallText ? list.findLastIndex((b) => b?.type === "text" && b.text === preCallText) : -1;
+  if (end < 0) return list.filter((b) => b?.type === "thinking");
+  return list.slice(0, end + 1).filter((b) => b?.type === "thinking" || b?.type === "text");
+}
+
+/** Where a consult's advice is re-inserted next turn: right after the last block the round
+ *  carried, else right before the first block its continuation wrote. Thinking counts — a round
+ *  that only thought before consulting would otherwise put the continuation's own thinking
+ *  ahead of the consult, and the next turn would diverge from what the continuation sent. */
+export function consultAnchor(carried, continuationBlocks) {
+  const at = (b, before) => b?.type === "text" && b.text ? { text: b.text, before }
+    : b?.type === "thinking" && b.thinking ? { thinking: b.thinking, before }
+    : b?.type === "tool_use" && b.id ? { toolUseId: b.id, before }
+    : null;
+  return at(carried?.at(-1), false) ?? at(continuationBlocks?.[0], true);
+}
+
+/** Record a turn's answered consults (`{ id, carried, advice, after }`, `after` being the blocks
+ *  the round's continuation wrote) once the turn is over: a record that exists while a later
+ *  round is translated re-inserts its pair beside the one that round's history already holds. */
+export function recordConsults(sessionId, answered) {
+  const used = new Set();
+  for (const a of answered ?? []) {
+    let anchor = consultAnchor(a.carried, a.after);
+    // The store is keyed by content, so two rounds that wrote the same words share a key.
+    if (anchor && used.has(anchorKey(anchor))) anchor = consultAnchor([], a.after);
+    if (!anchor || used.has(anchorKey(anchor))) continue;
+    used.add(anchorKey(anchor));
+    recordAdvisorGuidance(sessionId, anchor, a.advice, a.id);
+  }
+}
+
+/** A non-streamed round's content, split the way the stream translator splits a streamed one:
+ *  the consult call (if any) apart, and the anchors the A4 record and the next round read. */
+export function splitConsult(content) {
+  const blocks = [];
+  let consultId = null;
+  for (const b of Array.isArray(content) ? content : []) {
+    if (b?.type === "tool_use" && ADVISOR_TOOL_NAMES.has(b.name)) {
+      consultId ??= b.id;
+      continue;
+    }
+    blocks.push(b);
+  }
+  let lastText = "";
+  let firstBlock = null;
+  for (const b of blocks) {
+    if (b?.type === "text") {
+      lastText = b.text;
+      firstBlock ??= { type: "text", text: b.text };
+    } else if (b?.type === "tool_use") firstBlock ??= { type: "tool", id: b.id };
+  }
+  return { blocks, consultId, lastText, firstBlock };
+}
 
 // Empty input_schema: the executor signals *timing only*. Letting it write a query loses
 // exactly the detail the advisor is there to catch — the harness forwards the full transcript
@@ -531,6 +600,7 @@ export function runAdvisor(text, opts = {}) {
     const child = execFile(cmd, args, {
       env,
       timeout: ADVISOR_TIMEOUT_MS,
+      signal: opts.signal,
       maxBuffer: 32 * 1024 * 1024,
     }, (err, stdout, stderr) => {
       if (err) {
@@ -1627,6 +1697,9 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
   // Anchor sources for a consult's advice; must match the client's history byte for byte.
   let lastText = "";
   let firstBlock = null; // { type:"text", text } | { type:"tool", id }
+  // Content of every block sent to the client, in order: a continuation replays a round's
+  // blocks upstream exactly as the harness will replay them next turn.
+  const emitted = [];
   let advisorToolUse = null; // { id, name, args } when the turn ends on a consult_advisor tool_use
 
   const closeOpen = () => {
@@ -1661,7 +1734,11 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
   const openBlock = (kind, contentBlock) => {
     closeOpen();
     const index = nextBlockIndex++;
-    open = { kind, index };
+    const rec = kind === "thinking" ? { type: "thinking", thinking: "" }
+      : kind === "text" ? { type: "text", text: "" }
+      : { type: "tool_use", id: contentBlock.id, name: contentBlock.name, args: "" };
+    emitted.push(rec);
+    open = { kind, index, rec };
     emit("content_block_start", { type: "content_block_start", index, content_block: contentBlock });
   };
 
@@ -1698,6 +1775,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
     if (ctx.reasoningMode === "thinking") {
       if (open?.kind !== "thinking")
         openBlock("thinking", { type: "thinking", thinking: "", signature: "" });
+      open.rec.thinking += text;
       emit("content_block_delta", {
         type: "content_block_delta",
         index: open.index,
@@ -1718,6 +1796,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
     }
     outputChars += text.length;
     lastText += text;
+    open.rec.text += text;
     if (firstBlock?.type === "text" && firstBlock.index === open.index) firstBlock.text += text;
     emit("content_block_delta", {
       type: "content_block_delta",
@@ -1774,6 +1853,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
         return;
       }
       rec.args += frag;
+      open.rec.args += frag;
       outputChars += frag.length;
       if (rec.stubSchema) return;
       emit("content_block_delta", {
@@ -1905,6 +1985,18 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
     },
     get firstBlock() {
       return firstBlock;
+    },
+    // Anthropic content blocks for what the client was sent; a suppressed consult is not among them.
+    get blocks() {
+      return emitted.map((b) => {
+        if (b.type === "thinking") return { type: "thinking", thinking: b.thinking, signature: REASONING_SIGNATURE };
+        if (b.type === "text") return { type: "text", text: b.text };
+        let input = {};
+        try {
+          input = b.args ? JSON.parse(b.args) : {};
+        } catch {}
+        return { type: "tool_use", id: b.id, name: b.name, input };
+      });
     },
     // Close whatever block is still open (emitting the thinking signature first, when that is
     // what is open) so a caller can append its own block at nextBlockIndex without nesting.
