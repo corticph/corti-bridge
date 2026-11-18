@@ -8,7 +8,7 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
-import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, consultCarry, splitConsult, consultAnchor, recordConsults, _resetWebSearchCache, _resetImageCache, estimateTokens, resolveEffort } from "'"$REPO"'/translate.mjs";
+import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, consultCarry, splitConsult, consultAnchor, recordConsults, _resetWebSearchCache, _resetImageCache, estimateTokens, resolveEffort, runAdvisor, advisorTimeoutMs } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 import { resolveVisionModel, VISION_DEFAULT, VISION_TIERS } from "'"$REPO"'/lib/vision.mjs";
 import { announcedDeferredNames, coerceStubInput, DEFERRED_STUB_DESCRIPTION } from "'"$REPO"'/lib/tool-search.mjs";
@@ -104,6 +104,32 @@ check("executorCwd: first occurrence wins over a later update", executorCwd({ me
 ] }), "/work/first");
 check("executorCwd: an update line alone drops its (was ...) suffix", executorCwd({ messages: [{ role: "system", content: " - Primary working directory: /work/b (was /work/a)" }] }), "/work/b");
 check("executorCwd: absent", executorCwd({ messages: [{ role: "user", content: "hi" }] }), undefined);
+
+// runAdvisor failure mapping, through a real child process (CORTI_ADVISOR_STUB).
+{
+  const fsm = await import("node:fs"); const osm = await import("node:os"); const pathm = await import("node:path");
+  const dir = fsm.mkdtempSync(pathm.join(osm.tmpdir(), "advstub-"));
+  const stub = (name, body) => { const f = pathm.join(dir, name); fsm.writeFileSync(f, "#!/bin/sh\n" + body + "\n"); fsm.chmodSync(f, 0o755); return f; };
+  const sleeper = stub("sleep.sh", "cat >/dev/null\nsleep 5");
+  const envEcho = stub("env.sh", "cat >/dev/null\nprintf %s \"$API_TIMEOUT_MS\"");
+  const savedStub = process.env.CORTI_ADVISOR_STUB, savedTimeout = process.env.CORTI_ADVISOR_TIMEOUT_MS;
+  process.env.CORTI_ADVISOR_TIMEOUT_MS = "300";
+  process.env.CORTI_ADVISOR_STUB = sleeper;
+  const timedOut = await runAdvisor("x");
+  check("runAdvisor: a child killed by the timeout is execution_time_exceeded", timedOut.code, "execution_time_exceeded");
+  const ac = new AbortController(); setTimeout(() => ac.abort(), 100);
+  process.env.CORTI_ADVISOR_TIMEOUT_MS = "4000";
+  const aborted = await runAdvisor("x", { signal: ac.signal });
+  check("runAdvisor: a client hang-up is not a timeout", aborted.code, "unavailable");
+  process.env.CORTI_ADVISOR_STUB = envEcho;
+  process.env.CORTI_ADVISOR_TIMEOUT_MS = "123456";
+  const envOut = await runAdvisor("x");
+  check("runAdvisor: the child API_TIMEOUT_MS matches the advisor timeout", envOut.text, String(advisorTimeoutMs()));
+  check("runAdvisor: advisorTimeoutMs reads the env at call time", advisorTimeoutMs(), 123456);
+  if (savedStub === undefined) delete process.env.CORTI_ADVISOR_STUB; else process.env.CORTI_ADVISOR_STUB = savedStub;
+  if (savedTimeout === undefined) delete process.env.CORTI_ADVISOR_TIMEOUT_MS; else process.env.CORTI_ADVISOR_TIMEOUT_MS = savedTimeout;
+  fsm.rmSync(dir, { recursive: true, force: true });
+}
 
 // Model name mapping: claude-* model names should map to configured Corti models via env vars.
 process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = "corti-s1";

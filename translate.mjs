@@ -359,12 +359,13 @@ const ADVISOR_EXECUTOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-execut
 // observed timing out in real sessions. 8 minutes is the floor; raise CORTI_ADVISOR_TIMEOUT_MS
 // to extend further. The gateway's stream-idle watchdog is suppressed for the advisor
 // handoff (see gateway.mjs deadlineCheck / advisorHandoff) so this is the real ceiling.
-const ADVISOR_TIMEOUT_MS = Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 8 * 60_000;
+// Read at call time, like advisorMaxTokens, so tests can shorten it.
+export const advisorTimeoutMs = () => Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 8 * 60_000;
 const ADVISOR_MODEL = process.env.CORTI_ADVISOR_MODEL || "opus";
 // Soft per-call output cap, surfaced to the advisor via the serialized transcript's budget
 // line. The official advisor tool sets a hard `max_tokens` on the tool def; corti-bridge -p
 // exposes no such flag, so this is a soft steer (the advisor shapes to fit) plus the hard
-// ADVISOR_TIMEOUT_MS / maxBuffer ceilings. 2048 is the official "recommended starting point."
+// advisorTimeoutMs / maxBuffer ceilings. 2048 is the official "recommended starting point."
 // Read at call time (not module load) so per-test env changes take effect.
 const advisorMaxTokens = () => Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2048;
 
@@ -630,6 +631,9 @@ export function runAdvisor(text, opts = {}) {
     // The executor's CLAUDE.md files already reach the advisor inside the transcript, framed as
     // quoted context; loaded again by the child they would arrive as instructions to the advisor.
     env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
+    // After a mid-stream api_error the child retries without streaming, and Claude Code gives that
+    // request 300s unless API_TIMEOUT_MS says otherwise: the retry regenerates the whole answer.
+    env.API_TIMEOUT_MS = String(advisorTimeoutMs());
     // maxBuffer bounds the child's combined stdout. The advisor is an Opus-tier model
     // emitting --output-format json (an array of every event); even without inherited debug
     // logging, that stream can exceed a few MB on a long consult. 32MB is generous headroom —
@@ -639,24 +643,27 @@ export function runAdvisor(text, opts = {}) {
     const child = execFile(cmd, args, {
       env,
       cwd: advisorCwd(opts.cwd),
-      timeout: ADVISOR_TIMEOUT_MS,
+      timeout: advisorTimeoutMs(),
       signal: opts.signal,
       maxBuffer: 32 * 1024 * 1024,
     }, (err, stdout, stderr) => {
       if (err) {
         // Capture the raw failure so the gateway diagnostic can show WHY, not just that, it
-        // failed. execFile sets err.code === "ETIMEDOUT" when the timeout fires; other codes
-        // (ENOENT if corti-bridge isn't on PATH, ERR_CHILD_PROCESS_STDIO_MAXBUFFER if stdout
-        // or stderr exceeded maxBuffer, a non-zero exit) are non-timeout failures. stderr
-        // carries the child's own error text when it exited non-zero — the most useful signal.
-        const detail = `code=${err.code || "?"} msg=${String(err.message || "").slice(0, 200)}` +
+        // failed. Besides the timeout (killed), err.code carries ENOENT if corti-bridge isn't on
+        // PATH, ERR_CHILD_PROCESS_STDIO_MAXBUFFER if stdout or stderr exceeded maxBuffer, or the
+        // exit status of a child that failed on its own. stderr carries the child's own error
+        // text when it exited non-zero — the most useful signal.
+        const detail = `code=${err.code || "?"}${err.killed ? ` killed signal=${err.signal ?? "-"}` : ""} msg=${String(err.message || "").slice(0, 200)}` +
           (stderr ? ` stderr=${String(stderr).trim().slice(0, 200)}` : "");
         const hint = err.code === "ENOENT"
           ? " (the corti-bridge wrapper isn't on PATH — run ./setup.sh to install it)"
           : "";
         return resolve({
           ok: false,
-          code: err.code === "ETIMEDOUT" ? "execution_time_exceeded" : "unavailable",
+          // execFile reports its timeout as killed (Claude Code exits 143), never as ETIMEDOUT. A
+          // client hang-up and a maxBuffer overflow kill the child too; neither is a timeout.
+          code: err.killed && !opts.signal?.aborted && err.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"
+            ? "execution_time_exceeded" : "unavailable",
           detail: detail + hint,
         });
       }

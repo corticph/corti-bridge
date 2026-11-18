@@ -216,10 +216,14 @@ cat > advisor-stub.sh <<'ADVSTUB'
 #!/bin/sh
 # Keep the transcript when asked (C1-CARRY asserts on what the advisor was actually shown);
 # discard it otherwise, so the other suites stay unaffected.
-if [ -n "${ADVISOR_STUB_CAPTURE:-}" ]; then cat >> "$ADVISOR_STUB_CAPTURE"; else cat >/dev/null; fi
+ADVISOR_STUB_IN=$(cat)
+[ -n "${ADVISOR_STUB_CAPTURE:-}" ] && printf '%s\n' "$ADVISOR_STUB_IN" >> "$ADVISOR_STUB_CAPTURE"
 # ADVISOR-CWD: where the child was started and whether it may load CLAUDE.md files.
 [ -n "${ADVISOR_STUB_ENVCAP:-}" ] && printf 'cwd=%s mds=%s\n' "$(pwd -P)" "${CLAUDE_CODE_DISABLE_CLAUDE_MDS:-}" >> "$ADVISOR_STUB_ENVCAP"
-printf '{"ok":true,"text":"stub advisor advice"}'
+case "$ADVISOR_STUB_IN" in
+  *TIMEOUTME*) printf '{"ok":false,"code":"execution_time_exceeded"}' ;;
+  *) printf '{"ok":true,"text":"stub advisor advice"}' ;;
+esac
 ADVSTUB
 chmod +x advisor-stub.sh
 
@@ -862,6 +866,12 @@ const s = https.createServer(
     req.on("end", () => {
       const body = Buffer.concat(chunks).toString();
       if (body.includes("CAPME")) return sse(res, consult(`call_cap${++capCalls}`));
+      if (body.includes("TIMEOUTME")) return sse(res, consult(`call_to${++capCalls}`));
+      if (body.includes("DROPME")) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write('data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"partial"}}]}\n\n');
+        return void setTimeout(() => res.socket.destroy(), 300);
+      }
       // TWINME: two consults in one assistant message.
       if (body.includes("TWINME") && body.includes('"tool_call_id":"call_t')) return sse(res, [
         { choices: [{ index: 0, delta: { role: "assistant", content: "TWIN ANSWER" } }] },
@@ -945,6 +955,16 @@ JSONBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messag
 JSONRESP=$(curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: nest-sess-3' \
   -d "$JSONBODY" "$C1NESTG/v1/messages" 2>&1 || true)
 JSONSPAWNS=$(( $(grep -c '<transcript>' "$NEST_ADVISOR_IN" || true) - NESTSPAWNS - CAPSPAWNS ))
+# ADVISOR-TIMEOUT: the advisor stub times out on this transcript and the model keeps consulting.
+TOBEFORE=$(grep -c '<transcript>' "$NEST_ADVISOR_IN" || true)
+TOBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"TIMEOUTME"}]}'
+TORESP=$(curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: nest-sess-6' \
+  -d "$TOBODY" "$C1NESTG/v1/messages" 2>&1 || true)
+TOSPAWNS=$(( $(grep -c '<transcript>' "$NEST_ADVISOR_IN" || true) - TOBEFORE ))
+# STREAM-ERROR: the first call dies mid-stream; the debug log must say why.
+DROPBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"DROPME"}]}'
+curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: nest-sess-7' \
+  -d "$DROPBODY" "$C1NESTG/v1/messages" >/dev/null 2>&1 || true
 TWINBEFORE=$(grep -c '<transcript>' "$NEST_ADVISOR_IN" || true)
 TWINBODY='{"model":"corti-s1","max_tokens":16,"stream":true,'"$C1TOOLS"',"messages":[{"role":"user","content":"TWINME"}]}'
 TWINRESP=$(curl -s -m 30 -N -H 'content-type: application/json' -H 'x-claude-code-session-id: nest-sess-5' \
@@ -1020,6 +1040,13 @@ check "C1-CAP: the fifth consult reaches the client as a tool call" \
   "$(printf '%s' "$CAPRESP" | grep -c '"name":"consult_advisor"')" "1"
 check "C1-CAP: the turn ends on tool_use" \
   "$(printf '%s' "$CAPRESP" | grep -A1 'event: message_delta' | grep -c '"stop_reason":"tool_use"')" "1"
+check "ADVISOR-TIMEOUT: the timed-out round is the only advisor run of the turn" "$TOSPAWNS" "1"
+check "ADVISOR-TIMEOUT: later consults are answered execution_time_exceeded at once" \
+  "$(printf '%s' "$TORESP" | grep -o '"error_code":"execution_time_exceeded"' | wc -l | tr -d ' ')" "3"
+check "ADVISOR-TIMEOUT: the use cap still ends the loop" \
+  "$(printf '%s' "$TORESP" | grep -c '"error_code":"max_uses_exceeded"')" "1"
+check "STREAM-ERROR: a mid-stream drop logs its cause" \
+  "$(cat "$SCRATCH"/nest-logs/*nest-sess-7*.log 2>/dev/null | grep -c 'upstream stream error: ')" "1"
 check "C1-NESTED-JSON: a nested consult in a JSON continuation runs the advisor again" "$JSONSPAWNS" "2"
 check "C1-NESTED-JSON: the answer streams through, the consult does not" \
   "$(printf '%s' "$JSONRESP" | grep -c 'JSON ANSWER')/$(printf '%s' "$JSONRESP" | grep -c '"name":"consult_advisor"')" "1/0"

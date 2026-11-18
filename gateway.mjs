@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import {
   TranslateRejection,
   advisorContinuationErrorCode,
+  advisorTimeoutMs,
   applyIntercepts,
   createStreamTranslator,
   estimateTokens,
@@ -935,6 +936,9 @@ async function handleMessages(req, res, body) {
   // State of the current round, read by endContinuationFailure.
   let resIdx = 0;
   let advisorResult;
+  // A round that timed out has already held the turn for the whole advisor budget; a later consult
+  // in the same turn is answered with the same error instead of waiting that long again.
+  let advisorTimedOut = false;
 
   /** Advisor succeeded but the continuation (proxy's own 2nd call) failed: a proxy-internal
    *  event, not an advisor failure. A text note ends the turn — no second advisor_tool_result
@@ -973,6 +977,7 @@ async function handleMessages(req, res, body) {
   // continues without advice, never a fake success.
   const runAdvisorRound = async (round, consultId, history, carried) => {
     if (round > ADVISOR_MAX_USES) return { ok: false, code: "max_uses_exceeded" };
+    if (advisorTimedOut) return { ok: false, code: "execution_time_exceeded", detail: "not run: an earlier round timed out" };
     // Serialize the executor's full request (system + tools + transcript + budget line), up to
     // and including what it wrote before this consult. The tool input is empty — the executor
     // signals timing only; the harness forwards context automatically, per the official design.
@@ -988,8 +993,9 @@ async function handleMessages(req, res, body) {
     try {
       const out = await runAdvisor(advisorInput, { parentSessionId, signal: clientAbort.signal, cwd: advisorDir });
       // Bare string = injected test stub; treat as success for backward compat.
-      const result = typeof out === "string" ? { ok: true, text: out } : out;
-      return result ?? { ok: false, code: "unavailable" };
+      const result = (typeof out === "string" ? { ok: true, text: out } : out) ?? { ok: false, code: "unavailable" };
+      if (result.code === "execution_time_exceeded") advisorTimedOut = true;
+      return result;
     } catch (err) {
       diagnostics.push(`advisor spawn failed: ${err?.message ?? err}`);
       return { ok: false, code: "unavailable" };
@@ -1738,8 +1744,9 @@ async function handleMessages(req, res, body) {
           }
         };
 
-        const streamError = () => {
+        const streamError = (err) => {
           if (finalized) return;
+          diagnostics.push(`upstream stream error: ${err?.code ?? "-"} ${err?.message ?? err}`);
           // mid-stream socket failure (possibly over gunzip): never close open
           // blocks — truncated tool args must not look complete
           if (!translator.terminated)
@@ -1809,6 +1816,8 @@ async function handleMessages(req, res, body) {
   if (translated.stream === true) {
     interval = setInterval(deadlineCheck, 1_000);
   } else {
+    // The advisor child's non-streaming retry may run as long as the advisor itself (the child gets
+    // API_TIMEOUT_MS to match); the advisor's own timeout is that request's real ceiling.
     absolute = setTimeout(() => {
       if (finalized) return;
       fail(
@@ -1818,7 +1827,7 @@ async function handleMessages(req, res, body) {
         },
         "watchdog-timeout",
       );
-    }, NONSTREAM_TIMEOUT_MS);
+    }, noAdvisor ? Math.max(NONSTREAM_TIMEOUT_MS, advisorTimeoutMs()) : NONSTREAM_TIMEOUT_MS);
   }
 
   sendUpstream();
