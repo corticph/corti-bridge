@@ -400,6 +400,15 @@ _d_check_gateway() {
                     ;;
             esac
         fi
+        # Deferred tools that arrived without the harness announcement naming them: tool
+        # search then re-bills the whole prompt on every load (see lib/tool-search.mjs).
+        case "$_d_health" in
+            *'"toolSearchUnannounced":0'*) ;;
+            *'"toolSearchUnannounced":'*)
+                _d_report WARN tool-search "requests carried deferred tools without the deferred-tools announcement" \
+                    "Claude Code likely changed its wording; update the parser in lib/tool-search.mjs. Until then each tool load re-bills the prompt."
+                ;;
+        esac
         _d_report OK gateway "healthy on :$_d_PORT ($_d_sub)" \
             "Clone not confirmed from health alone (see proxy-dir + process checks)."
     fi

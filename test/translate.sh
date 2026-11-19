@@ -8,9 +8,11 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 node --input-type=module -e '
-import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, _resetWebSearchCache, _resetImageCache, estimateTokens } from "'"$REPO"'/translate.mjs";
+import { translateRequest, translateError, promptTooLong, applyIntercepts, createStreamTranslator, advisorContinuationErrorCode, translateCompletion, _resetAdvisorProcessed, recordAdvisorGuidance, _resetAdvisorGuidance, consultCarry, splitConsult, consultAnchor, recordConsults, _resetWebSearchCache, _resetImageCache, estimateTokens, resolveEffort, runAdvisor, advisorTimeoutMs } from "'"$REPO"'/translate.mjs";
 import { serializeAdvisorInput } from "'"$REPO"'/lib/advisor-transcript.mjs";
 import { resolveVisionModel, VISION_DEFAULT, VISION_TIERS } from "'"$REPO"'/lib/vision.mjs";
+import { announcedDeferredNames, coerceStubInput, DEFERRED_STUB_DESCRIPTION } from "'"$REPO"'/lib/tool-search.mjs";
+import { executorCwd } from "'"$REPO"'/lib/harness-text.mjs";
 
 let failed = 0;
 const check = (name, got, want) => {
@@ -33,7 +35,7 @@ const ADAPTIVE = { type: "adaptive" };
 // so every fixture that must reach the advisor carries one.
 const ANYTOOL = () => ({ name: "run_bash", description: "Run a bash command", input_schema: { type: "object" } });
 
-// Corti effort vocabulary is {high, max}. The picker six levels collapse at the midpoint;
+// Without catalog levels (no effortLevels lookup) the picker six levels collapse onto {high, max};
 // budget mapping routes through the same collapse, so medium/low never reach upstream.
 for (const m of ["corti-s1", "corti-s1-mini", "corti-s1-ultra-beta", "corti-s1-ultra-instant-beta"]) {
   check(`${m}: adaptive (no effort) defaults to high`, await effort(m, ADAPTIVE), "high");
@@ -62,6 +64,109 @@ const noThinking = (await translateRequest({
   messages: [{ role: "user", content: "hi" }],
 })).request.reasoning_effort;
 check("no thinking block omits reasoning_effort (non-reasoning guard)", noThinking, undefined);
+
+// Catalog effort levels: nearest listed level, ties up; [] omits; unknown keeps the high/max collapse.
+const S1 = ["low", "high", "max"];
+const MINI = ["low", "medium", "xhigh"];
+for (const [req, levels, want] of [
+  ["low", S1, "low"], ["medium", S1, "high"], ["high", S1, "high"], ["xhigh", S1, "max"], ["max", S1, "max"], ["ultracode", S1, "max"],
+  ["low", MINI, "low"], ["medium", MINI, "medium"], ["high", MINI, "xhigh"], ["xhigh", MINI, "xhigh"], ["max", MINI, "xhigh"],
+  ["high", ["low"], "low"], ["low", ["max"], "max"],
+  ["high", [], undefined], ["high", ["minimal"], undefined],
+  ["low", undefined, "high"], ["xhigh", undefined, "max"], ["bogus", S1, undefined],
+]) check(`resolveEffort(${req}, ${levels ? levels.join("/") || "none" : "unknown"}) = ${want}`, resolveEffort(req, levels), want);
+
+const levelsOf = (map) => (id) => map[id];
+const viaLevels = async (model, thinking, output_config, opts = {}) =>
+  (await translateRequest({ model, max_tokens: 16, thinking, output_config, messages: [{ role: "user", content: "hi" }] },
+    { effortLevels: levelsOf({ "corti-s1": S1, "corti-s1-mini": MINI, "corti-s1-instant": [] }), ...opts })).request.reasoning_effort;
+check("levels: mini adaptive default high resolves to xhigh", await viaLevels("corti-s1-mini", ADAPTIVE), "xhigh");
+check("levels: mini picker medium is sent as medium", await viaLevels("corti-s1-mini", ADAPTIVE, { effort: "medium" }), "medium");
+check("levels: s1 picker low is honoured", await viaLevels("corti-s1", ADAPTIVE, { effort: "low" }), "low");
+check("levels: s1 low budget maps to low", await viaLevels("corti-s1", ENABLED(1000)), "low");
+check("levels: no-effort model omits reasoning_effort", await viaLevels("corti-s1-instant", ADAPTIVE, { effort: "max" }), undefined);
+check("levels: model absent from catalog keeps the collapse", await viaLevels("corti-s1-ultra-beta", ADAPTIVE, { effort: "low" }), "high");
+check("levels: advisor high on mini resolves to xhigh", await viaLevels("corti-s1-mini", ADAPTIVE, undefined, { advisorEffort: "high" }), "xhigh");
+check("levels: advisor max on s1 stays max", await viaLevels("corti-s1", ADAPTIVE, undefined, { advisorEffort: "max" }), "max");
+const traced = await translateRequest({ model: "corti-s1-mini", max_tokens: 16, thinking: ADAPTIVE, messages: [{ role: "user", content: "hi" }] },
+  { effortLevels: levelsOf({ "corti-s1-mini": MINI }) });
+check("levels: trace reports requested and sent", JSON.stringify([traced.effort?.requested, traced.effort?.sent]), JSON.stringify(["high", "xhigh"]));
+// Advisor thinking budget: capped on a reasoning request, below max_tokens, never raised.
+const tb = async (model, extra, opts) => (await translateRequest({ model, max_tokens: 32000, thinking: ADAPTIVE, messages: [{ role: "user", content: "hi" }], ...extra },
+  { effortLevels: levelsOf({ "corti-s1": S1, "corti-s1-instant": [] }), ...opts })).request.thinking_token_budget;
+check("advisor budget: set on the advisor child", await tb("corti-s1", {}, { advisorEffort: "high", advisorThinkingBudget: 8192 }), 8192);
+check("advisor budget: absent on an ordinary request", await tb("corti-s1", {}, {}), undefined);
+check("advisor budget: never sent to a model that takes no effort", await tb("corti-s1-instant", {}, { advisorEffort: "high", advisorThinkingBudget: 8192 }), undefined);
+check("advisor budget: a smaller client budget stands", await tb("corti-s1", { thinking: ENABLED(4000) }, { advisorEffort: "high", advisorThinkingBudget: 8192 }), 4000);
+check("advisor budget: leaves room for the answer under max_tokens", await tb("corti-s1", { max_tokens: 6000 }, { advisorEffort: "high", advisorThinkingBudget: 8192 }), 4976);
+
+// C2: the rewrite path hands the caller abort signal to the advisor spawn.
+{
+  const seen = [];
+  const ac = new AbortController();
+  const rwBody = { model: "corti-s1", max_tokens: 16, tools: [ANYTOOL()], messages: [
+    { role: "user", content: "advise me" },
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_rw1", name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_rw1", is_error: true, content: "Error: No such tool available: consult_advisor" }] },
+  ] };
+  await applyIntercepts(rwBody, { mode: "openai", signal: ac.signal, runAdvisor: async (t, o) => { seen.push(o); return "rw advice"; } });
+  check("advisor rewrite: the spawn receives the abort signal", seen[0]?.signal === ac.signal, true);
+}
+// A hang-up aborts the rewrite run; that failure must not become the consult cached answer.
+{
+  const mk = (id) => ({ model: "corti-s1", max_tokens: 16, tools: [ANYTOOL()], messages: [
+    { role: "user", content: "advise me" },
+    { role: "assistant", content: [{ type: "tool_use", id, name: "consult_advisor", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: "Error: No such tool available: consult_advisor" }] },
+  ] });
+  const failing = async () => ({ ok: false, code: "unavailable" });
+  const cache = new Map();
+  const gone = new AbortController(); gone.abort();
+  await applyIntercepts(mk("toolu_ab1"), { mode: "openai", signal: gone.signal, runAdvisor: failing, advisorProcessed: cache });
+  check("advisor rewrite: an aborted run is not cached", cache.has("toolu_ab1"), false);
+  await applyIntercepts(mk("toolu_ab2"), { mode: "openai", signal: new AbortController().signal, runAdvisor: failing, advisorProcessed: cache });
+  check("advisor rewrite: a failure without a hang-up is still cached", cache.has("toolu_ab2"), true);
+}
+
+// executorCwd: harness-authored environment block only; the first occurrence is the session own.
+const ENVBLOCK = (d) => "# Environment\n - Primary working directory: " + d + "\n - Is a git repository: true";
+check("executorCwd: role system message (string)", executorCwd({ messages: [{ role: "system", content: ENVBLOCK("/work/proj") }, { role: "user", content: "hi" }] }), "/work/proj");
+check("executorCwd: role system message (text blocks)", executorCwd({ messages: [{ role: "system", content: [{ type: "text", text: ENVBLOCK("/work/blocks") }] }] }), "/work/blocks");
+check("executorCwd: body.system", executorCwd({ system: [{ type: "text", text: ENVBLOCK("/work/sys") }], messages: [] }), "/work/sys");
+check("executorCwd: user prose cannot set it", executorCwd({ messages: [{ role: "user", content: ENVBLOCK("/evil") }] }), undefined);
+check("executorCwd: first occurrence wins over a later update", executorCwd({ messages: [
+  { role: "system", content: ENVBLOCK("/work/first") },
+  { role: "system", content: " - Primary working directory: /work/first/sub (was /work/first)" },
+] }), "/work/first");
+check("executorCwd: an update line alone drops its (was ...) suffix", executorCwd({ messages: [{ role: "system", content: " - Primary working directory: /work/b (was /work/a)" }] }), "/work/b");
+check("executorCwd: absent", executorCwd({ messages: [{ role: "user", content: "hi" }] }), undefined);
+check("executorCwd: prose in the system prompt does not count", executorCwd({ system: "Docs say: Primary working directory: /evil is shown in the env block.", messages: [{ role: "system", content: ENVBLOCK("/work/real") }] }), "/work/real");
+
+// runAdvisor failure mapping, through a real child process (CORTI_ADVISOR_STUB).
+{
+  const fsm = await import("node:fs"); const osm = await import("node:os"); const pathm = await import("node:path");
+  const dir = fsm.mkdtempSync(pathm.join(osm.tmpdir(), "advstub-"));
+  const stub = (name, body) => { const f = pathm.join(dir, name); fsm.writeFileSync(f, "#!/bin/sh\n" + body + "\n"); fsm.chmodSync(f, 0o755); return f; };
+  const sleeper = stub("sleep.sh", "cat >/dev/null\nsleep 5");
+  const envEcho = stub("env.sh", "cat >/dev/null\nprintf %s \"$API_TIMEOUT_MS\"");
+  const savedStub = process.env.CORTI_ADVISOR_STUB, savedTimeout = process.env.CORTI_ADVISOR_TIMEOUT_MS;
+  process.env.CORTI_ADVISOR_TIMEOUT_MS = "300";
+  process.env.CORTI_ADVISOR_STUB = sleeper;
+  const timedOut = await runAdvisor("x");
+  check("runAdvisor: a child killed by the timeout is execution_time_exceeded", timedOut.code, "execution_time_exceeded");
+  const ac = new AbortController(); setTimeout(() => ac.abort(), 100);
+  process.env.CORTI_ADVISOR_TIMEOUT_MS = "4000";
+  const aborted = await runAdvisor("x", { signal: ac.signal });
+  check("runAdvisor: a client hang-up is not a timeout", aborted.code, "unavailable");
+  process.env.CORTI_ADVISOR_STUB = envEcho;
+  process.env.CORTI_ADVISOR_TIMEOUT_MS = "123456";
+  const envOut = await runAdvisor("x");
+  check("runAdvisor: the child API_TIMEOUT_MS matches the advisor timeout", envOut.text, String(advisorTimeoutMs()));
+  check("runAdvisor: advisorTimeoutMs reads the env at call time", advisorTimeoutMs(), 123456);
+  if (savedStub === undefined) delete process.env.CORTI_ADVISOR_STUB; else process.env.CORTI_ADVISOR_STUB = savedStub;
+  if (savedTimeout === undefined) delete process.env.CORTI_ADVISOR_TIMEOUT_MS; else process.env.CORTI_ADVISOR_TIMEOUT_MS = savedTimeout;
+  fsm.rmSync(dir, { recursive: true, force: true });
+}
 
 // Model name mapping: claude-* model names should map to configured Corti models via env vars.
 process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = "corti-s1";
@@ -531,6 +636,125 @@ const lt2 = createStreamTranslator({}, () => {});
 lt2.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "tu_first", type: "function", function: { name: "run_bash", arguments: "{}" } }] } }] });
 lt2.feed({ choices: [{ index: 0, delta: { content: "after the call" } }] });
 check("A4: firstBlock reports a leading tool call by id", JSON.stringify(lt2.firstBlock), JSON.stringify({ type: "tool", id: "tu_first" }));
+
+// Block G6 — CONT-CACHE: a continuation extends the upstream prompt (tools first, then system and
+// history), and the next turn rebuilt by restoreAdvisorGuidance extends the continuation.
+const c2ev = [];
+const c2t = createStreamTranslator({ reasoningMode: "thinking", onAdvisorToolUse: () => {} }, (e, d) => c2ev.push([e, d]));
+c2t.feed({ choices: [{ index: 0, delta: { reasoning: "plan" } }] });
+c2t.feed({ choices: [{ index: 0, delta: { content: "Asking the advisor." } }] });
+c2t.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c2_adv", type: "function", function: { name: "consult_advisor", arguments: "{}" } }] } }] });
+c2t.feed({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+const C2SIG = "Y29ydGktcHJveHk=";
+const th = (t) => ({ type: "thinking", thinking: t, signature: C2SIG });
+const tx = (t) => ({ type: "text", text: t });
+check("CONT-CACHE: blocks hold what the client was sent, the suppressed consult excluded",
+  JSON.stringify(c2t.blocks), JSON.stringify([th("plan"), tx("Asking the advisor.")]));
+const c2tool = createStreamTranslator({}, () => {});
+c2tool.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "tb1", type: "function", function: { name: "run_bash", arguments: "{\"cmd\":" } }] } }] });
+c2tool.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: "\"ls\"}" } }] } }] });
+check("CONT-CACHE: blocks carry a tool call with its parsed input",
+  JSON.stringify(c2tool.blocks), JSON.stringify([{ type: "tool_use", id: "tb1", name: "run_bash", input: { cmd: "ls" } }]));
+
+const tu = { type: "tool_use", id: "x1", name: "run_bash", input: {} };
+check("CONT-CACHE: consultCarry keeps thinking and text up to the pre-call text",
+  JSON.stringify(consultCarry([th("a"), tx("one"), tu, tx("two"), th("late")], "two")), JSON.stringify([th("a"), tx("one"), tx("two")]));
+check("CONT-CACHE: consultCarry carries only thinking when the round wrote no text",
+  JSON.stringify(consultCarry([th("a"), tu], "")), JSON.stringify([th("a")]));
+check("CONT-CACHE: consultCarry treats an unmatched pre-call text as none",
+  JSON.stringify(consultCarry([th("a"), tx("one")], "other")), JSON.stringify([th("a")]));
+check("CONT-CACHE: consultCarry tolerates a missing block list", JSON.stringify(consultCarry(undefined, "x")), "[]");
+const sc = splitConsult([th("a"), tx("lead"), tu, tx("last"), { type: "tool_use", id: "adv9", name: "consult_advisor", input: {} }]);
+check("CONT-CACHE: splitConsult takes the consult out and reports its id", sc.consultId + "/" + sc.blocks.length, "adv9/4");
+check("CONT-CACHE: splitConsult reports the anchors the stream translator would",
+  JSON.stringify([sc.lastText, sc.firstBlock]), JSON.stringify(["last", { type: "text", text: "lead" }]));
+check("CONT-CACHE: splitConsult without a consult", splitConsult([tx("hi")]).consultId, null);
+
+check("CONT-CACHE: consultAnchor follows the last carried block",
+  JSON.stringify(consultAnchor([th("a"), tx("pre")], [tx("x")])), JSON.stringify({ text: "pre", before: false }));
+check("CONT-CACHE: consultAnchor follows carried thinking when the round wrote no text",
+  JSON.stringify(consultAnchor([th("a")], [tx("x")])), JSON.stringify({ thinking: "a", before: false }));
+check("CONT-CACHE: consultAnchor precedes the continuation when nothing was carried",
+  JSON.stringify(consultAnchor([], [th("b"), tx("x")])), JSON.stringify({ thinking: "b", before: true }));
+check("CONT-CACHE: consultAnchor has nothing to anchor on", consultAnchor([], []), null);
+
+const c2tools = () => [{ name: "run_bash", description: "run", input_schema: { type: "object", properties: { cmd: { type: "string" } } } }];
+const c2base = () => ({ model: "corti-s1", max_tokens: 64, system: "agent", tools: c2tools(), messages: [{ role: "user", content: "fix it" }] });
+const c2pair = (id, carried, advice) => [
+  { role: "assistant", content: [...carried, { type: "tool_use", id, name: "consult_advisor", input: {} }] },
+  { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "<advisor_guidance>\n" + advice + "\n</advisor_guidance>", is_error: false }] },
+];
+const j = (v) => JSON.stringify(v);
+const c2skip = (sid) => ({ skipAdvisor: true, skipImages: true, parentSessionId: sid, forwardThinking: true });
+const c2open = (sid) => ({ mode: "openai", parentSessionId: sid, forwardThinking: true });
+// One consult turn as gateway.mjs runs it, then the next turn as the harness replays it (one
+// assistant message, advisor blocks dropped). rounds: blocks before each consult; last: the answer.
+const c2run = async (sid, rounds, last) => {
+  _resetAdvisorGuidance();
+  const first = c2base();
+  const up1 = (await translateRequest(first, c2open(sid))).request;
+  let h = [...first.messages];
+  const conts = [];
+  const answered = [];
+  for (let i = 0; i < rounds.length; i++) {
+    const r = rounds[i];
+    const pre = [...r].reverse().find((b) => b.type === "text")?.text ?? "";
+    const carried = consultCarry(r, pre);
+    h = [...h, ...c2pair("adv" + i, carried, "advice " + i)];
+    conts.push((await translateRequest({ ...first, messages: h }, c2skip(sid))).request);
+    answered.push({ id: "adv" + i, carried, advice: "advice " + i, after: i + 1 < rounds.length ? rounds[i + 1] : last });
+  }
+  recordConsults(sid, answered);
+  const next = c2base();
+  const tool = last.find((b) => b.type === "tool_use");
+  next.messages.push(
+    { role: "assistant", content: [...rounds.flat(), ...last] },
+    tool ? { role: "user", content: [{ type: "tool_result", tool_use_id: tool.id, content: "ok" }] } : { role: "user", content: "more" },
+  );
+  const nextUp = (await translateRequest(next, c2open(sid))).request;
+  const lastCont = conts[conts.length - 1];
+  const extendsPrev = conts.every((c, i) => j(c.messages.slice(0, (i ? conts[i - 1] : up1).messages.length)) === j((i ? conts[i - 1] : up1).messages));
+  return {
+    up1, conts, nextUp,
+    toolsSame: conts.every((c) => j(c.tools) === j(up1.tools)) && j(nextUp.tools) === j(up1.tools),
+    extendsPrev,
+    nextExtends: j(nextUp.messages.slice(0, lastCont.messages.length)) === j(lastCont.messages),
+  };
+};
+const bash = (id) => ({ type: "tool_use", id, name: "run_bash", input: { cmd: "ls" } });
+const c2cases = [
+  ["pre-call text, two rounds", [[th("plan one"), tx("Asking the advisor.")], [th("plan two"), tx("Checking once more.")]], [tx("Done."), bash("tn1")]],
+  ["the same pre-call text twice", [[th("plan one"), tx("Asking the advisor.")], [th("plan two"), tx("Asking the advisor.")]], [tx("Done.")]],
+  ["thinking only, continuation thinks then calls a tool", [[th("plan")]], [th("after advice"), bash("tn2")]],
+  ["thinking only, continuation thinks then answers", [[th("plan")]], [th("after advice"), tx("Done.")]],
+  ["a bare consult, continuation thinks first", [[]], [th("after advice"), tx("Done.")]],
+  ["two thinking-only rounds", [[th("plan one")], [th("plan two")]], [tx("Done.")]],
+];
+for (const [name, rounds, last] of c2cases) {
+  const r = await c2run("c2-" + name, rounds, last);
+  check(`CONT-CACHE (${name}): tools byte-identical on every request`, r.toolsSame, true);
+  check(`CONT-CACHE (${name}): each continuation extends the request before it`, r.extendsPrev, true);
+  check(`CONT-CACHE (${name}): next turn extends the last continuation`, r.nextExtends, true);
+}
+check("CONT-CACHE: the first call still offers consult_advisor",
+  (await c2run("c2-offer", [[tx("x")]], [tx("y")])).up1.tools.some((t) => t.function.name === "consult_advisor"), true);
+
+// A tool call beside the consult is not carried, so that next turn diverges; it must still
+// translate and keep the advice.
+const par = await c2run("c2-par", [[tx("Running and asking."), bash("tp1")]], [tx("Done.")]);
+check("CONT-CACHE: a parallel tool call still restores the advice next turn",
+  j(par.nextUp.messages).includes("advice 0"), true);
+
+// Sent bare, the consult does not extend into the next turn; guards that the check above can fail.
+_resetAdvisorGuidance();
+const bareFirst = c2base();
+await translateRequest(bareFirst, c2open("c2-bare"));
+const bareCont = (await translateRequest({ ...bareFirst, messages: [...bareFirst.messages, ...c2pair("adv0", [], "advice 0")] }, c2skip("c2-bare"))).request;
+recordConsults("c2-bare", [{ id: "adv0", carried: [th("plan"), tx("Asking.")], advice: "advice 0", after: [tx("Done.")] }]);
+const bareNext = (await translateRequest({ ...c2base(), messages: [{ role: "user", content: "fix it" }, { role: "assistant", content: [th("plan"), tx("Asking."), tx("Done.")] }, { role: "user", content: "more" }] }, c2open("c2-bare"))).request;
+check("CONT-CACHE: a consult sent without its round does not extend into the next turn",
+  j(bareNext.messages.slice(0, bareCont.messages.length)) === j(bareCont.messages), false);
+_resetAdvisorGuidance();
 
 // Block H — C6: prior-turn advisor advice round-trips into history instead of being dropped.
 // advisor_tool_result is NOT in SERVER_BLOCK_TYPES (only server_tool_use is); before the fix it
@@ -1338,6 +1562,214 @@ const estAdv = estimateTokens({ messages: [
   ] },
 ] });
 check("estimateTokens: advisor-anchored thinking counts", estAdv > estAdvBase, true);
+
+// Tool search (fix 1): a ToolSearch result is tool_reference blocks only. Without rendering, the
+// model read "(empty tool result)" and retried; it must see the definitions it was promised.
+const TS_TOOLS = [
+  { name: "Bash", description: "Run a shell command.", input_schema: { type: "object", properties: { command: { type: "string" } } } },
+  { name: "ToolSearch", description: "Load deferred tools.", input_schema: { type: "object", properties: { query: { type: "string" } } } },
+  { name: "CronList", description: "List cron jobs.", input_schema: { type: "object", properties: {} }, defer_loading: true },
+];
+const tsBody = (extra = []) => ({
+  model: "corti-s1", max_tokens: 64, tools: TS_TOOLS,
+  messages: [
+    { role: "user", content: "load CronList" },
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_ts", name: "ToolSearch", input: { query: "select:CronList" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ts", content: [{ type: "tool_reference", tool_name: "CronList" }, ...extra] }] },
+  ],
+});
+const tsTool = (r) => r.request.messages.find((m) => m.role === "tool")?.content;
+const tsText = tsTool(await translateRequest(tsBody()));
+check("tool search: reference is not an empty result", tsText !== "(empty tool result)", true);
+check("tool search: reference renders the full definition in a functions block",
+  tsText, "<functions>\n<function>{\"description\":\"List cron jobs.\",\"name\":\"CronList\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}</function>\n</functions>");
+check("tool search: rendering is byte-identical across translations", tsTool(await translateRequest(tsBody())), tsText);
+const tsUnknown = tsTool(await translateRequest({ ...tsBody(), tools: TS_TOOLS.filter((t) => t.name !== "CronList") }));
+check("tool search: a reference to an absent tool still names it", tsUnknown.includes("\"name\":\"CronList\""), true);
+const tsMixed = tsTool(await translateRequest(tsBody([{ type: "text", text: "note" }])));
+check("tool search: text beside references is kept", tsMixed.startsWith("note\n\n<functions>"), true);
+check("estimateTokens: counts rendered tool references",
+  estimateTokens(tsBody()) > estimateTokens({ ...tsBody(), messages: tsBody().messages.slice(0, 2).concat([{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ts", content: [] }] }]) }), true);
+const tsAdv = serializeAdvisorInput(tsBody()).text;
+check("advisor transcript: ToolSearch result names the loaded tools", tsAdv.includes("[ToolSearch loaded: CronList]"), true);
+
+// Tool search (fix 2, A1): Corti renders tools first, so appending each load there re-billed the
+// whole prompt. Deferred names go upstream as fixed stubs from the first request instead.
+const ANNOUNCE = (names) => "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — calling them directly will fail with InputValidationError. Use ToolSearch with query \"select:<name>[,<name>...]\" to load tool schemas before calling them:\n" + names.join("\n") + "\n\nAvailable agent types:\n- claude";
+const PLACEHOLDER = { name: "DeferredToolPlaceholder", description: "never call this tool", input_schema: { type: "object", properties: {} }, defer_loading: true };
+const CRON_CREATE = { name: "CronCreate", description: "Schedule a prompt.", defer_loading: true, input_schema: { type: "object", properties: {
+  cron: { type: "string" }, prompt: { type: "string" }, recurring: { type: "boolean" }, max_runs: { type: "integer" },
+  labels: { type: "array", items: { type: "string" } }, opts: { type: "object" } }, required: ["cron", "prompt"] } };
+const BASE_TOOLS = [TS_TOOLS[0], TS_TOOLS[1], PLACEHOLDER];
+const beforeLoad = () => ({
+  model: "corti-s1", max_tokens: 64, tools: BASE_TOOLS,
+  messages: [{ role: "system", content: [{ type: "text", text: ANNOUNCE(["CronCreate", "CronList", "mcp__supabase-prod__execute_sql"]) }] }, { role: "user", content: "schedule a job" }],
+});
+const afterLoad = () => {
+  const b = beforeLoad();
+  b.tools = [...BASE_TOOLS.slice(0, 2), CRON_CREATE, PLACEHOLDER];
+  b.messages.push(
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_s1", name: "ToolSearch", input: { query: "select:CronCreate" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_s1", content: [{ type: "tool_reference", tool_name: "CronCreate" }] }] },
+  );
+  return b;
+};
+const upBefore = await translateRequest(beforeLoad());
+const upAfter = await translateRequest(afterLoad());
+check("tool search A1: upstream tools are byte-identical before and after a load",
+  JSON.stringify(upAfter.request.tools), JSON.stringify(upBefore.request.tools));
+check("tool search A1: earlier upstream messages are byte-identical after a load",
+  JSON.stringify(upAfter.request.messages.slice(0, upBefore.request.messages.length)), JSON.stringify(upBefore.request.messages));
+const upNames = upBefore.request.tools.map((t) => t.function.name).join(",");
+check("tool search: every announced name is declared, real tools first", upNames, "Bash,ToolSearch,CronCreate,CronList,mcp__supabase-prod__execute_sql");
+check("tool search: the placeholder never goes upstream", upNames.includes("DeferredToolPlaceholder"), false);
+const tsStub = upAfter.request.tools.find((t) => t.function.name === "CronCreate").function;
+check("tool search: a loaded tool stays a stub upstream", JSON.stringify([tsStub.description, tsStub.parameters]), JSON.stringify([DEFERRED_STUB_DESCRIPTION, { type: "object" }]));
+check("tool search: the loaded definition reaches the model inline",
+  upAfter.request.messages.find((m) => m.role === "tool").content.includes("\"name\":\"CronCreate\",\"parameters\":{\"type\":\"object\",\"properties\":{\"cron\""), true);
+check("tool search: stub schemas map loaded tools to their real schema", upAfter.stubSchemas?.get("CronCreate"), CRON_CREATE.input_schema);
+check("tool search: unloaded stubs carry no schema to type from", upAfter.stubSchemas?.has("CronList"), false);
+check("tool search: plan state is reported", upAfter.toolSearch, "stubbed");
+check("tool search: no stub schemas before any load", upBefore.stubSchemas, undefined);
+
+// Fallback: no announcement to name the deferred tools means forwarding them as real tools.
+const fbBody = afterLoad();
+fbBody.messages[0] = { role: "user", content: "schedule a job" };
+const fb = await translateRequest(fbBody);
+check("tool search: without an announcement deferred tools go upstream as real tools",
+  fb.request.tools.find((t) => t.function.name === "CronCreate")?.function.description, "Schedule a prompt.");
+check("tool search: the fallback is reported", fb.toolSearch, "unannounced");
+check("tool search: the fallback leaves a diagnostic", fb.dropped.some((d) => d.startsWith("tool search: deferred tools without an announcement")), true);
+
+// Announcements arrive as deltas; removals are ignored so the array never shrinks.
+const deltaBody = afterLoad();
+deltaBody.messages.push({ role: "system", content: [{ type: "text", text: ANNOUNCE(["WebFetch", "CronList"]) + "\nThe following deferred tools are no longer available (their MCP server disconnected). Do not search for them:\nmcp__supabase-prod__execute_sql" }] });
+check("tool search: delta announcements append in order of first appearance",
+  JSON.stringify(announcedDeferredNames(deltaBody)), JSON.stringify(["CronCreate", "CronList", "mcp__supabase-prod__execute_sql", "WebFetch"]));
+check("tool search: no announcement reads as null", announcedDeferredNames({ messages: [{ role: "user", content: "hi" }] }), null);
+// A loaded tool no announcement named is still declared, after the announced ones.
+const lateBody = afterLoad();
+lateBody.tools = [...lateBody.tools, { name: "mcp__late__tool", description: "late", input_schema: { type: "object", properties: {} }, defer_loading: true }];
+lateBody.messages.push(
+  { role: "assistant", content: [{ type: "tool_use", id: "toolu_s2", name: "ToolSearch", input: { query: "late" } }] },
+  { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_s2", content: [{ type: "tool_reference", tool_name: "mcp__late__tool" }] }] },
+);
+check("tool search: an unannounced loaded tool is appended as a stub",
+  (await translateRequest(lateBody)).request.tools.map((t) => t.function.name).at(-1), "mcp__late__tool");
+// A deferred WebSearch is one stub, not a stub plus the proxy fallback WebSearch tool.
+const wsDeferred = beforeLoad();
+wsDeferred.messages[0].content[0].text = ANNOUNCE(["WebSearch"]);
+check("tool search: a deferred WebSearch is declared once",
+  (await translateRequest(wsDeferred)).request.tools.filter((t) => t.function.name === "WebSearch").length, 1);
+
+// Stub calls come back untyped (glm47 types an argument only from the declared schema).
+const S = CRON_CREATE.input_schema;
+check("coerceStubInput: bool, integer, array and object are typed back",
+  JSON.stringify(coerceStubInput({ cron: "* * * * *", prompt: "p", recurring: "true", max_runs: "5", labels: "[\"a\", \"b\"]", opts: "{\"x\": 1}" }, S)),
+  JSON.stringify({ cron: "* * * * *", prompt: "p", recurring: true, max_runs: 5, labels: ["a", "b"], opts: { x: 1 } }));
+check("coerceStubInput: a string property that looks like JSON stays a string", coerceStubInput({ prompt: "5" }, S).prompt, "5");
+check("coerceStubInput: a non-integer for an integer property is left for validation", coerceStubInput({ max_runs: "1.5" }, S).max_runs, "1.5");
+check("coerceStubInput: unparseable text is left for validation", coerceStubInput({ recurring: "yes" }, S).recurring, "yes");
+check("coerceStubInput: a key outside the schema is left as is", coerceStubInput({ extra: "1" }, S).extra, "1");
+check("coerceStubInput: nullable union types parse", coerceStubInput({ n: "null" }, { properties: { n: { type: ["integer", "null"] } } }).n, null);
+const typedInput = { recurring: true };
+check("coerceStubInput: already-typed input is returned unchanged", coerceStubInput(typedInput, S), typedInput);
+
+const stubCtx = { msgId: "m", requestedModel: "corti-s1", stubSchemas: upAfter.stubSchemas };
+const stubCompletion = translateCompletion({ choices: [{ message: { role: "assistant", content: null, tool_calls: [
+  { id: "c1", type: "function", function: { name: "CronCreate", arguments: "{\"cron\": \"* * * * *\", \"prompt\": \"p\", \"recurring\": \"false\", \"max_runs\": \"3\"}" } },
+  { id: "c2", type: "function", function: { name: "Bash", arguments: "{\"command\": \"true\"}" } },
+] }, finish_reason: "tool_calls" }] }, stubCtx);
+const nsCalls = stubCompletion.content.filter((b) => b.type === "tool_use");
+check("stub call (non-stream): args are typed back", JSON.stringify(nsCalls[0].input), JSON.stringify({ cron: "* * * * *", prompt: "p", recurring: false, max_runs: 3 }));
+check("stub call (non-stream): a real tool is untouched", nsCalls[1].input.command, "true");
+
+const stEvents = [];
+const st = createStreamTranslator(stubCtx, (e, d) => stEvents.push([e, d]));
+st.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "CronCreate", arguments: "" } }] } }] });
+st.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: "{\"cron\": \"* * * * *\", \"prompt\": \"p\", " } }] } }] });
+st.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: "\"recurring\": \"true\"}" } }] } }] });
+st.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 1, id: "c2", type: "function", function: { name: "Bash", arguments: "{\"command\": " } }] } }] });
+st.feed({ choices: [{ index: 0, delta: { tool_calls: [{ index: 1, function: { arguments: "\"true\"}" } }] } }] });
+st.feed({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+const jsonDeltas = (i) => stEvents.filter(([e, d]) => e === "content_block_delta" && d.index === i && d.delta.type === "input_json_delta").map(([, d]) => d.delta.partial_json);
+check("stub call (stream): args are held and sent once, typed", JSON.stringify(jsonDeltas(0)), JSON.stringify([JSON.stringify({ cron: "* * * * *", prompt: "p", recurring: true })]));
+check("stub call (stream): the typed args precede the block stop",
+  stEvents.findIndex(([e, d]) => e === "content_block_stop" && d.index === 0) > stEvents.findIndex(([e, d]) => e === "content_block_delta" && d.index === 0), true);
+check("stub call (stream): a real tool still streams incrementally", jsonDeltas(1).length, 2);
+
+const bigDeferred = beforeLoad();
+bigDeferred.tools = [...bigDeferred.tools, { name: "CronList", description: "x".repeat(4000), input_schema: { type: "object" }, defer_loading: true }];
+check("estimateTokens: a stubbed deferred tool counts as its stub, not its real schema",
+  estimateTokens(bigDeferred), estimateTokens(beforeLoad()));
+check("advisor transcript: deferred tools stay out of the tool list",
+  /CronCreate —|DeferredToolPlaceholder/.test(serializeAdvisorInput(afterLoad()).text), false);
+
+// Review fixes. Only harness-authored text may declare tools: user or assistant prose that quotes
+// the header must not inject stubs (each injected name would re-bill the prompt).
+const proseBody = (role) => ({ model: "corti-s1", max_tokens: 64, tools: BASE_TOOLS, messages: [{ role, content: [{ type: "text", text: ANNOUNCE(["Injected"]) }] }, { role: "user", content: "hi" }] });
+check("tool search: an announcement in user text is ignored", announcedDeferredNames(proseBody("user")), null);
+check("tool search: an announcement in assistant text is ignored", announcedDeferredNames(proseBody("assistant")), null);
+check("tool search: a mid_conv_system announcement counts",
+  JSON.stringify(announcedDeferredNames({ messages: [{ role: "user", content: [{ type: "mid_conv_system", content: [{ type: "text", text: ANNOUNCE(["CronList"]) }] }] }] })), JSON.stringify(["CronList"]));
+check("tool search: a header with no names reads as no announcement",
+  announcedDeferredNames({ messages: [{ role: "system", content: "Use ToolSearch to load tool schemas before calling them:\n\n- not a name" }] }), null);
+const collide = beforeLoad();
+collide.messages[0].content[0].text = ANNOUNCE(["Bash", "CronList"]);
+check("tool search: an announced name that is a real tool is not declared twice",
+  (await translateRequest(collide)).request.tools.filter((t) => t.function.name === "Bash").length, 1);
+// A deferred tool the parse did not cover must stay callable rather than vanish upstream.
+const uncovered = beforeLoad();
+uncovered.tools = [...uncovered.tools, { name: "mcp__other__tool", description: "o", input_schema: { type: "object" }, defer_loading: true }];
+check("tool search: an uncovered deferred tool is still declared as a stub",
+  (await translateRequest(uncovered)).request.tools.map((t) => t.function.name).includes("mcp__other__tool"), true);
+// A past ToolSearch result keeps its bytes when the harness later drops the tool (MCP disconnect).
+const pinBody = () => ({ ...afterLoad() });
+const pinned1 = await translateRequest(pinBody(), { parentSessionId: "ts-pin" });
+const dropped2 = pinBody();
+dropped2.tools = dropped2.tools.filter((t) => t.name !== "CronCreate");
+const pinned2 = await translateRequest(dropped2, { parentSessionId: "ts-pin" });
+const toolMsg = (r) => r.request.messages.find((m) => m.role === "tool").content;
+check("tool search: a dropped tool keeps its first rendering within a session", toolMsg(pinned2), toolMsg(pinned1));
+check("tool search: without a session the rendering falls back to the name",
+  toolMsg(await translateRequest(dropped2)).includes("{\"name\":\"CronCreate\"}"), true);
+
+
+// Block G9 — the two branches meet: a consult turn must keep its byte-identity guarantees while
+// deferred stubs pin the tools array. First call and continuation share one body object, so the
+// stubs and consult_advisor must survive both translations unchanged.
+_resetAdvisorGuidance();
+const c2sbase = () => ({
+  model: "corti-s1", max_tokens: 64, system: "agent",
+  tools: [{ name: "run_bash", description: "run", input_schema: { type: "object", properties: { cmd: { type: "string" } } } }, TS_TOOLS[1], CRON_CREATE, PLACEHOLDER],
+  messages: [
+    { role: "system", content: [{ type: "text", text: ANNOUNCE(["CronCreate"]) }] },
+    { role: "user", content: "fix it" },
+  ],
+});
+const c2sOpen = { mode: "openai", parentSessionId: "c2s", forwardThinking: true };
+const c2sSkip = { skipAdvisor: true, skipImages: true, parentSessionId: "c2s", forwardThinking: true };
+const c2sFirst = c2sbase();
+const c2sUp1 = (await translateRequest(c2sFirst, c2sOpen)).request;
+const c2sNames = c2sUp1.tools.map((t) => t.function.name).join(",");
+check("stubs+advisor: the first call declares the stub and appends consult_advisor",
+  c2sNames, "run_bash,ToolSearch,consult_advisor,CronCreate");
+const c2sCont = (await translateRequest({ ...c2sFirst, messages: [...c2sFirst.messages, ...c2pair("c2s1", [th("plan"), tx("Asking the advisor.")], "advice")] }, c2sSkip)).request;
+check("stubs+advisor: the continuation sends the first call tools byte for byte",
+  JSON.stringify(c2sCont.tools), JSON.stringify(c2sUp1.tools));
+check("stubs+advisor: the continuation extends the first call prefix",
+  JSON.stringify(c2sCont.messages.slice(0, c2sUp1.messages.length)), JSON.stringify(c2sUp1.messages));
+recordConsults("c2s", [{ id: "c2s1", carried: consultCarry([th("plan"), tx("Asking the advisor.")], "Asking the advisor."), advice: "advice", after: [tx("Done.")] }]);
+const c2sNextBody = c2sbase();
+c2sNextBody.messages.push(
+  { role: "assistant", content: [th("plan"), tx("Asking the advisor."), tx("Done.")] },
+  { role: "user", content: "more" },
+);
+const c2sNext = (await translateRequest(c2sNextBody, c2sOpen)).request;
+check("stubs+advisor: the next turn keeps the tools", JSON.stringify(c2sNext.tools), JSON.stringify(c2sUp1.tools));
+check("stubs+advisor: the next turn extends the continuation prefix",
+  JSON.stringify(c2sNext.messages.slice(0, c2sCont.messages.length)), JSON.stringify(c2sCont.messages));
+_resetAdvisorGuidance();
 
 console.log("");
 if (failed === 0) { console.log("all checks passed"); process.exit(0); }

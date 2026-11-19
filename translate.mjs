@@ -3,10 +3,13 @@
 import https from "node:https";
 import path from "node:path";
 import fs from "node:fs";
+import os from "node:os";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { serializeAdvisorInput } from "./lib/advisor-transcript.mjs";
+import { executorCwd } from "./lib/harness-text.mjs";
+import { renderToolReferences, toolsByName, planDeferredTools, deferredStub, coerceStubInput, DEFERRED_STUB_DESCRIPTION } from "./lib/tool-search.mjs";
 
 export const REASONING_SIGNATURE = "Y29ydGktcHJveHk="; // base64 "corti-proxy"
 
@@ -45,6 +48,27 @@ function webSearchCacheMap(sessionId) {
 }
 
 export function _resetWebSearchCache() { webSearchBySession.clear(); }
+
+/** Per-session pin: tool name -> its first rendered ToolSearch definition. A past ToolSearch
+ *  result must keep its bytes when the harness later drops or edits the tool (A1). */
+const TOOL_RENDER_CACHE_CAP = 64;
+const TOOL_RENDER_PER_SESSION = 512;
+const toolRenderBySession = new Map();
+
+function toolRenderMemo(sessionId) {
+  if (!sessionId) return undefined;
+  let map = toolRenderBySession.get(sessionId);
+  if (!map) {
+    if (toolRenderBySession.size >= TOOL_RENDER_CACHE_CAP)
+      toolRenderBySession.delete(toolRenderBySession.keys().next().value);
+    map = new Map();
+    toolRenderBySession.set(sessionId, map);
+  }
+  if (map.size >= TOOL_RENDER_PER_SESSION) map.delete(map.keys().next().value);
+  return map;
+}
+
+export function _resetToolRenderCache() { toolRenderBySession.clear(); }
 
 /** Per-session cache: image key -> text description. A described image must produce the same
  *  bytes every turn, else the prefix cache collapses (A1) — same failure mode as WebSearch. Key is
@@ -123,15 +147,37 @@ function mapModel(model) {
   return model;
 }
 
-// Corti's effort vocabulary is {high, max}; the picker's six levels collapse at the midpoint.
-// Off-vocabulary values (medium/low) floor somewhere unknown upstream.
-const mapEffort = (e) => {
+const EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"];
+const normEffort = (e) => {
   if (typeof e !== "string") return undefined;
   const v = e.toLowerCase();
-  if (["low", "medium", "high"].includes(v)) return "high";
-  if (["xhigh", "max", "ultracode"].includes(v)) return "max";
-  return undefined;
+  if (v === "ultracode") return "max";
+  return EFFORT_ORDER.includes(v) ? v : undefined;
 };
+
+/**
+ * The effort level sent upstream for a requested one, given the model's catalog `effort.levels`.
+ * Levels differ per model (corti-s1: low/high/max; corti-s1-mini: low/medium/xhigh), and a level
+ * the model does not list 400s. The nearest listed level wins, ties going up: a request is never
+ * silently given less depth than the next level would give it.
+ *   levels undefined → catalog unknown: the {high, max} collapse that corti-s1 always accepted.
+ *   levels []        → the model takes no effort: undefined, so the field is omitted.
+ */
+export function resolveEffort(requested, levels) {
+  const want = normEffort(requested);
+  if (!want) return undefined;
+  if (!Array.isArray(levels)) return EFFORT_ORDER.indexOf(want) <= EFFORT_ORDER.indexOf("high") ? "high" : "max";
+  const ranked = levels.map(normEffort).filter(Boolean);
+  if (!ranked.length) return undefined;
+  const w = EFFORT_ORDER.indexOf(want);
+  let best;
+  for (const l of ranked) {
+    const d = Math.abs(EFFORT_ORDER.indexOf(l) - w);
+    const bd = best === undefined ? Infinity : Math.abs(EFFORT_ORDER.indexOf(best) - w);
+    if (d < bd || (d === bd && EFFORT_ORDER.indexOf(l) > EFFORT_ORDER.indexOf(best))) best = l;
+  }
+  return best;
+}
 
 /* ------------------------------------------------------------------ */
 /* web search: Tavily API (primary), DuckDuckGo HTML (keyless fallback)*/
@@ -313,12 +359,13 @@ const ADVISOR_EXECUTOR_PROMPT_FILE = path.join(REPO_ROOT, "lib", "advisor-execut
 // observed timing out in real sessions. 8 minutes is the floor; raise CORTI_ADVISOR_TIMEOUT_MS
 // to extend further. The gateway's stream-idle watchdog is suppressed for the advisor
 // handoff (see gateway.mjs deadlineCheck / advisorHandoff) so this is the real ceiling.
-const ADVISOR_TIMEOUT_MS = Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 8 * 60_000;
+// Read at call time, like advisorMaxTokens, so tests can shorten it.
+export const advisorTimeoutMs = () => Number(process.env.CORTI_ADVISOR_TIMEOUT_MS) || 8 * 60_000;
 const ADVISOR_MODEL = process.env.CORTI_ADVISOR_MODEL || "opus";
 // Soft per-call output cap, surfaced to the advisor via the serialized transcript's budget
 // line. The official advisor tool sets a hard `max_tokens` on the tool def; corti-bridge -p
 // exposes no such flag, so this is a soft steer (the advisor shapes to fit) plus the hard
-// ADVISOR_TIMEOUT_MS / maxBuffer ceilings. 2048 is the official "recommended starting point."
+// advisorTimeoutMs / maxBuffer ceilings. 2048 is the official "recommended starting point."
 // Read at call time (not module load) so per-test env changes take effect.
 const advisorMaxTokens = () => Number(process.env.CORTI_ADVISOR_MAX_TOKENS) || 2048;
 
@@ -345,6 +392,15 @@ function advisorProcessedMap(sessionId) {
 
 export function _resetAdvisorProcessed() { advisorProcessedBySession.clear(); }
 
+// Store key for an anchor; restoreAdvisorGuidance computes the same key per history block. Tool
+// ids round-trip because tool_result pairing needs them; thinking round-trips verbatim.
+export function anchorKey(anchor) {
+  return anchor?.toolUseId ? `u:${anchor.toolUseId}`
+    : anchor?.text ? `t:${anchor.text}`
+    : anchor?.thinking ? `h:${anchor.thinking}`
+    : "";
+}
+
 /** Per-session record of answered consults, keyed by a block that survives beside each one. The
  *  harness renders the server_tool_use / advisor_tool_result pair but never replays it, so without
  *  this the model reads its own "calling the advisor now" as a promise it never kept. */
@@ -352,12 +408,10 @@ const ADVISOR_GUIDANCE_CAP = 64;
 const ADVISOR_GUIDANCE_PER_SESSION = 32;
 const advisorGuidanceBySession = new Map();
 
-// Anchor is `{ text }` or `{ toolUseId }` (ids round-trip because tool_result pairing needs them,
-// so they cover a consult followed straight by a tool call); `before` says which side it sat on.
+// Anchor is `{ text }`, `{ thinking }` or `{ toolUseId }` (see anchorKey); `before` says which
+// side of the anchor block the consult sat on.
 export function recordAdvisorGuidance(sessionId, anchor, advice, consultId) {
-  const key = anchor?.toolUseId ? `u:${anchor.toolUseId}`
-    : anchor?.text ? `t:${anchor.text}`
-    : "";
+  const key = anchorKey(anchor);
   if (!sessionId || !key || !advice || !consultId) return;
   let map = advisorGuidanceBySession.get(sessionId);
   if (!map) {
@@ -406,6 +460,7 @@ export function restoreAdvisorGuidance(sessionId, messages) {
     };
     for (const b of blocksOf(msg.content)) {
       const key = b?.type === "text" && typeof b.text === "string" ? `t:${b.text}`
+        : b?.type === "thinking" && typeof b.thinking === "string" ? `h:${b.thinking}`
         : b?.type === "tool_use" && typeof b.id === "string" ? `u:${b.id}`
         : null;
       const rec = key && !used.has(key) ? store.get(key) : null;
@@ -429,6 +484,67 @@ export function restoreAdvisorGuidance(sessionId, messages) {
 }
 
 export function _resetAdvisorGuidance() { advisorGuidanceBySession.clear(); }
+
+/** The blocks of a round that belong in the continuation's consult message: what
+ *  restoreAdvisorGuidance will put before the consult next turn, so the two prompts share a
+ *  prefix. Thinking and text up to the pre-call text, or only thinking when the round wrote none.
+ *  A tool call beside the consult is not carried: it would go upstream with no result. */
+export function consultCarry(blocks, preCallText) {
+  const list = Array.isArray(blocks) ? blocks : [];
+  const end = preCallText ? list.findLastIndex((b) => b?.type === "text" && b.text === preCallText) : -1;
+  if (end < 0) return list.filter((b) => b?.type === "thinking");
+  return list.slice(0, end + 1).filter((b) => b?.type === "thinking" || b?.type === "text");
+}
+
+/** Where a consult's advice is re-inserted next turn: right after the last block the round
+ *  carried, else right before the first block its continuation wrote. Thinking counts — a round
+ *  that only thought before consulting would otherwise put the continuation's own thinking
+ *  ahead of the consult, and the next turn would diverge from what the continuation sent. */
+export function consultAnchor(carried, continuationBlocks) {
+  const at = (b, before) => b?.type === "text" && b.text ? { text: b.text, before }
+    : b?.type === "thinking" && b.thinking ? { thinking: b.thinking, before }
+    : b?.type === "tool_use" && b.id ? { toolUseId: b.id, before }
+    : null;
+  return at(carried?.at(-1), false) ?? at(continuationBlocks?.[0], true);
+}
+
+/** Record a turn's answered consults (`{ id, carried, advice, after }`, `after` being the blocks
+ *  the round's continuation wrote) once the turn is over: a record that exists while a later
+ *  round is translated re-inserts its pair beside the one that round's history already holds. */
+export function recordConsults(sessionId, answered) {
+  const used = new Set();
+  for (const a of answered ?? []) {
+    let anchor = consultAnchor(a.carried, a.after);
+    // The store is keyed by content, so two rounds that wrote the same words share a key.
+    if (anchor && used.has(anchorKey(anchor))) anchor = consultAnchor([], a.after);
+    if (!anchor || used.has(anchorKey(anchor))) continue;
+    used.add(anchorKey(anchor));
+    recordAdvisorGuidance(sessionId, anchor, a.advice, a.id);
+  }
+}
+
+/** A non-streamed round's content, split the way the stream translator splits a streamed one:
+ *  the consult call (if any) apart, and the anchors the A4 record and the next round read. */
+export function splitConsult(content) {
+  const blocks = [];
+  let consultId = null;
+  for (const b of Array.isArray(content) ? content : []) {
+    if (b?.type === "tool_use" && ADVISOR_TOOL_NAMES.has(b.name)) {
+      consultId ??= b.id;
+      continue;
+    }
+    blocks.push(b);
+  }
+  let lastText = "";
+  let firstBlock = null;
+  for (const b of blocks) {
+    if (b?.type === "text") {
+      lastText = b.text;
+      firstBlock ??= { type: "text", text: b.text };
+    } else if (b?.type === "tool_use") firstBlock ??= { type: "tool", id: b.id };
+  }
+  return { blocks, consultId, lastText, firstBlock };
+}
 
 // Empty input_schema: the executor signals *timing only*. Letting it write a query loses
 // exactly the detail the advisor is there to catch — the harness forwards the full transcript
@@ -459,6 +575,15 @@ const ADVISOR_TOOL_DEF = {
 // full context the executor has, per the official advisor tool's "server supplies context"
 // behaviour. A bare string return from an injected test stub is treated as { ok: true, text }
 // so tests that return plain advice strings stay unchanged.
+/** The advisor child runs in the executor's directory, so its own environment block names the
+ *  project it is advising on. Never the gateway's: that is whichever project first started it. */
+function advisorCwd(dir) {
+  try {
+    if (typeof dir === "string" && path.isAbsolute(dir) && fs.statSync(dir).isDirectory()) return dir;
+  } catch { /* gone or unreadable: fall through */ }
+  return os.tmpdir();
+}
+
 export function runAdvisor(text, opts = {}) {
   return new Promise((resolve) => {
     // Test seam: CORTI_ADVISOR_STUB is a script that reads the transcript on stdin and writes a
@@ -472,6 +597,9 @@ export function runAdvisor(text, opts = {}) {
       "--system-prompt-file", ADVISOR_PROMPT_FILE,
       "--tools", "",
       "--input-format", "text",
+      // The executor's directory supplies the environment block only: its project settings would
+      // run their hooks and MCP servers on every consult.
+      "--setting-sources", "user",
     ];
     const env = { ...process.env };
     // The child must not inherit the gateway's debug logging: CORTI_DEBUG makes corti-bridge
@@ -500,6 +628,12 @@ export function runAdvisor(text, opts = {}) {
     // openai-mode advisorWanted("openai", false) sees CORTI_ADVISOR=off → no injection.
     // Primary guard remains CORTI_ADVISOR_NOINJECT (the token stamp → skipAdvisor:true).
     env.CORTI_ADVISOR = "off";
+    // The executor's CLAUDE.md files already reach the advisor inside the transcript, framed as
+    // quoted context; loaded again by the child they would arrive as instructions to the advisor.
+    env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
+    // After a mid-stream api_error the child retries without streaming, and Claude Code gives that
+    // request 300s unless API_TIMEOUT_MS says otherwise: the retry regenerates the whole answer.
+    env.API_TIMEOUT_MS = String(advisorTimeoutMs());
     // maxBuffer bounds the child's combined stdout. The advisor is an Opus-tier model
     // emitting --output-format json (an array of every event); even without inherited debug
     // logging, that stream can exceed a few MB on a long consult. 32MB is generous headroom —
@@ -508,23 +642,28 @@ export function runAdvisor(text, opts = {}) {
     // err.code if this is ever too small again.
     const child = execFile(cmd, args, {
       env,
-      timeout: ADVISOR_TIMEOUT_MS,
+      cwd: advisorCwd(opts.cwd),
+      timeout: advisorTimeoutMs(),
+      signal: opts.signal,
       maxBuffer: 32 * 1024 * 1024,
     }, (err, stdout, stderr) => {
       if (err) {
         // Capture the raw failure so the gateway diagnostic can show WHY, not just that, it
-        // failed. execFile sets err.code === "ETIMEDOUT" when the timeout fires; other codes
-        // (ENOENT if corti-bridge isn't on PATH, ERR_CHILD_PROCESS_STDIO_MAXBUFFER if stdout
-        // or stderr exceeded maxBuffer, a non-zero exit) are non-timeout failures. stderr
-        // carries the child's own error text when it exited non-zero — the most useful signal.
-        const detail = `code=${err.code || "?"} msg=${String(err.message || "").slice(0, 200)}` +
+        // failed. Besides the timeout (killed), err.code carries ENOENT if corti-bridge isn't on
+        // PATH, ERR_CHILD_PROCESS_STDIO_MAXBUFFER if stdout or stderr exceeded maxBuffer, or the
+        // exit status of a child that failed on its own. stderr carries the child's own error
+        // text when it exited non-zero — the most useful signal.
+        const detail = `code=${err.code || "?"}${err.killed ? ` killed signal=${err.signal ?? "-"}` : ""} msg=${String(err.message || "").slice(0, 200)}` +
           (stderr ? ` stderr=${String(stderr).trim().slice(0, 200)}` : "");
         const hint = err.code === "ENOENT"
           ? " (the corti-bridge wrapper isn't on PATH — run ./setup.sh to install it)"
           : "";
         return resolve({
           ok: false,
-          code: err.code === "ETIMEDOUT" ? "execution_time_exceeded" : "unavailable",
+          // execFile reports its timeout as killed (Claude Code exits 143), never as ETIMEDOUT. A
+          // client hang-up and a maxBuffer overflow kill the child too; neither is a timeout.
+          code: err.killed && !opts.signal?.aborted && err.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"
+            ? "execution_time_exceeded" : "unavailable",
           detail: detail + hint,
         });
       }
@@ -827,7 +966,7 @@ function advisorWanted(mode, skipAdvisor) {
 // off), on/off force both modes. skipAdvisor (the -noadvisor- recursion guard) is authoritative
 // and checked first inside advisorWanted so no env var can override it. The runAdvisor
 // dependency is injectable via ctx so tests stay hermetic (no child_process spawn).
-async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor, mode, parentSessionId, advisorProcessed } = {}) {
+async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvisor, mode, parentSessionId, advisorProcessed, signal } = {}) {
   if (!advisorWanted(mode, skipAdvisor)) return [];
   // No tools means no next action to steer — a one-shot side call (summarise a page, title a
   // chat), not an agent loop. Measured: 6 of 7 consults in one session, 50s of Opus time wasted.
@@ -877,7 +1016,8 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
         { ...body, messages: restoreAdvisorGuidance(parentSessionId, body.messages) },
         { maxTokens: advisorMaxTokens() },
       );
-      const out = await call(text, { parentSessionId });
+      // signal: a client that hangs up mid-rewrite must not leave the child running its whole budget.
+      const out = await call(text, { parentSessionId, cwd: executorCwd(body), signal });
       // A bare string is a test stub (backward compat) — treat as success.
       const res = typeof out === "string" ? { ok: true, text: out } : out;
       let guidance;
@@ -893,9 +1033,13 @@ async function interceptConsultAdvisor(body, { toolUseMap, runAdvisor, skipAdvis
       }
       b.content = guidance;
       b.is_error = false;
-      if (processed.size >= ADVISOR_PROCESSED_PER_SESSION)
-        processed.delete(processed.keys().next().value);
-      processed.set(b.tool_use_id, guidance);
+      // A run the client's hang-up aborted is not this consult's answer; cached, every later
+      // replay would read "advisor unavailable" and never run the advisor again.
+      if (!signal?.aborted) {
+        if (processed.size >= ADVISOR_PROCESSED_PER_SESSION)
+          processed.delete(processed.keys().next().value);
+        processed.set(b.tool_use_id, guidance);
+      }
       const elidedStr = elidedCount ? ` elided=${elidedCount}` : "";
       const resStr = res?.ok ? `advisor=${res.text.length} chars` : `advisor_error=${res?.code || "unavailable"}`;
       diagnostics.push(`advisor intercepted: transcript=${text.length} chars${elidedStr} ${resStr}`);
@@ -943,14 +1087,15 @@ function blocksOf(content) {
   return Array.isArray(content) ? content : [];
 }
 
-function toolResultText(block) {
+// tool_reference blocks (ToolSearch) carry no text of their own: render the referenced tools.
+function toolResultText(block, byName, memo) {
   const c = block.content;
   if (typeof c === "string") return c;
   if (Array.isArray(c)) {
-    return c
-      .filter((b) => b && b.type === "text" && typeof b.text === "string")
-      .map((b) => b.text)
-      .join("\n\n");
+    const parts = c.filter((b) => b && b.type === "text" && typeof b.text === "string").map((b) => b.text);
+    const refs = renderToolReferences(c, byName, memo);
+    if (refs) parts.push(refs);
+    return parts.join("\n\n");
   }
   return "";
 }
@@ -1011,6 +1156,8 @@ export async function translateRequest(body, opts) {
   }
 
   const messages = [];
+  const byName = toolsByName(body.tools);
+  const renderMemo = toolRenderMemo(opts?.parentSessionId);
   let pendingCalls = [];
   // Consults this session already made, put back before anything walks the history.
   const history = restoreAdvisorGuidance(opts?.parentSessionId, body.messages);
@@ -1101,7 +1248,7 @@ export async function translateRequest(body, opts) {
 
       for (const b of rawBlocks) {
         if (b.type === "tool_result") {
-          let text = toolResultText(b);
+          let text = toolResultText(b, byName, renderMemo);
           const imgs = toolResultImages(b);
 
           if (imgs.length) {
@@ -1209,9 +1356,17 @@ export async function translateRequest(body, opts) {
   }
 
   const allTools = Array.isArray(body.tools) ? body.tools : [];
-  const tools = allTools.filter(
+  let tools = allTools.filter(
     (t) => t && typeof t === "object" && t.input_schema && typeof t.name === "string",
   );
+  const serverTools = allTools.length - tools.length;
+
+  // Deferred tools go upstream as fixed stubs so a ToolSearch load never changes the tools array
+  // (A1): the real definition reaches the model inline, through the rendered tool_reference.
+  const deferredPlan = planDeferredTools(body);
+  if (deferredPlan?.stubbed) tools = tools.filter((t) => t.defer_loading !== true).concat(deferredPlan.names.map(deferredStub));
+  else if (deferredPlan)
+    dropped.push("tool search: deferred tools without an announcement to name them, forwarded as real tools (each load re-bills the prompt)");
 
   // Convert WebSearch to a function tool so the call is schemaed; the proxy
   // intercepts the tool_result next turn to inject real search results. Only when the client's own
@@ -1238,8 +1393,7 @@ export async function translateRequest(body, opts) {
     });
   }
 
-  const droppedTools = allTools.length - tools.length;
-  if (droppedTools > 0) dropped.push(`${droppedTools} server tool(s) stripped`);
+  if (serverTools > 0) dropped.push(`${serverTools} server tool(s) stripped`);
 
   if (tools.length) {
     req.tools = tools.map((t) => ({
@@ -1265,26 +1419,44 @@ export async function translateRequest(body, opts) {
   // effort (depth) and thinking (whether) are separate axes. reasoning_effort is gated on
   // body.thinking: a request with no thinking block is not reasoning-capable and 400s on effort.
   const th = body.thinking;
+  let requestedEffort;
+  let effortTrace;
   if (th && typeof th === "object") {
-    const effort = mapEffort(body.output_config?.effort);
     // output_config.effort (the picker) wins over the legacy budget mapping; adaptive enables only.
     const budgetEffort =
       th.type === "enabled" && typeof th.budget_tokens === "number"
-        ? mapEffort(th.budget_tokens < 4096 ? "low" : th.budget_tokens < 16384 ? "medium" : "high")
+        ? (th.budget_tokens < 4096 ? "low" : th.budget_tokens < 16384 ? "medium" : "high")
         : undefined;
-    req.reasoning_effort = effort ?? budgetEffort ?? "high";
+    requestedEffort = normEffort(body.output_config?.effort) ?? budgetEffort ?? "high";
     if (th.type === "enabled" && typeof th.budget_tokens === "number" && th.budget_tokens > 0)
       req.thinking_token_budget = th.budget_tokens;
   }
-
-  // C2: the advisor child reasons at CORTI_ADVISOR_EFFORT (high by default), overriding the
-  // resolved effort above. A model that rejects the level 400s — surfacing a capability gap.
-  if (opts?.advisorEffort) req.reasoning_effort = opts.advisorEffort;
+  // C2: the advisor child reasons at CORTI_ADVISOR_EFFORT, overriding whatever was requested.
+  if (opts?.advisorEffort) requestedEffort = opts.advisorEffort;
+  if (requestedEffort !== undefined) {
+    // opts.effortLevels: the gateway's catalog lookup (model id → levels, undefined when unknown).
+    const levels = typeof opts?.effortLevels === "function" ? opts.effortLevels(req.model) : undefined;
+    const sent = resolveEffort(requestedEffort, levels);
+    if (sent !== undefined) req.reasoning_effort = sent;
+    effortTrace = { requested: requestedEffort, sent, levels };
+  }
+  // The advisor child's thinking is capped so it always reaches its answer: uncapped, a hard
+  // consult thinks to max_tokens with no text, and Claude Code then restarts it from zero.
+  // Only on a reasoning request, and never at or above max_tokens (room is left for the answer).
+  if (opts?.advisorThinkingBudget > 0 && req.reasoning_effort !== undefined) {
+    const room = req.max_tokens - 1024;
+    const budget = Math.min(opts.advisorThinkingBudget, req.thinking_token_budget ?? Infinity, room);
+    if (budget > 0) req.thinking_token_budget = budget;
+  }
 
   // Forwarded thinking counts on its own channel so debug logs read "forwarded: …", not "dropped:".
   const forwardedCount = req.messages.filter((m) => m.reasoning).length;
   const out = { request: req, dropped };
+  // Response translation types stub calls back from these (see coerceStubInput).
+  if (deferredPlan?.stubbed && deferredPlan.schemas.size) out.stubSchemas = deferredPlan.schemas;
+  if (deferredPlan) out.toolSearch = deferredPlan.stubbed ? "stubbed" : "unannounced";
   if (forwardedCount) out.forwarded = `thinking (assistant history) x${forwardedCount}`;
+  if (effortTrace) out.effort = effortTrace;
   return out;
 }
 
@@ -1294,6 +1466,7 @@ export async function translateRequest(body, opts) {
 
 export function estimateTokens(body, opts) {
   try {
+    const byName = toolsByName(body?.tools);
     let chars = 0;
     let overhead = 0;
     const add = (s) => {
@@ -1323,11 +1496,13 @@ export function estimateTokens(body, opts) {
           add(JSON.stringify(b.input ?? {}));
         } else if (b.type === "tool_result") {
           if (typeof b.content === "string") add(b.content);
-          else if (Array.isArray(b.content))
+          else if (Array.isArray(b.content)) {
             for (const c of b.content) {
               if (c?.type === "text") add(c.text);
               else if (c?.type === "image") overhead += 100;
             }
+            add(renderToolReferences(b.content, byName));
+          }
         } else if (b.type === "thinking") {
           if (fwdThinking) add(b.thinking ?? "");
         } else if (b.type === "redacted_thinking") {
@@ -1339,12 +1514,20 @@ export function estimateTokens(body, opts) {
       }
     }
 
+    // Mirrors translateRequest: stubbed deferred tools go upstream as stubs, not real schemas.
+    const plan = planDeferredTools(body);
     for (const t of Array.isArray(body?.tools) ? body.tools : []) {
       if (!t || typeof t !== "object" || !t.input_schema) continue;
+      if (plan?.stubbed && t.defer_loading === true) continue;
       overhead += 16;
       add(t.name);
       add(t.description);
       add(JSON.stringify(t.input_schema));
+    }
+    for (const name of plan?.stubbed ? plan.names : []) {
+      overhead += 16;
+      add(name);
+      add(DEFERRED_STUB_DESCRIPTION);
     }
 
     return Math.max(1, Math.floor(chars / 4) + overhead);
@@ -1538,6 +1721,8 @@ export function translateCompletion(completion, ctx) {
     } catch {
       ctx.onDiagnostic?.(`tool args JSON.parse failed for ${call.function?.name}: using {}`);
     }
+    const stubSchema = ctx?.stubSchemas?.get?.(call.function?.name);
+    if (stubSchema) input = coerceStubInput(input, stubSchema);
     content.push({ type: "tool_use", id: call.id || `chatcmpl-tool-local-${Math.random().toString(16).slice(2, 10)}`, name: call.function?.name, input });
   }
 
@@ -1579,6 +1764,9 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
   // Anchor sources for a consult's advice; must match the client's history byte for byte.
   let lastText = "";
   let firstBlock = null; // { type:"text", text } | { type:"tool", id }
+  // Content of every block sent to the client, in order: a continuation replays a round's
+  // blocks upstream exactly as the harness will replay them next turn.
+  const emitted = [];
   let advisorToolUse = null; // { id, name, args } when the turn ends on a consult_advisor tool_use
 
   const closeOpen = () => {
@@ -1589,18 +1777,35 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
         index: open.index,
         delta: { type: "signature_delta", signature: REASONING_SIGNATURE },
       });
-    emit("content_block_stop", { type: "content_block_stop", index: open.index });
-    if (open.kind === "tool") {
-      const rec = [...toolBlocks.values()].find((t) => t.blockIndex === open.index);
-      if (rec) rec.closed = true;
+    const rec = open.kind === "tool" ? [...toolBlocks.values()].find((t) => t.blockIndex === open.index) : null;
+    // A stub call's args were held back: typing them needs the whole object (coerceStubInput).
+    if (rec?.stubSchema) {
+      let json = rec.args;
+      try {
+        json = JSON.stringify(coerceStubInput(JSON.parse(rec.args || "{}"), rec.stubSchema));
+      } catch {
+        ctx.onDiagnostic?.(`stub tool args JSON.parse failed for ${rec.name}: sent as received`);
+      }
+      if (json)
+        emit("content_block_delta", {
+          type: "content_block_delta",
+          index: open.index,
+          delta: { type: "input_json_delta", partial_json: json },
+        });
     }
+    emit("content_block_stop", { type: "content_block_stop", index: open.index });
+    if (rec) rec.closed = true;
     open = null;
   };
 
   const openBlock = (kind, contentBlock) => {
     closeOpen();
     const index = nextBlockIndex++;
-    open = { kind, index };
+    const rec = kind === "thinking" ? { type: "thinking", thinking: "" }
+      : kind === "text" ? { type: "text", text: "" }
+      : { type: "tool_use", id: contentBlock.id, name: contentBlock.name, args: "" };
+    emitted.push(rec);
+    open = { kind, index, rec };
     emit("content_block_start", { type: "content_block_start", index, content_block: contentBlock });
   };
 
@@ -1637,6 +1842,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
     if (ctx.reasoningMode === "thinking") {
       if (open?.kind !== "thinking")
         openBlock("thinking", { type: "thinking", thinking: "", signature: "" });
+      open.rec.thinking += text;
       emit("content_block_delta", {
         type: "content_block_delta",
         index: open.index,
@@ -1657,6 +1863,7 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
     }
     outputChars += text.length;
     lastText += text;
+    open.rec.text += text;
     if (firstBlock?.type === "text" && firstBlock.index === open.index) firstBlock.text += text;
     emit("content_block_delta", {
       type: "content_block_delta",
@@ -1686,7 +1893,8 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
         } else {
           openBlock("tool", { type: "tool_use", id, name, input: {} });
           if (!firstBlock) firstBlock = { type: "tool", id };
-          toolBlocks.set(idx, { blockIndex: open.index, closed: false, name, id, args: "" });
+          const stubSchema = ctx?.stubSchemas?.get?.(name);
+          toolBlocks.set(idx, { blockIndex: open.index, closed: false, name, id, args: "", ...(stubSchema ? { stubSchema } : {}) });
         }
       }
     }
@@ -1712,7 +1920,9 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
         return;
       }
       rec.args += frag;
+      open.rec.args += frag;
       outputChars += frag.length;
+      if (rec.stubSchema) return;
       emit("content_block_delta", {
         type: "content_block_delta",
         index: rec.blockIndex,
@@ -1842,6 +2052,18 @@ export function createStreamTranslator(ctx, emit, startIndex = 0) {
     },
     get firstBlock() {
       return firstBlock;
+    },
+    // Anthropic content blocks for what the client was sent; a suppressed consult is not among them.
+    get blocks() {
+      return emitted.map((b) => {
+        if (b.type === "thinking") return { type: "thinking", thinking: b.thinking, signature: REASONING_SIGNATURE };
+        if (b.type === "text") return { type: "text", text: b.text };
+        let input = {};
+        try {
+          input = b.args ? JSON.parse(b.args) : {};
+        } catch {}
+        return { type: "tool_use", id: b.id, name: b.name, input };
+      });
     },
     // Close whatever block is still open (emitting the thinking signature first, when that is
     // what is open) so a caller can append its own block at nextBlockIndex without nesting.

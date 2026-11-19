@@ -576,6 +576,10 @@ unset CLAUDE_CODE_ENABLE_DESIGN_SYNC
 # Corti never answers auto mode's server-side check (`safeguards`), so actions get no verdict.
 # 0 is Anthropic's documented gateway opt-out: Claude Code runs its own classifier through us.
 export CLAUDE_CODE_AUTO_MODE_SERVER="${CLAUDE_CODE_AUTO_MODE_SERVER:-0}"
+# An advisor run leaves the stream without events for minutes; past 300s Claude Code drops it and
+# resends (pings do not count), then Bun's fetch times out. 15 min clears the 12-min advisor cap.
+export CLAUDE_STREAM_IDLE_TIMEOUT_MS="${CLAUDE_STREAM_IDLE_TIMEOUT_MS:-900000}"
+export API_FORCE_IDLE_TIMEOUT="${API_FORCE_IDLE_TIMEOUT:-0}"
 
 # exec is the normal path: the wrapper's job is done and it should get out of the way. It is
 # given up only when a notice is waiting, because printing one means outliving the session.
